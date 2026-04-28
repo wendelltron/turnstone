@@ -186,6 +186,7 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/workstreams/close",
         "/api/cluster/workstreams/new",
         "/api/memories",
+        "/api/tts",
     }
 )
 
@@ -538,7 +539,7 @@ def required_scope(method: str, path: str) -> str:
         method == "POST"
         and normalized.startswith("/api/workstreams/")
         and normalized.rsplit("/", 1)[-1]
-        in {"delete", "open", "refresh-title", "title", "attachments"}
+        in {"delete", "open", "refresh-title", "title", "attachments", "speech-to-text"}
     ):
         return "write"
     # Attachment deletion: DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}.
@@ -565,6 +566,7 @@ def required_scope(method: str, path: str) -> str:
                 "refresh-title",
                 "title",
                 "attachments",
+                "speech-to-text",
             }:
                 return "write"
 

@@ -1298,3 +1298,27 @@ class TestProviderExtraParams:
         result_fallback = session._provider_extra_params(model_alias="fallback")
         assert result_fallback == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
         assert "skip_special_tokens" not in result_fallback
+
+    def test_nemotron_server_compat_can_disable_thinking_and_enable_video_audio(self, tmp_db):
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        cfg = ModelConfig(
+            alias="nemotron",
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key="none",
+            model="private/nvidia/nemotron-3-nano-omni-reasoning-30b-a3b",
+            server_compat={
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "mm_processor_kwargs": {"use_audio_in_video": True},
+                }
+            },
+        )
+        session._registry = ModelRegistry(models={"nemotron": cfg}, default="nemotron")
+        session._model_alias = "nemotron"
+        result = session._provider_extra_params()
+        assert result is not None
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "medium"
+        assert result["chat_template_kwargs"]["enable_thinking"] is False
+        assert result["mm_processor_kwargs"]["use_audio_in_video"] is True

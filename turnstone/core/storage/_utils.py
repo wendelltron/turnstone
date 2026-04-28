@@ -28,6 +28,18 @@ def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
             "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         }
+    if kind == "audio" and isinstance(raw, bytes):
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {
+            "type": "audio_url",
+            "audio_url": {"url": f"data:{mime};base64,{b64}"},
+        }
+    if kind == "video" and isinstance(raw, bytes):
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {
+            "type": "video_url",
+            "video_url": {"url": f"data:{mime};base64,{b64}"},
+        }
     if kind == "text" and isinstance(raw, bytes):
         try:
             text = raw.decode("utf-8")

@@ -1023,6 +1023,27 @@ class TestConsoleWorkstreamCreation:
         body = mock_post.call_args[1]["json"]
         assert body["model"] == "gpt-5"
 
+    def test_create_with_media_routing_models(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={
+                "node_id": "node-a",
+                "stt_model": "whisper-local",
+                "tts_model": "kokoro-local",
+                "vision_eval_model": "omni-vision",
+                "av_eval_model": "omni-av",
+                "intent_eval_model": "omni-intent",
+            },
+        )
+        assert resp.status_code == 200
+        body = mock_post.call_args[1]["json"]
+        assert body["stt_model"] == "whisper-local"
+        assert body["tts_model"] == "kokoro-local"
+        assert body["vision_eval_model"] == "omni-vision"
+        assert body["av_eval_model"] == "omni-av"
+        assert body["intent_eval_model"] == "omni-intent"
+
     def test_create_with_initial_message_directed(self, client_and_mock, mock_collector):
         client, mock_post = client_and_mock
         resp = client.post(

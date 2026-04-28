@@ -1626,8 +1626,18 @@ function showNewWsModal() {
   // Populate model dropdown
   var modelSelect = document.getElementById("new-ws-model");
   var judgeSelect = document.getElementById("new-ws-judge");
+  var sttSelect = document.getElementById("new-ws-stt-model");
+  var ttsSelect = document.getElementById("new-ws-tts-model");
+  var visionEvalSelect = document.getElementById("new-ws-vision-eval-model");
+  var avEvalSelect = document.getElementById("new-ws-av-eval-model");
+  var intentEvalSelect = document.getElementById("new-ws-intent-eval-model");
   modelSelect.textContent = "";
   judgeSelect.textContent = "";
+  if (sttSelect) sttSelect.textContent = "";
+  if (ttsSelect) ttsSelect.textContent = "";
+  if (visionEvalSelect) visionEvalSelect.textContent = "";
+  if (avEvalSelect) avEvalSelect.textContent = "";
+  if (intentEvalSelect) intentEvalSelect.textContent = "";
 
   var defaultOpt = document.createElement("option");
   defaultOpt.value = "";
@@ -1638,6 +1648,20 @@ function showNewWsModal() {
   defaultJudgeOpt.value = "";
   defaultJudgeOpt.textContent = "Default (agent model)";
   judgeSelect.appendChild(defaultJudgeOpt);
+  [
+    [sttSelect, "Default STT model"],
+    [ttsSelect, "Default TTS model"],
+    [visionEvalSelect, "Default vision evaluator"],
+    [avEvalSelect, "Default audio/video evaluator"],
+    [intentEvalSelect, "Default intent evaluator"],
+  ].forEach(function (entry) {
+    var sel = entry[0];
+    if (!sel) return;
+    var opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = entry[1];
+    sel.appendChild(opt);
+  });
 
   authFetch("/v1/api/models")
     .then(function (r) {
@@ -1655,6 +1679,13 @@ function showNewWsModal() {
         jOpt.value = m.alias;
         jOpt.textContent = opt.textContent;
         judgeSelect.appendChild(jOpt);
+        [sttSelect, ttsSelect, visionEvalSelect, avEvalSelect, intentEvalSelect].forEach(function (sel) {
+          if (!sel) return;
+          var extraOpt = document.createElement("option");
+          extraOpt.value = m.alias;
+          extraOpt.textContent = opt.textContent;
+          sel.appendChild(extraOpt);
+        });
       });
     })
     .catch(function () {
@@ -1663,6 +1694,11 @@ function showNewWsModal() {
   document.getElementById("new-ws-name").value = "";
   modelSelect.value = "";
   judgeSelect.value = "";
+  if (sttSelect) sttSelect.value = "";
+  if (ttsSelect) ttsSelect.value = "";
+  if (visionEvalSelect) visionEvalSelect.value = "";
+  if (avEvalSelect) avEvalSelect.value = "";
+  if (intentEvalSelect) intentEvalSelect.value = "";
   var taskEl = document.getElementById("new-ws-task");
   taskEl.value = "";
   var mod =
@@ -1728,8 +1764,14 @@ function submitNewWs() {
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
   var judgeModel = document.getElementById("new-ws-judge").value.trim();
+  var sttModel = document.getElementById("new-ws-stt-model").value.trim();
+  var ttsModel = document.getElementById("new-ws-tts-model").value.trim();
+  var visionEvalModel = document.getElementById("new-ws-vision-eval-model").value.trim();
+  var avEvalModel = document.getElementById("new-ws-av-eval-model").value.trim();
+  var intentEvalModel = document.getElementById("new-ws-intent-eval-model").value.trim();
   var skill = document.getElementById("new-ws-skill").value;
   var task = document.getElementById("new-ws-task").value.trim();
+  var mediaRouting = document.getElementById("new-ws-media-routing");
   var errEl = document.getElementById("new-ws-error");
   var btn = document.getElementById("new-ws-submit");
 
@@ -1742,8 +1784,14 @@ function submitNewWs() {
   if (name) body.name = name;
   if (model) body.model = model;
   if (judgeModel) body.judge_model = judgeModel;
+  if (sttModel) body.stt_model = sttModel;
+  if (ttsModel) body.tts_model = ttsModel;
+  if (visionEvalModel) body.vision_eval_model = visionEvalModel;
+  if (avEvalModel) body.av_eval_model = avEvalModel;
+  if (intentEvalModel) body.intent_eval_model = intentEvalModel;
   if (task) body.initial_message = task;
   if (skill) body.skill = skill;
+  if (mediaRouting) mediaRouting.open = false;
 
   authFetch("/v1/api/cluster/workstreams/new", {
     method: "POST",

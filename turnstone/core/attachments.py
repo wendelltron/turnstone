@@ -9,6 +9,8 @@ from typing import Any
 # constants live here so the session / tests share the same definitions.
 IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 TEXT_DOC_SIZE_CAP: int = 512 * 1024
+AUDIO_SIZE_CAP: int = 25 * 1024 * 1024
+VIDEO_SIZE_CAP: int = 25 * 1024 * 1024
 # Cap on simultaneously-pending attachments for a single (ws, user).
 # Once reserved for a queued message the row no longer counts against
 # this budget, so the name reflects the pending-pool limit rather than
@@ -18,15 +20,36 @@ MAX_PENDING_ATTACHMENTS_PER_USER_WS: int = 10
 ALLOWED_IMAGE_MIMES: frozenset[str] = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
+ALLOWED_AUDIO_MIMES: frozenset[str] = frozenset(
+    {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/ogg",
+        "audio/flac",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/webm",
+    }
+)
+ALLOWED_VIDEO_MIMES: frozenset[str] = frozenset(
+    {
+        "video/mp4",
+        "video/quicktime",
+        "video/x-msvideo",
+        "video/webm",
+    }
+)
 
 
 @dataclass(frozen=True)
 class Attachment:
     """An attachment resolved from storage, ready for injection into a turn.
 
-    ``kind`` is ``"image"`` or ``"text"``.  ``content`` is raw bytes — for
-    text attachments, UTF-8 decoded at the point of content-part
-    construction.
+    ``kind`` is ``"image"``, ``"audio"``, ``"video"``, or ``"text"``.
+    ``content`` is raw bytes — for text attachments, UTF-8 decoded at the
+    point of content-part construction.
     """
 
     attachment_id: str
@@ -42,6 +65,14 @@ class Attachment:
     @property
     def is_text(self) -> bool:
         return self.kind == "text"
+
+    @property
+    def is_audio(self) -> bool:
+        return self.kind == "audio"
+
+    @property
+    def is_video(self) -> bool:
+        return self.kind == "video"
 
 
 def unreadable_placeholder(filename: str) -> dict[str, Any]:

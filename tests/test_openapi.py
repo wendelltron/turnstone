@@ -29,6 +29,7 @@ class TestServerSpec:
             "/v1/api/dashboard",
             "/v1/api/workstreams/saved",
             "/v1/api/send",
+            "/v1/api/tts",
             "/v1/api/approve",
             "/v1/api/plan",
             "/v1/api/command",
@@ -36,6 +37,7 @@ class TestServerSpec:
             "/v1/api/events/global",
             "/v1/api/workstreams/new",
             "/v1/api/workstreams/close",
+            "/v1/api/workstreams/{ws_id}/speech-to-text",
             "/v1/api/auth/login",
             "/v1/api/auth/logout",
             "/health",
@@ -62,6 +64,34 @@ class TestServerSpec:
         send = spec["paths"]["/v1/api/send"]["post"]
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
+
+    def test_speech_and_tts_endpoints_are_documented(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        stt = spec["paths"]["/v1/api/workstreams/{ws_id}/speech-to-text"]["post"]
+        tts = spec["paths"]["/v1/api/tts"]["post"]
+        ws_new = spec["paths"]["/v1/api/workstreams/new"]["post"]
+        assert "responses" in stt
+        assert "responses" in tts
+        assert "requestBody" in tts
+        assert "application/json" in tts["requestBody"]["content"]
+        assert "requestBody" in ws_new
+
+    def test_models_schema_includes_capabilities_and_media_roles(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        schemas = spec["components"]["schemas"]
+        info = schemas["AvailableModelInfo"]
+        roles = schemas["AvailableModelMediaRoles"]
+
+        assert "capabilities" in info["properties"]
+        assert info["properties"]["capabilities"]["type"] == "object"
+        assert "media_roles" in info["properties"]
+        assert info["properties"]["media_roles"]["$ref"].endswith("/AvailableModelMediaRoles")
+        for field in ("stt", "tts", "vision_eval", "av_eval", "intent_eval"):
+            assert roles["properties"][field]["type"] == "boolean"
 
     def test_health_endpoint_not_versioned(self):
         from turnstone.api.server_spec import build_server_spec

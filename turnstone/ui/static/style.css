@@ -911,6 +911,47 @@ body { position: static; }
    ========================================================================== */
 
 /* Attachment chips — pill cluster above the textarea */
+.ts-composer-media-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: var(--radius-sm);
+  padding: 0 10px;
+  min-width: 36px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 15px;
+  transition: background 0.1s, border-color 0.1s, color 0.1s, transform 0.1s;
+}
+.ts-composer-media-btn:hover:not(:disabled) {
+  background: var(--bg-highlight);
+  color: var(--fg-bright);
+  border-color: var(--accent-dim);
+}
+.ts-composer-media-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ts-composer-media-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ts-composer-media-btn.is-recording {
+  color: var(--red);
+  border-color: var(--red);
+  background: rgba(248, 113, 113, 0.08);
+  animation: ts-media-record-pulse 1s ease-in-out infinite;
+}
+.ts-composer-media-btn.is-busy {
+  color: var(--accent);
+}
+@keyframes ts-media-record-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.06); }
+}
 .ts-composer-chips {
   display: flex;
   flex-wrap: wrap;
@@ -952,6 +993,39 @@ body { position: static; }
 .ts-composer-chip-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* New-workstream modal: attachment row + chips */
+#new-ws-media-routing {
+  margin: 6px 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 0 10px;
+  background: var(--bg-surface);
+}
+#new-ws-media-routing[open] {
+  padding-bottom: 10px;
+}
+#new-ws-media-routing summary {
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  padding: 10px 0;
+}
+#new-ws-media-routing summary::-webkit-details-marker {
+  display: none;
+}
+#new-ws-media-routing summary::after {
+  content: "▾";
+  float: right;
+  color: var(--fg-dim);
+}
+#new-ws-media-routing[open] summary::after {
+  transform: rotate(180deg);
+}
+#new-ws-media-routing label:first-of-type {
+  margin-top: 4px;
+}
 #new-ws-attach-row {
   display: flex;
   flex-direction: column;

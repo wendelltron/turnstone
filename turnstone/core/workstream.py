@@ -193,6 +193,11 @@ class WorkstreamManager:
         ws_id: str = "",
         client_type: str = "",
         judge_model: str | None = None,
+        stt_model: str | None = None,
+        tts_model: str | None = None,
+        vision_eval_model: str | None = None,
+        av_eval_model: str | None = None,
+        intent_eval_model: str | None = None,
         user_id: str = "",
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
@@ -299,6 +304,16 @@ class WorkstreamManager:
             factory_kwargs["client_type"] = client_type
         if judge_model:
             factory_kwargs["judge_model"] = judge_model
+        if stt_model:
+            factory_kwargs["stt_model"] = stt_model
+        if tts_model:
+            factory_kwargs["tts_model"] = tts_model
+        if vision_eval_model:
+            factory_kwargs["vision_eval_model"] = vision_eval_model
+        if av_eval_model:
+            factory_kwargs["av_eval_model"] = av_eval_model
+        if intent_eval_model:
+            factory_kwargs["intent_eval_model"] = intent_eval_model
         ws.session = self._session_factory(ws.ui, model, ws.id, **factory_kwargs)
 
         # Authoritative insert under lock with re-check (another thread may

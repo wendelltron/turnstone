@@ -28,6 +28,8 @@
  *                     extra listeners).
  *   sendBtn / stopBtn — supported surface for the same reason; pages
  *                     mutate textContent / aria-label on cancel.
+ *   actionsRowEl      — supported surface for callers that need to add
+ *                     page-specific controls beside attach/send/stop.
  *
  * Lifecycle: the constructor mounts DOM into `mount` (an HTMLElement).
  * Drag/drop, when enabled, listens on `dragDrop.targetEl` (typically the
@@ -176,6 +178,7 @@
       root.appendChild(actionRow);
       textRow = actionRow;
     }
+    this.actionsRowEl = actionRow;
 
     this._buildAttachButton(actionRow, opts);
     this._buildInput(textRow, opts);

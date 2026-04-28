@@ -1274,6 +1274,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_name = body.get("name", "")
     raw_model = body.get("model", "")
     raw_judge_model = body.get("judge_model", "")
+    raw_stt_model = body.get("stt_model", "")
+    raw_tts_model = body.get("tts_model", "")
+    raw_vision_eval_model = body.get("vision_eval_model", "")
+    raw_av_eval_model = body.get("av_eval_model", "")
+    raw_intent_eval_model = body.get("intent_eval_model", "")
     raw_initial_message = body.get("initial_message", "")
     raw_skill = body.get("skill", "")
     raw_resume_ws = body.get("resume_ws", "")
@@ -1285,6 +1290,16 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_model = "" if raw_model is None else None
     if not isinstance(raw_judge_model, str):
         raw_judge_model = "" if raw_judge_model is None else None
+    if not isinstance(raw_stt_model, str):
+        raw_stt_model = "" if raw_stt_model is None else None
+    if not isinstance(raw_tts_model, str):
+        raw_tts_model = "" if raw_tts_model is None else None
+    if not isinstance(raw_vision_eval_model, str):
+        raw_vision_eval_model = "" if raw_vision_eval_model is None else None
+    if not isinstance(raw_av_eval_model, str):
+        raw_av_eval_model = "" if raw_av_eval_model is None else None
+    if not isinstance(raw_intent_eval_model, str):
+        raw_intent_eval_model = "" if raw_intent_eval_model is None else None
     if not isinstance(raw_initial_message, str):
         raw_initial_message = "" if raw_initial_message is None else None
     if not isinstance(raw_skill, str):
@@ -1296,13 +1311,18 @@ async def create_workstream(request: Request) -> JSONResponse:
         or raw_name is None
         or raw_model is None
         or raw_judge_model is None
+        or raw_stt_model is None
+        or raw_tts_model is None
+        or raw_vision_eval_model is None
+        or raw_av_eval_model is None
+        or raw_intent_eval_model is None
         or raw_initial_message is None
         or raw_skill is None
         or raw_resume_ws is None
     ):
         return JSONResponse(
             {
-                "error": "node_id, name, model, judge_model, initial_message, skill, and resume_ws must be strings"
+                "error": "node_id, name, model, judge_model, stt_model, tts_model, vision_eval_model, av_eval_model, intent_eval_model, initial_message, skill, and resume_ws must be strings"
             },
             status_code=400,
         )
@@ -1310,6 +1330,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     name = raw_name[:256]
     model = raw_model[:128]
     judge_model = raw_judge_model[:128]
+    stt_model = raw_stt_model[:128]
+    tts_model = raw_tts_model[:128]
+    vision_eval_model = raw_vision_eval_model[:128]
+    av_eval_model = raw_av_eval_model[:128]
+    intent_eval_model = raw_intent_eval_model[:128]
     initial_message = raw_initial_message[:4096]
     skill = raw_skill[:256]
     resume_ws = raw_resume_ws[:64]
@@ -1342,6 +1367,11 @@ async def create_workstream(request: Request) -> JSONResponse:
         "name": name,
         "model": model,
         "judge_model": judge_model,
+        "stt_model": stt_model,
+        "tts_model": tts_model,
+        "vision_eval_model": vision_eval_model,
+        "av_eval_model": av_eval_model,
+        "intent_eval_model": intent_eval_model,
         "initial_message": initial_message,
         "skill": skill,
         "resume_ws": resume_ws,

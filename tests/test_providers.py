@@ -219,6 +219,19 @@ class TestOpenAIProvider:
         result = sanitize_messages(msgs)
         assert result[0]["content"] is None
 
+    def test_sanitize_messages_preserves_audio_and_video_parts(self) -> None:
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,AAAA"}},
+                    {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,BBBB"}},
+                    {"type": "text", "text": "describe this"},
+                ],
+            }
+        ]
+        assert sanitize_messages(msgs) == msgs
+
     def test_sanitize_messages_does_not_mutate_original(self) -> None:
         original = {"role": "assistant", "content": None}
         sanitize_messages([original])

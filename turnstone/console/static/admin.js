@@ -22,6 +22,11 @@ var ALIAS_SETTING_KEYS = [
   "model.plan_alias",
   "model.task_alias",
   "channels.default_model_alias",
+  "audio.stt_model_alias",
+  "audio.tts_model_alias",
+  "audio.vision_eval_model_alias",
+  "audio.av_eval_model_alias",
+  "audio.intent_eval_model_alias",
 ];
 
 // Settings whose empty option means "inherit from a fallback chain", as

@@ -180,10 +180,15 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 _IMAGE_SIZE_CAP = _ATTACH_IMAGE_SIZE_CAP
 
 
-def _encode_image_data_uri(raw: bytes, mime: str) -> str:
-    """Wrap raw image bytes as a ``data:{mime};base64,...`` URI."""
+def _encode_media_data_uri(raw: bytes, mime: str) -> str:
+    """Wrap raw media bytes as a ``data:{mime};base64,...`` URI."""
     b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+
+def _encode_image_data_uri(raw: bytes, mime: str) -> str:
+    """Wrap raw image bytes as a ``data:{mime};base64,...`` URI."""
+    return _encode_media_data_uri(raw, mime)
 
 
 # Upper bound on total skill content injected into system messages
@@ -348,6 +353,11 @@ class ChatSession:
         self._governance_lock = threading.Lock()
         self._registry = registry
         self._model_alias = model_alias
+        self._stt_model_alias: str = ""
+        self._tts_model_alias: str = ""
+        self._vision_eval_model_alias: str = ""
+        self._av_eval_model_alias: str = ""
+        self._intent_eval_model_alias: str = ""
         self._health_registry = health_registry
         # Resolve provider for the current model
         self._provider: LLMProvider = (
@@ -652,6 +662,11 @@ class ChatSession:
                 # up to 32KB per active workstream — acceptable trade-off for correctness.
                 "applied_skill_content": self._applied_skill_content,
                 "notify_on_complete": self._notify_on_complete,
+                "stt_model_alias": self._stt_model_alias,
+                "tts_model_alias": self._tts_model_alias,
+                "vision_eval_model_alias": self._vision_eval_model_alias,
+                "av_eval_model_alias": self._av_eval_model_alias,
+                "intent_eval_model_alias": self._intent_eval_model_alias,
             },
         )
 
@@ -1319,6 +1334,16 @@ class ChatSession:
                     self._skill_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
+            if "stt_model_alias" in config:
+                self._stt_model_alias = config["stt_model_alias"]
+            if "tts_model_alias" in config:
+                self._tts_model_alias = config["tts_model_alias"]
+            if "vision_eval_model_alias" in config:
+                self._vision_eval_model_alias = config["vision_eval_model_alias"]
+            if "av_eval_model_alias" in config:
+                self._av_eval_model_alias = config["av_eval_model_alias"]
+            if "intent_eval_model_alias" in config:
+                self._intent_eval_model_alias = config["intent_eval_model_alias"]
         # When forking, persist the copied messages and restored config under
         # the fork's own ws_id so they survive restarts.
         if fork:
@@ -1977,6 +2002,24 @@ class ChatSession:
                             },
                         }
                     )
+                elif att.is_audio:
+                    parts.append(
+                        {
+                            "type": "audio_url",
+                            "audio_url": {
+                                "url": _encode_media_data_uri(att.content, att.mime_type),
+                            },
+                        }
+                    )
+                elif att.is_video:
+                    parts.append(
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": _encode_media_data_uri(att.content, att.mime_type),
+                            },
+                        }
+                    )
                 elif att.is_text:
                     try:
                         text = att.content.decode("utf-8")
@@ -2011,8 +2054,8 @@ class ChatSession:
         user_msg: dict[str, Any] = {"role": "user", "content": user_content}
         if attachments:
             # Sibling metadata so live history replay has the same shape
-            # as reloaded-from-DB (filenames are not recoverable from an
-            # image_url data URI).  sanitize_messages strips leading-
+            # as reloaded-from-DB (filenames are not recoverable from media
+            # data URIs).  sanitize_messages strips leading-
             # underscore keys before the wire call so this is safe.
             user_msg["_attachments_meta"] = [
                 {

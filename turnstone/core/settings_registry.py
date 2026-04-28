@@ -131,6 +131,52 @@ def _build_registry() -> dict[str, SettingDef]:
             "fast subtasks where deep reasoning is wasteful. (Empty here means \u201cinherit\u201d "
             "\u2014 use \u2018none\u2019 to actually disable reasoning.)",
         ),
+        # -- media / speech -------------------------------------------------
+        SettingDef(
+            "audio.stt_model_alias",
+            "str",
+            "",
+            "Default model alias for speech-to-text (empty = provider fallback)",
+            "audio",
+            help="Which model alias or backend alias handles speech-to-text requests. Leave empty "
+            "to use the server fallback chain for transcription.",
+        ),
+        SettingDef(
+            "audio.tts_model_alias",
+            "str",
+            "",
+            "Default model alias for text-to-speech (empty = provider fallback)",
+            "audio",
+            help="Which model alias or backend alias handles text-to-speech synthesis. Leave empty "
+            "to use the server fallback chain for speech output.",
+        ),
+        SettingDef(
+            "audio.vision_eval_model_alias",
+            "str",
+            "",
+            "Default model alias for image/webcam evaluation",
+            "audio",
+            help="Which model alias evaluates webcam snapshots or image attachments before they are "
+            "fed into the main conversation flow.",
+        ),
+        SettingDef(
+            "audio.av_eval_model_alias",
+            "str",
+            "",
+            "Default model alias for audio/video evaluation",
+            "audio",
+            help="Which model alias evaluates uploaded audio clips or video clips for summary, "
+            "transcription, or metadata extraction.",
+        ),
+        SettingDef(
+            "audio.intent_eval_model_alias",
+            "str",
+            "",
+            "Default model alias for speech intent evaluation",
+            "audio",
+            help="Which model alias performs second-pass intent evaluation on transcripts or media "
+            "summaries before they are sent to the main agent.",
+        ),
         # -- session --------------------------------------------------------
         SettingDef(
             "session.instructions",

@@ -187,6 +187,18 @@ class ModelRegistry:
             return self.task_effort
         return None
 
+    def resolve_media_alias(self, kind: str, default_alias: str = "") -> str | None:
+        """Return the configured alias for a media/evaluator role.
+
+        Roles such as ``stt`` / ``tts`` / ``vision_eval`` are configured via
+        settings, not dedicated registry slots, so this helper currently just
+        normalizes the provided alias and validates existence.
+        """
+        alias = (default_alias or "").strip()
+        if not alias:
+            return None
+        return alias if self.has_alias(alias) else None
+
     @property
     def count(self) -> int:
         """Number of registered models."""

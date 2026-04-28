@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -64,16 +64,46 @@ class AttachmentInfo(BaseModel):
     filename: str = Field(description="Original upload filename")
     mime_type: str = Field(description="Canonicalized MIME type")
     size_bytes: int = Field(description="Payload size in bytes")
-    kind: str = Field(description="'image' or 'text'", examples=["image", "text"])
+    kind: str = Field(
+        description="'image', 'audio', 'video', or 'text'",
+        examples=["image", "audio", "video", "text"],
+    )
 
 
 class UploadAttachmentResponse(AttachmentInfo):
     """Returned after a successful upload."""
 
 
+class SpeechToTextResponse(BaseModel):
+    status: str = Field(default="ok", description="Request outcome")
+    transcript: str = Field(description="Transcribed text")
+    mime_type: str = Field(description="Uploaded audio MIME type")
+    sent: bool = Field(
+        default=False,
+        description="Whether the transcript was forwarded to the workstream send path",
+    )
+    send_result: dict = Field(
+        default_factory=dict,
+        description="Raw send-path outcome when auto_send was requested",
+    )
+    model_alias: str = Field(
+        default="",
+        description="Effective speech-to-text model alias override, when configured",
+    )
+
+
 class ListAttachmentsResponse(BaseModel):
     attachments: list[AttachmentInfo] = Field(
         description="Pending (unconsumed) attachments for caller+workstream"
+    )
+
+
+class TextToSpeechRequest(BaseModel):
+    text: str = Field(description="Text to synthesize")
+    voice: str = Field(default="", description="Optional voice identifier")
+    ws_id: str = Field(
+        default="",
+        description="Optional workstream id so per-workstream TTS routing overrides can be applied",
     )
 
 
@@ -108,6 +138,30 @@ class CancelRequest(BaseModel):
 class CreateWorkstreamRequest(BaseModel):
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")
+    judge_model: str = Field(
+        default="",
+        description="Override judge model alias for this workstream",
+    )
+    stt_model: str = Field(
+        default="",
+        description="Override speech-to-text model alias for this workstream",
+    )
+    tts_model: str = Field(
+        default="",
+        description="Override text-to-speech model alias for this workstream",
+    )
+    vision_eval_model: str = Field(
+        default="",
+        description="Override image/webcam evaluator model alias for this workstream",
+    )
+    av_eval_model: str = Field(
+        default="",
+        description="Override audio/video evaluator model alias for this workstream",
+    )
+    intent_eval_model: str = Field(
+        default="",
+        description="Override intent evaluator model alias for this workstream",
+    )
     auto_approve: bool = Field(default=False, description="Auto-approve all tool calls")
     resume_ws: str = Field(
         default="",
@@ -373,10 +427,20 @@ class ListSkillSummaryResponse(BaseModel):
     skills: list[SkillSummary]
 
 
+class AvailableModelMediaRoles(BaseModel):
+    stt: bool = False
+    tts: bool = False
+    vision_eval: bool = False
+    av_eval: bool = False
+    intent_eval: bool = False
+
+
 class AvailableModelInfo(BaseModel):
     alias: str
     model: str
     provider: str
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    media_roles: AvailableModelMediaRoles = Field(default_factory=AvailableModelMediaRoles)
 
 
 class ListAvailableModelsResponse(BaseModel):

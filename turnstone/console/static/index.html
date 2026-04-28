@@ -889,6 +889,19 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <select id="new-ws-judge">
       <option value="">Default (agent model)</option>
     </select>
+    <details id="new-ws-media-routing" class="new-ws-media-routing">
+      <summary>Advanced media routing</summary>
+      <label for="new-ws-stt-model">Speech-to-Text Model <span class="label-hint">optional</span></label>
+      <select id="new-ws-stt-model"><option value="">Default STT model</option></select>
+      <label for="new-ws-tts-model">Text-to-Speech Model <span class="label-hint">optional</span></label>
+      <select id="new-ws-tts-model"><option value="">Default TTS model</option></select>
+      <label for="new-ws-vision-eval-model">Vision Evaluator Model <span class="label-hint">optional</span></label>
+      <select id="new-ws-vision-eval-model"><option value="">Default vision evaluator</option></select>
+      <label for="new-ws-av-eval-model">Audio/Video Evaluator Model <span class="label-hint">optional</span></label>
+      <select id="new-ws-av-eval-model"><option value="">Default audio/video evaluator</option></select>
+      <label for="new-ws-intent-eval-model">Intent Evaluator Model <span class="label-hint">optional</span></label>
+      <select id="new-ws-intent-eval-model"><option value="">Default intent evaluator</option></select>
+    </details>
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>

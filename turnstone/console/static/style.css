@@ -1438,6 +1438,16 @@
   .notify-row-remove { order: 2; margin-left: auto; }
 }
 
+#new-ws-media-routing {
+  margin: 8px 0 10px;
+}
+#new-ws-media-routing summary {
+  cursor: pointer;
+}
+#new-ws-media-routing label:first-of-type {
+  margin-top: 8px;
+}
+
 .admin-details { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 0 12px; }
 .admin-details[open] { padding-bottom: 12px; }
 .admin-details summary {

@@ -12,6 +12,8 @@ import queue
 import threading
 from unittest.mock import MagicMock
 
+from turnstone.core.auth import required_scope
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -128,6 +130,30 @@ class TestUploadHappyPath:
         assert body["kind"] == "text"
         assert body["mime_type"] == "text/markdown"
 
+    def test_upload_audio_by_mime(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("voice.wav", b"RIFFfake", "audio/wav")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kind"] == "audio"
+        assert body["mime_type"] == "audio/wav"
+
+    def test_upload_video_by_extension_when_mime_missing(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/attachments",
+            files={"file": ("clip.mp4", b"not_a_real_mp4", "application/octet-stream")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kind"] == "video"
+        assert body["mime_type"] == "video/mp4"
+
     def test_upload_by_extension_when_mime_missing(self, app_client):
         client, _ = app_client
         # Send an application/octet-stream body — only extension should save it.
@@ -138,6 +164,33 @@ class TestUploadHappyPath:
         )
         assert resp.status_code == 200
         assert resp.json()["kind"] == "text"
+
+
+class TestSpeechAndSnapshotEndpoints:
+    def test_auth_scope_classification_for_speech_and_tts(self):
+        assert required_scope("POST", "/v1/api/tts") == "write"
+        assert required_scope("POST", "/v1/api/workstreams/ws-A/speech-to-text") == "write"
+
+    def test_speech_to_text_without_backend_returns_503(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/workstreams/ws-A/speech-to-text",
+            files={"audio": ("speech.webm", b"RIFFfake", "audio/webm")},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 503
+        assert "Speech transcription is not configured" in resp.json()["error"]
+
+    def test_tts_fallback_returns_audio(self, app_client):
+        client, _ = app_client
+        resp = client.post(
+            "/v1/api/tts",
+            json={"text": "hello world"},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("audio/wav")
+        assert resp.content.startswith(b"RIFF")
 
 
 class TestUploadRejections:

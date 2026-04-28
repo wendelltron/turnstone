@@ -152,6 +152,21 @@ class ConsoleCreateWsRequest(BaseModel):
     judge_model: str = Field(
         default="", description="Override judge model alias for this workstream"
     )
+    stt_model: str = Field(
+        default="", description="Override speech-to-text model alias for this workstream"
+    )
+    tts_model: str = Field(
+        default="", description="Override text-to-speech model alias for this workstream"
+    )
+    vision_eval_model: str = Field(
+        default="", description="Override image/webcam evaluator model alias for this workstream"
+    )
+    av_eval_model: str = Field(
+        default="", description="Override audio/video evaluator model alias for this workstream"
+    )
+    intent_eval_model: str = Field(
+        default="", description="Override intent evaluator model alias for this workstream"
+    )
 
 
 class ConsoleCreateWsResponse(BaseModel):

@@ -1262,6 +1262,25 @@ class TestCreateWorkstreamRequestModel:
         req = CreateWorkstreamRequest(name="test")
         assert req.model == ""
 
+    def test_request_accepts_media_routing_fields(self) -> None:
+        from turnstone.api.server_schemas import CreateWorkstreamRequest
+
+        req = CreateWorkstreamRequest(
+            name="test",
+            judge_model="judge-x",
+            stt_model="stt-x",
+            tts_model="tts-x",
+            vision_eval_model="vision-x",
+            av_eval_model="av-x",
+            intent_eval_model="intent-x",
+        )
+        assert req.judge_model == "judge-x"
+        assert req.stt_model == "stt-x"
+        assert req.tts_model == "tts-x"
+        assert req.vision_eval_model == "vision-x"
+        assert req.av_eval_model == "av-x"
+        assert req.intent_eval_model == "intent-x"
+
     def test_json_payload_carries_model(self) -> None:
         body = {"name": "ws1", "model": "local"}
         assert body["model"] == "local"

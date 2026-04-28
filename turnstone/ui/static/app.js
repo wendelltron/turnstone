@@ -36,6 +36,19 @@ function Pane(wsId) {
   // Map<attachment_id, {filename, size_bytes, mime_type, kind}>
   this.pendingAttachments = new Map();
   this.attachChipsEl = null;
+  this.mediaRecorder = null;
+  this.recordedAudioChunks = [];
+  this.isRecording = false;
+  this._recordingStream = null;
+  this._recordingMimeType = "";
+  this._discardRecording = false;
+  this._ttsEnabled = true;
+  this._ttsBusy = false;
+  this._ttsAudio = null;
+  this._ttsLastText = "";
+  this._ttsBtn = null;
+  this._micBtn = null;
+  this._cameraBtn = null;
   this._createDOM();
 }
 
@@ -193,18 +206,25 @@ Pane.prototype._createDOM = function () {
   this.inputEl = this.composer.inputEl;
   this.sendBtn = this.composer.sendBtn;
   this.stopBtn = this.composer.stopBtn;
+
+  this._buildMediaControls();
+  this._syncMediaButtons();
 };
 
 Pane.prototype.reset = function () {
   this.currentAssistantEl = null;
   this.currentReasoningEl = null;
   this.contentBuffer = "";
+  this._ttsLastText = "";
   this.setBusy(false);
   this.pendingApproval = false;
   this.approvalBlockEl = null;
   this._pendingEditSend = null;
   this.inputEl.disabled = false;
   this.clearAttachmentChips();
+  this.stopTTSPlayback();
+  this.stopRecording(true);
+  this._syncMediaButtons();
 };
 
 // ---------------------------------------------------------------------------
@@ -430,6 +450,8 @@ Pane.prototype.disconnectSSE = function () {
     this.evtSource.close();
     this.evtSource = null;
   }
+  this.stopRecording(true);
+  this.stopTTSPlayback();
 };
 
 Pane.prototype.setBusy = function (b) {
@@ -664,11 +686,14 @@ Pane.prototype.handleEvent = function (evt) {
       this.currentReasoningEl = null;
       this.contentBuffer = "";
       this.scrollToBottom(true);
+      this._updateLastAssistantText();
+      this._syncMediaButtons();
       break;
 
     case "state_change":
       if (evt.state === "idle" || evt.state === "error") {
         this.setBusy(false);
+        this._syncMediaButtons();
         this._attachRetryToLastAssistant();
         // Only steal focus if this is the active pane and no approval pending.
         if (this.id === focusedPaneId && !this.pendingApproval) {
@@ -850,6 +875,351 @@ Pane.prototype.addThinkingIndicator = function () {
 Pane.prototype.removeThinkingIndicator = function () {
   var el = this.messagesEl.querySelector(".thinking-indicator");
   if (el) el.remove();
+};
+
+Pane.prototype._buildMediaControls = function () {
+  if (!this.composer || !this.composer.actionsRowEl) return;
+  var self = this;
+
+  this._micBtn = document.createElement("button");
+  this._micBtn.type = "button";
+  this._micBtn.className = "ts-composer-media-btn ts-composer-mic-btn";
+  this._micBtn.title = "Record speech to text";
+  this._micBtn.setAttribute("aria-label", "Record speech to text");
+  this._micBtn.textContent = "🎙";
+  this._micBtn.addEventListener("click", function () {
+    self.toggleRecording();
+  });
+  this.composer.actionsRowEl.insertBefore(
+    this._micBtn,
+    this.sendBtn || this.stopBtn || null,
+  );
+
+  this._cameraBtn = document.createElement("button");
+  this._cameraBtn.type = "button";
+  this._cameraBtn.className = "ts-composer-media-btn ts-composer-camera-btn";
+  this._cameraBtn.title = "Capture webcam snapshot";
+  this._cameraBtn.setAttribute("aria-label", "Capture webcam snapshot");
+  this._cameraBtn.textContent = "📷";
+  this._cameraBtn.addEventListener("click", function () {
+    self.captureSnapshot();
+  });
+  this.composer.actionsRowEl.insertBefore(
+    this._cameraBtn,
+    this.sendBtn || this.stopBtn || null,
+  );
+
+  this._ttsBtn = document.createElement("button");
+  this._ttsBtn.type = "button";
+  this._ttsBtn.className = "ts-composer-media-btn ts-composer-tts-btn";
+  this._ttsBtn.title = "Play last assistant response";
+  this._ttsBtn.setAttribute("aria-label", "Play last assistant response");
+  this._ttsBtn.textContent = "🔊";
+  this._ttsBtn.addEventListener("click", function () {
+    self.playLastAssistantTTS();
+  });
+  this.composer.actionsRowEl.insertBefore(
+    this._ttsBtn,
+    this.sendBtn || this.stopBtn || null,
+  );
+};
+
+Pane.prototype._syncMediaButtons = function () {
+  if (this._micBtn) {
+    this._micBtn.classList.toggle("is-recording", !!this.isRecording);
+    this._micBtn.textContent = this.isRecording ? "⏺" : "🎙";
+    this._micBtn.title = this.isRecording
+      ? "Stop recording and transcribe"
+      : "Record speech to text";
+    this._micBtn.setAttribute(
+      "aria-label",
+      this.isRecording
+        ? "Stop recording and transcribe"
+        : "Record speech to text",
+    );
+  }
+  if (this._cameraBtn) {
+    this._cameraBtn.disabled = !!this.busy;
+  }
+  if (this._ttsBtn) {
+    var hasText = !!(this._ttsLastText && this._ttsLastText.trim());
+    this._ttsBtn.disabled = !hasText || !!this._ttsBusy;
+    this._ttsBtn.classList.toggle("is-busy", !!this._ttsBusy);
+    if (this._ttsBusy) {
+      this._ttsBtn.textContent = "…";
+      this._ttsBtn.title = "Synthesizing speech";
+      this._ttsBtn.setAttribute("aria-label", "Synthesizing speech");
+    } else {
+      this._ttsBtn.textContent = "🔊";
+      this._ttsBtn.title = hasText
+        ? "Play last assistant response"
+        : "No assistant response available";
+      this._ttsBtn.setAttribute(
+        "aria-label",
+        hasText ? "Play last assistant response" : "No assistant response available",
+      );
+    }
+  }
+};
+
+Pane.prototype._guessRecordingMimeType = function () {
+  if (typeof MediaRecorder === "undefined") return "";
+  var candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) {
+      return candidates[i];
+    }
+  }
+  return "";
+};
+
+Pane.prototype.toggleRecording = function () {
+  if (this.isRecording) {
+    this.stopRecording(false);
+    return;
+  }
+  this.startRecording();
+};
+
+Pane.prototype.startRecording = function () {
+  var self = this;
+  if (this.isRecording) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast("Microphone capture is not supported in this browser");
+    return;
+  }
+  navigator.mediaDevices
+    .getUserMedia({ audio: true })
+    .then(function (stream) {
+      var mimeType = self._guessRecordingMimeType();
+      var rec = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
+      self._recordingMimeType = rec.mimeType || mimeType || "audio/webm";
+      self.mediaRecorder = rec;
+      self.recordedAudioChunks = [];
+      self._recordingStream = stream;
+      rec.addEventListener("dataavailable", function (evt) {
+        if (evt.data && evt.data.size > 0) {
+          self.recordedAudioChunks.push(evt.data);
+        }
+      });
+      rec.addEventListener("stop", function () {
+        var chunks = self.recordedAudioChunks.slice();
+        var discard = !!self._discardRecording;
+        self._discardRecording = false;
+        self.recordedAudioChunks = [];
+        self.isRecording = false;
+        self._syncMediaButtons();
+        self._teardownRecordingStream();
+        self.mediaRecorder = null;
+        if (discard || !chunks.length) return;
+        var blob = new Blob(chunks, { type: self._recordingMimeType || "audio/webm" });
+        self.uploadAudioForSTT(blob);
+      });
+      rec.start();
+      self.isRecording = true;
+      self._syncMediaButtons();
+      showToast("Recording… click again to stop");
+    })
+    .catch(function (err) {
+      showToast("Microphone unavailable: " + ((err && err.message) || "permission denied"));
+    });
+};
+
+Pane.prototype._teardownRecordingStream = function () {
+  if (this._recordingStream && this._recordingStream.getTracks) {
+    this._recordingStream.getTracks().forEach(function (track) {
+      try {
+        track.stop();
+      } catch (_e) {}
+    });
+  }
+  this._recordingStream = null;
+};
+
+Pane.prototype.stopRecording = function (discard) {
+  if (!this.mediaRecorder) {
+    this.isRecording = false;
+    this._teardownRecordingStream();
+    this._syncMediaButtons();
+    return;
+  }
+  var rec = this.mediaRecorder;
+  this._discardRecording = !!discard;
+  if (rec.state !== "inactive") {
+    rec.stop();
+  } else if (discard) {
+    this.recordedAudioChunks = [];
+    this.isRecording = false;
+    this._discardRecording = false;
+    this._teardownRecordingStream();
+    this.mediaRecorder = null;
+    this._syncMediaButtons();
+  }
+};
+
+Pane.prototype.uploadAudioForSTT = function (blob) {
+  if (!this.wsId || !blob || !blob.size) return;
+  var self = this;
+  var ext = ".webm";
+  var mime = blob.type || "audio/webm";
+  if (mime.indexOf("ogg") !== -1) ext = ".ogg";
+  else if (mime.indexOf("mp4") !== -1 || mime.indexOf("mpeg") !== -1) ext = ".m4a";
+  var fd = new FormData();
+  fd.append("audio", blob, "speech" + ext);
+
+  if (this.busy) {
+    showToast("Wait for the current turn to finish before transcribing audio");
+    return;
+  }
+  this.setBusy(true);
+  authFetch(
+    "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/speech-to-text?auto_send=true",
+    { method: "POST", body: fd },
+  )
+    .then(function (r) {
+      return r.json().then(function (body) {
+        return { ok: r.ok, body: body };
+      });
+    })
+    .then(function (res) {
+      if (!res.ok) {
+        self.addErrorMessage((res.body && res.body.error) || "Speech transcription failed");
+        self.setBusy(false);
+        return;
+      }
+      if (res.body && res.body.transcript) {
+        self.addUserMessage(res.body.transcript);
+        self.composer.clear();
+      }
+    })
+    .catch(function (err) {
+      self.addErrorMessage("Speech transcription failed: " + err.message);
+      self.setBusy(false);
+    });
+};
+
+Pane.prototype.captureSnapshot = function () {
+  var self = this;
+  if (this.busy) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast("Camera capture is not supported in this browser");
+    return;
+  }
+  navigator.mediaDevices
+    .getUserMedia({ video: true })
+    .then(function (stream) {
+      var video = document.createElement("video");
+      video.playsInline = true;
+      video.muted = true;
+      video.srcObject = stream;
+      var cleanup = function () {
+        stream.getTracks().forEach(function (track) {
+          try {
+            track.stop();
+          } catch (_e) {}
+        });
+      };
+      var capture = function () {
+        var width = video.videoWidth || 1280;
+        var height = video.videoHeight || 720;
+        var canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        var ctx = canvas.getContext("2d");
+        if (!ctx) {
+          cleanup();
+          showToast("Snapshot capture failed");
+          return;
+        }
+        ctx.drawImage(video, 0, 0, width, height);
+        canvas.toBlob(
+          function (blob) {
+            cleanup();
+            if (!blob) {
+              showToast("Snapshot capture failed");
+              return;
+            }
+            var file = new File(
+              [blob],
+              "snapshot-" + new Date().toISOString().replace(/[:.]/g, "-") + ".png",
+              { type: "image/png" },
+            );
+            self.uploadAttachment(file);
+          },
+          "image/png",
+          0.92,
+        );
+      };
+      video.addEventListener(
+        "loadedmetadata",
+        function () {
+          video.play().then(function () {
+            setTimeout(capture, 120);
+          });
+        },
+        { once: true },
+      );
+    })
+    .catch(function (err) {
+      showToast("Camera unavailable: " + ((err && err.message) || "permission denied"));
+    });
+};
+
+Pane.prototype.stopTTSPlayback = function () {
+  if (this._ttsAudio) {
+    try {
+      this._ttsAudio.pause();
+      this._ttsAudio.src = "";
+    } catch (_e) {}
+    this._ttsAudio = null;
+  }
+};
+
+Pane.prototype.playLastAssistantTTS = function () {
+  if (!this._ttsLastText || !this._ttsLastText.trim() || this._ttsBusy) return;
+  var self = this;
+  this.stopTTSPlayback();
+  this._ttsBusy = true;
+  this._syncMediaButtons();
+  authFetch("/v1/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: this._ttsLastText, ws_id: this.wsId || "" }),
+  })
+    .then(function (r) {
+      if (!r.ok) {
+        return r.json().then(function (body) {
+          throw new Error((body && body.error) || "TTS failed");
+        });
+      }
+      return r.blob();
+    })
+    .then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var audio = new Audio(url);
+      self._ttsAudio = audio;
+      audio.addEventListener("ended", function () {
+        URL.revokeObjectURL(url);
+        if (self._ttsAudio === audio) self._ttsAudio = null;
+      });
+      audio.addEventListener("error", function () {
+        URL.revokeObjectURL(url);
+        if (self._ttsAudio === audio) self._ttsAudio = null;
+      });
+      return audio.play();
+    })
+    .catch(function (err) {
+      showToast("TTS failed: " + err.message);
+    })
+    .finally(function () {
+      self._ttsBusy = false;
+      self._syncMediaButtons();
+    });
 };
 
 Pane.prototype.addUserMessage = function (text, attachments) {
@@ -1151,6 +1521,16 @@ Pane.prototype._editAndResend = function (msgEl, newText) {
     });
 };
 
+Pane.prototype._updateLastAssistantText = function () {
+  var assistants = this.messagesEl.querySelectorAll(".ts-msg--assistant .ts-msg-body");
+  var text = "";
+  if (assistants.length) {
+    text = (assistants[assistants.length - 1].innerText || "").trim();
+  }
+  this._ttsLastText = text;
+  this._syncMediaButtons();
+};
+
 Pane.prototype.replayHistory = function (messages) {
   var self = this;
   this.messagesEl.innerHTML = "";
@@ -1274,6 +1654,7 @@ Pane.prototype.replayHistory = function (messages) {
     }
   }
   this._attachRetryToLastAssistant();
+  this._updateLastAssistantText();
   this.scrollToBottom();
 };
 
@@ -1837,6 +2218,7 @@ Pane.prototype.sendMessage = function () {
     this.addUserMessage(text, attachmentList);
   }
   this.composer.clear();
+  this._syncMediaButtons();
 
   authFetch("/v1/api/send", {
     method: "POST",
@@ -3197,10 +3579,20 @@ function showNewWsModal(forkFromWsId) {
   // Populate model dropdown
   var modelSelect = document.getElementById("new-ws-model");
   var judgeSelect = document.getElementById("new-ws-judge-model");
+  var sttSelect = document.getElementById("new-ws-stt-model");
+  var ttsSelect = document.getElementById("new-ws-tts-model");
+  var visionEvalSelect = document.getElementById("new-ws-vision-eval-model");
+  var avEvalSelect = document.getElementById("new-ws-av-eval-model");
+  var intentEvalSelect = document.getElementById("new-ws-intent-eval-model");
   var fp = getFocusedPane();
   var curModel = fp ? fp.modelAlias || fp.model || "" : "";
   modelSelect.textContent = "";
   judgeSelect.textContent = "";
+  if (sttSelect) sttSelect.textContent = "";
+  if (ttsSelect) ttsSelect.textContent = "";
+  if (visionEvalSelect) visionEvalSelect.textContent = "";
+  if (avEvalSelect) avEvalSelect.textContent = "";
+  if (intentEvalSelect) intentEvalSelect.textContent = "";
   var defaultOpt = document.createElement("option");
   defaultOpt.value = "";
   defaultOpt.textContent = curModel
@@ -3211,6 +3603,20 @@ function showNewWsModal(forkFromWsId) {
   defJudgeOpt.value = "";
   defJudgeOpt.textContent = "Default (agent model)";
   judgeSelect.appendChild(defJudgeOpt);
+  [
+    [sttSelect, "Default STT model"],
+    [ttsSelect, "Default TTS model"],
+    [visionEvalSelect, "Default vision evaluator"],
+    [avEvalSelect, "Default audio/video evaluator"],
+    [intentEvalSelect, "Default intent evaluator"],
+  ].forEach(function (entry) {
+    var sel = entry[0];
+    if (!sel) return;
+    var opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = entry[1];
+    sel.appendChild(opt);
+  });
   authFetch("/v1/api/models")
     .then(function (r) {
       return r.json();
@@ -3227,6 +3633,14 @@ function showNewWsModal(forkFromWsId) {
         judgeOpt.value = m.alias;
         judgeOpt.textContent = opt.textContent;
         judgeSelect.appendChild(judgeOpt);
+
+        [sttSelect, ttsSelect, visionEvalSelect, avEvalSelect, intentEvalSelect].forEach(function (sel) {
+          if (!sel) return;
+          var extraOpt = document.createElement("option");
+          extraOpt.value = m.alias;
+          extraOpt.textContent = opt.textContent;
+          sel.appendChild(extraOpt);
+        });
       });
     })
     .catch(function () {
@@ -3255,8 +3669,15 @@ function showNewWsModal(forkFromWsId) {
     });
 
   document.getElementById("new-ws-name").value = "";
+  if (sttSelect) sttSelect.value = "";
+  if (ttsSelect) ttsSelect.value = "";
+  if (visionEvalSelect) visionEvalSelect.value = "";
+  if (avEvalSelect) avEvalSelect.value = "";
+  if (intentEvalSelect) intentEvalSelect.value = "";
   var initEl = document.getElementById("new-ws-initial-message");
   if (initEl) initEl.value = "";
+  var mediaRouting = document.getElementById("new-ws-media-routing");
+  if (mediaRouting) mediaRouting.open = false;
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
   errEl.textContent = "";
@@ -3351,12 +3772,22 @@ function submitNewWs() {
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
   var judge_model = document.getElementById("new-ws-judge-model").value.trim();
+  var stt_model = document.getElementById("new-ws-stt-model").value.trim();
+  var tts_model = document.getElementById("new-ws-tts-model").value.trim();
+  var vision_eval_model = document.getElementById("new-ws-vision-eval-model").value.trim();
+  var av_eval_model = document.getElementById("new-ws-av-eval-model").value.trim();
+  var intent_eval_model = document.getElementById("new-ws-intent-eval-model").value.trim();
   var skill = document.getElementById("new-ws-skill").value;
   var initEl = document.getElementById("new-ws-initial-message");
   var initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
   if (model) body.model = model;
   if (judge_model) body.judge_model = judge_model;
+  if (stt_model) body.stt_model = stt_model;
+  if (tts_model) body.tts_model = tts_model;
+  if (vision_eval_model) body.vision_eval_model = vision_eval_model;
+  if (av_eval_model) body.av_eval_model = av_eval_model;
+  if (intent_eval_model) body.intent_eval_model = intent_eval_model;
   if (skill && !_forkFromWsId) body.skill = skill;
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
   if (initial_message) body.initial_message = initial_message;

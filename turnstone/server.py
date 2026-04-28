@@ -18,6 +18,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -94,6 +95,22 @@ _MAX_TURN_CONTENT_CHARS = 256 * 1024  # cap piggybacked content on idle events
 # unreservation of attachments uploaded long ago but reserved fresh.
 _ORPHAN_SWEEP_INTERVAL_S = 30 * 60
 _ORPHAN_SWEEP_THRESHOLD_S = 1 * 3600
+
+_AUDIO_UPLOAD_SIZE_CAP = 25 * 1024 * 1024
+_AUDIO_VIDEO_ATTACHMENT_SIZE_CAP = 25 * 1024 * 1024
+_DEFAULT_STT_MODEL = os.environ.get("TURNSTONE_STT_MODEL", "gpt-4o-mini-transcribe")
+_DEFAULT_TTS_MODEL = os.environ.get("TURNSTONE_TTS_MODEL", "gpt-4o-mini-tts")
+_DEFAULT_TTS_VOICE = os.environ.get("TURNSTONE_TTS_VOICE", "alloy")
+_LOCAL_STT_MODEL = os.environ.get("TURNSTONE_STT_LOCAL_MODEL", "base.en")
+_LOCAL_KOKORO_MODEL_URL = os.environ.get(
+    "TURNSTONE_KOKORO_MODEL_URL",
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx",
+)
+_LOCAL_KOKORO_VOICES_URL = os.environ.get(
+    "TURNSTONE_KOKORO_VOICES_URL",
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
+)
+
 
 
 class WebUI:
@@ -1391,8 +1408,20 @@ async def list_skills_summary(request: Request) -> JSONResponse:
     return JSONResponse({"skills": skills})
 
 
+def _ws_session_from_request(request: Request, ws_id: str = "") -> Any | None:
+    if not ws_id:
+        return None
+    mgr = getattr(request.app.state, "workstreams", None)
+    if mgr is None:
+        return None
+    ws = mgr.get(ws_id)
+    return ws.session if ws is not None else None
+
+
 async def list_available_models(request: Request) -> JSONResponse:
     """GET /v1/api/models — list available model aliases."""
+    from turnstone.core.audio_routing import media_role_capability_flags
+
     registry = getattr(request.app.state, "registry", None)
     if registry is None:
         return JSONResponse({"models": []})
@@ -1404,6 +1433,18 @@ async def list_available_models(request: Request) -> JSONResponse:
                 "alias": cfg.alias,
                 "model": cfg.model,
                 "provider": cfg.provider,
+                "capabilities": cfg.capabilities,
+                "media_roles": {
+                    "stt": any(cfg.capabilities.get(k) for k in media_role_capability_flags("stt")),
+                    "tts": any(cfg.capabilities.get(k) for k in media_role_capability_flags("tts")),
+                    "vision_eval": any(
+                        cfg.capabilities.get(k) for k in media_role_capability_flags("vision_eval")
+                    ),
+                    "av_eval": any(cfg.capabilities.get(k) for k in media_role_capability_flags("av_eval")),
+                    "intent_eval": any(
+                        cfg.capabilities.get(k) for k in media_role_capability_flags("intent_eval")
+                    ),
+                },
             }
         )
     # Include effective defaults for clients (web UI, channel gateway).
@@ -2597,12 +2638,20 @@ async def create_workstream(request: Request) -> JSONResponse:
             ws_id=requested_ws_id,
             client_type=body.get("client_type", "") or "",
             judge_model=body.get("judge_model", "") or None,
+            stt_model=body.get("stt_model", "") or None,
+            tts_model=body.get("tts_model", "") or None,
+            vision_eval_model=body.get("vision_eval_model", "") or None,
+            av_eval_model=body.get("av_eval_model", "") or None,
+            intent_eval_model=body.get("intent_eval_model", "") or None,
             user_id=uid,
             kind=body_kind,
             parent_ws_id=body_parent,
         )
         if not isinstance(ws.ui, WebUI):
             raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
+        with contextlib.suppress(Exception):
+            if ws.session is not None:
+                ws.session._save_config()
         if skip or body.get("auto_approve", False):
             ws.ui.auto_approve = True
         # Register watch runner for this workstream
@@ -3150,6 +3199,53 @@ def _sniff_image_mime(data: bytes) -> str | None:
     return None
 
 
+def _classify_av_attachment(filename: str, claimed_mime: str) -> tuple[str | None, str | None, str | None]:
+    """Return ``(kind, canonical_mime, error)`` for an audio/video upload."""
+    import os
+
+    audio_mimes = {
+        "audio/wav",
+        "audio/x-wav",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/ogg",
+        "audio/flac",
+        "audio/mp4",
+        "audio/m4a",
+        "audio/webm",
+    }
+    video_mimes = {
+        "video/mp4",
+        "video/quicktime",
+        "video/x-msvideo",
+        "video/webm",
+    }
+    audio_exts = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".webm"}
+    video_exts = {".mp4", ".mov", ".avi", ".webm"}
+
+    claimed = (claimed_mime or "").strip().lower()
+    ext = os.path.splitext(filename or "")[1].lower()
+    if claimed in audio_mimes or ext in audio_exts:
+        mime = claimed if claimed in audio_mimes else {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".flac": "audio/flac",
+            ".m4a": "audio/mp4",
+            ".webm": "audio/webm",
+        }.get(ext, "audio/wav")
+        return "audio", mime, None
+    if claimed in video_mimes or ext in video_exts:
+        mime = claimed if claimed in video_mimes else {
+            ".mp4": "video/mp4",
+            ".mov": "video/quicktime",
+            ".avi": "video/x-msvideo",
+            ".webm": "video/webm",
+        }.get(ext, "video/mp4")
+        return "video", mime, None
+    return None, None, None
+
+
 def _classify_text_attachment(
     filename: str, claimed_mime: str, data: bytes
 ) -> tuple[str | None, str | None]:
@@ -3285,9 +3381,11 @@ async def upload_attachment(request: Request) -> JSONResponse:
     + magic bytes, enforces per-(ws,user) pending cap, then stores.
     """
     from turnstone.core.attachments import (
+        AUDIO_SIZE_CAP,
         IMAGE_SIZE_CAP,
         MAX_PENDING_ATTACHMENTS_PER_USER_WS,
         TEXT_DOC_SIZE_CAP,
+        VIDEO_SIZE_CAP,
     )
     from turnstone.core.memory import list_pending_attachments, save_attachment
     from turnstone.core.web_helpers import read_multipart_file_or_400
@@ -3300,8 +3398,12 @@ async def upload_attachment(request: Request) -> JSONResponse:
     if err:
         return err
 
-    # Cap at image size (largest permitted type) — per-kind cap enforced below.
-    got = await read_multipart_file_or_400(request, field="file", max_bytes=IMAGE_SIZE_CAP)
+    # Cap at AV size (largest permitted upload type) — per-kind cap enforced below.
+    got = await read_multipart_file_or_400(
+        request,
+        field="file",
+        max_bytes=_AUDIO_VIDEO_ATTACHMENT_SIZE_CAP,
+    )
     if isinstance(got, JSONResponse):
         return got
     filename, claimed_mime, data = got
@@ -3309,7 +3411,7 @@ async def upload_attachment(request: Request) -> JSONResponse:
     if not data:
         return JSONResponse({"error": "Empty file"}, status_code=400)
 
-    # Classify: image (magic-byte sniff) vs text (mime/ext + UTF-8 decode)
+    # Classify: image (magic-byte sniff) vs audio/video (mime/ext) vs text.
     sniffed_image = _sniff_image_mime(data)
     if sniffed_image is not None:
         if len(data) > IMAGE_SIZE_CAP:
@@ -3325,22 +3427,50 @@ async def upload_attachment(request: Request) -> JSONResponse:
         kind = "image"
         mime = sniffed_image
     else:
-        if len(data) > TEXT_DOC_SIZE_CAP:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Text document too large ({len(data):,} bytes); "
-                        f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
-                    ),
-                    "code": "too_large",
-                },
-                status_code=413,
-            )
-        mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
-        if mime_or_err[0] is None:
-            return JSONResponse({"error": mime_or_err[1], "code": "unsupported"}, status_code=400)
-        kind = "text"
-        mime = mime_or_err[0]
+        av_kind, av_mime, _av_err = _classify_av_attachment(filename, claimed_mime)
+        if av_kind == "audio":
+            if len(data) > AUDIO_SIZE_CAP:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Audio file too large ({len(data):,} bytes); cap is {AUDIO_SIZE_CAP:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            kind = av_kind
+            mime = av_mime or "audio/wav"
+        elif av_kind == "video":
+            if len(data) > VIDEO_SIZE_CAP:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Video file too large ({len(data):,} bytes); cap is {VIDEO_SIZE_CAP:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            kind = av_kind
+            mime = av_mime or "video/mp4"
+        else:
+            if len(data) > TEXT_DOC_SIZE_CAP:
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"Text document too large ({len(data):,} bytes); "
+                            f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
+            if mime_or_err[0] is None:
+                return JSONResponse({"error": mime_or_err[1], "code": "unsupported"}, status_code=400)
+            kind = "text"
+            mime = mime_or_err[0]
 
     # Serialize count-check + save per (ws, user) so concurrent uploads
     # can't both pass a check that sees count == cap-1.  Plain
@@ -3379,6 +3509,142 @@ async def upload_attachment(request: Request) -> JSONResponse:
             "size_bytes": len(data),
             "kind": kind,
         }
+    )
+
+
+async def speech_to_text(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/speech-to-text — transcribe one audio blob.
+
+    Multipart body with a single ``audio`` field and optional ``auto_send``
+    flag.  When ``auto_send`` is truthy the handler dispatches the transcript
+    through the normal send path so the existing SSE/UI turn lifecycle stays
+    intact.
+    """
+    from turnstone.core.audio_routing import resolve_media_alias
+    from turnstone.core.media_backends import (
+        MediaBackendError,
+        MediaBackendUnavailable,
+        transcribe_audio,
+    )
+    from turnstone.core.web_helpers import read_multipart_file_or_400
+
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    _user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+
+    auto_send_raw = str((request.query_params.get("auto_send") or "")).strip().lower()
+    auto_send = auto_send_raw in {"1", "true", "yes", "on"}
+
+    got = await read_multipart_file_or_400(request, field="audio", max_bytes=_AUDIO_UPLOAD_SIZE_CAP)
+    if isinstance(got, JSONResponse):
+        return got
+    filename, claimed_mime, data = got
+    if not data:
+        return JSONResponse({"error": "Empty audio upload"}, status_code=400)
+
+    transcript = ""
+    session = _ws_session_from_request(request, ws_id)
+    config_store = getattr(request.app.state, "config_store", None)
+    selected_alias = resolve_media_alias(session=session, config_store=config_store, role="stt")
+    used_backend = ""
+    try:
+        stt_result = transcribe_audio(data, filename or "speech.webm", selected_alias)
+        transcript = stt_result.transcript
+        used_backend = stt_result.backend
+        selected_alias = stt_result.model_alias or selected_alias
+    except MediaBackendUnavailable as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except MediaBackendError as exc:
+        log.warning("speech_to_text.backend_failed", error=str(exc), exc_info=True)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+    if not transcript:
+        return JSONResponse({"error": "Transcription returned empty text"}, status_code=502)
+
+    sent = False
+    send_result: dict[str, Any] = {"status": "skipped"}
+    if auto_send:
+        body_bytes = json.dumps(
+            {"message": transcript, "ws_id": ws_id, "attachment_ids": []}
+        ).encode("utf-8")
+        orig_json = getattr(request, "json", None)
+        orig_body = getattr(request, "body", None)
+
+        async def _fake_json() -> dict[str, Any]:
+            return {"message": transcript, "ws_id": ws_id, "attachment_ids": []}
+
+        async def _fake_body() -> bytes:
+            return body_bytes
+
+        request.json = _fake_json  # type: ignore[method-assign]
+        request.body = _fake_body  # type: ignore[method-assign]
+        try:
+            send_resp = await send_message(request)
+        finally:
+            if orig_json is not None:
+                request.json = orig_json  # type: ignore[method-assign]
+            if orig_body is not None:
+                request.body = orig_body  # type: ignore[method-assign]
+        send_result = send_resp.body and json.loads(send_resp.body.decode("utf-8")) or {"status": "unknown"}
+        sent = send_resp.status_code == 200 and isinstance(send_result, dict) and send_result.get("status") in {
+            "ok",
+            "queued",
+        }
+        if send_resp.status_code != 200:
+            return JSONResponse(
+                {
+                    "error": (send_result or {}).get("error", "Failed to dispatch transcript"),
+                    "transcript": transcript,
+                },
+                status_code=send_resp.status_code,
+            )
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "transcript": transcript,
+            "mime_type": claimed_mime or "application/octet-stream",
+            "sent": sent,
+            "send_result": send_result,
+            "model_alias": selected_alias,
+            "backend": used_backend,
+        }
+    )
+
+
+async def text_to_speech(request: Request) -> Response:
+    """POST /v1/api/tts — synthesize assistant text into playable audio."""
+    from turnstone.core.audio_routing import resolve_media_alias
+    from turnstone.core.media_backends import synthesize_speech
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > 8000:
+        return JSONResponse({"error": "text too long"}, status_code=400)
+
+    ws_id = str(body.get("ws_id") or "").strip()
+    session = _ws_session_from_request(request, ws_id)
+    config_store = getattr(request.app.state, "config_store", None)
+    selected_alias = resolve_media_alias(session=session, config_store=config_store, role="tts")
+
+    voice = str(body.get("voice") or _DEFAULT_TTS_VOICE)
+    try:
+        speech = synthesize_speech(text, voice, selected_alias)
+    except Exception as exc:
+        log.warning("text_to_speech.backend_failed", error=str(exc), exc_info=True)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    return Response(
+        speech.audio_bytes,
+        media_type=speech.media_type,
+        headers={"X-TTS-Backend": speech.backend, "X-Model-Alias": speech.model_alias or selected_alias},
     )
 
 
@@ -3425,8 +3691,9 @@ async def get_attachment_content(request: Request) -> Response:
     stored_mime = row.get("mime_type") or "application/octet-stream"
     filename = str(row.get("filename") or "attachment")
     # Force text/plain for text kinds — avoids same-origin HTML/SVG
-    # rendering if a user uploaded an HTML-ish text file.  Images keep
-    # their sniffed MIME (the allowlist is strict: png/jpeg/gif/webp).
+    # rendering if a user uploaded an HTML-ish text file.  Binary media
+    # kinds keep their stored MIME so the browser can hand them to the
+    # intended player/decoder.
     response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
     # Sanitize filename for Content-Disposition (quotes / CRLF only —
     # browsers tolerate most other characters).  RFC 6266 filename*=
@@ -4632,6 +4899,11 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route(
+                        "/api/workstreams/{ws_id}/speech-to-text",
+                        speech_to_text,
+                        methods=["POST"],
+                    ),
+                    Route(
                         "/api/workstreams/{ws_id}/attachments",
                         list_attachments,
                         methods=["GET"],
@@ -4649,6 +4921,7 @@ def create_app(
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
                     Route("/api/send", send_message, methods=["POST", "DELETE"]),
+                    Route("/api/tts", text_to_speech, methods=["POST"]),
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
@@ -5030,6 +5303,11 @@ def main() -> None:
         skill: str | None = None,
         client_type: str = "",
         judge_model: str | None = None,
+        stt_model: str | None = None,
+        tts_model: str | None = None,
+        vision_eval_model: str | None = None,
+        av_eval_model: str | None = None,
+        intent_eval_model: str | None = None,
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> ChatSession:
@@ -5099,7 +5377,7 @@ def main() -> None:
             else config_store.get("model.reasoning_effort")
         )
 
-        return ChatSession(
+        sess = ChatSession(
             client=r_client,
             model=r_model,
             ui=ui,
@@ -5135,6 +5413,16 @@ def main() -> None:
             kind=kind,
             parent_ws_id=parent_ws_id,
         )
+        sess._stt_model_alias = stt_model or config_store.get("audio.stt_model_alias") or ""
+        sess._tts_model_alias = tts_model or config_store.get("audio.tts_model_alias") or ""
+        sess._vision_eval_model_alias = (
+            vision_eval_model or config_store.get("audio.vision_eval_model_alias") or ""
+        )
+        sess._av_eval_model_alias = av_eval_model or config_store.get("audio.av_eval_model_alias") or ""
+        sess._intent_eval_model_alias = (
+            intent_eval_model or config_store.get("audio.intent_eval_model_alias") or ""
+        )
+        return sess
 
     # Create WatchRunner (periodic command polling, server-level)
     from turnstone.core.storage import get_storage as _get_storage

@@ -29,6 +29,7 @@ from turnstone.api.server_schemas import (
     DashboardResponse,
     HealthResponse,
     ListAttachmentsResponse,
+    SpeechToTextResponse,
     ListAvailableModelsResponse,
     ListMemoriesResponse,
     ListSavedWorkstreamsResponse,
@@ -40,6 +41,7 @@ from turnstone.api.server_schemas import (
     SearchMemoriesRequest,
     SendRequest,
     SendResponse,
+    TextToSpeechRequest,
     SkillSummary,
     UploadAttachmentResponse,
 )
@@ -72,7 +74,9 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "under the new workstream. When `initial_message` is also set, "
             "attachments are reserved onto that turn before the worker thread "
             "dispatches; otherwise they remain pending for a follow-up "
-            "`POST /v1/api/send`."
+            "`POST /v1/api/send`. The request may also carry per-workstream "
+            "routing overrides such as `judge_model`, `stt_model`, `tts_model`, "
+            "`vision_eval_model`, `av_eval_model`, and `intent_eval_model`."
         ),
         request_model=CreateWorkstreamRequest,
         response_model=CreateWorkstreamResponse,
@@ -96,6 +100,14 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         request_model=SendRequest,
         response_model=SendResponse,
         error_codes=[400, 404],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/tts",
+        "POST",
+        "Synthesize text to speech audio for browser playback",
+        request_model=TextToSpeechRequest,
+        error_codes=[400, 502],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -205,6 +217,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "workstream.  Ownership failures are masked as 404.",
         response_model=ListAttachmentsResponse,
         error_codes=[403, 404],
+        tags=["Attachments"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/speech-to-text",
+        "POST",
+        "Upload a short audio clip (multipart field `audio`) for transcription. "
+        "When `auto_send` is true the transcript is forwarded through the normal "
+        "send path so the existing SSE/UI flow is preserved.",
+        response_model=SpeechToTextResponse,
+        error_codes=[400, 403, 404, 413, 502, 503],
         tags=["Attachments"],
     ),
     EndpointSpec(
