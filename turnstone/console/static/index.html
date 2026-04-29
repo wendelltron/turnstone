@@ -2798,50 +2798,6 @@ window.TURNSTONE_KB_SHORTCUTS = [
 <script src="/shared/kb.js"></script>
 <script src="/shared/composer.js"></script>
 
-<div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
-  <div id="new-ws-box">
-    <h2 id="new-ws-title">New Workstream</h2>
-    <div id="new-ws-error" role="alert" aria-live="assertive"></div>
-    <label for="new-ws-task">Task <span class="label-hint">optional &mdash; sent as first message</span></label>
-    <textarea id="new-ws-task" rows="4" placeholder="What should this workstream work on?"></textarea>
-    <label for="new-ws-node">Node</label>
-    <select id="new-ws-node">
-      <option value="">Auto (best available)</option>
-    </select>
-    <label for="new-ws-name">Name <span class="label-hint">optional</span></label>
-    <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
-    <label for="new-ws-model">Model <span class="label-hint">optional</span></label>
-    <select id="new-ws-model">
-      <option value="">Default model</option>
-    </select>
-    <label for="new-ws-skill">Skill <span class="label-hint">optional</span></label>
-    <select id="new-ws-skill">
-      <option value="">Use defaults</option>
-    </select>
-    <label for="new-ws-judge">Judge Model <span class="label-hint">optional</span></label>
-    <select id="new-ws-judge">
-      <option value="">Default (agent model)</option>
-    </select>
-    <details id="new-ws-media-routing" class="new-ws-media-routing">
-      <summary>Advanced media routing</summary>
-      <label for="new-ws-stt-model">Speech-to-Text Model <span class="label-hint">optional</span></label>
-      <select id="new-ws-stt-model"><option value="">Default STT model</option></select>
-      <label for="new-ws-tts-model">Text-to-Speech Model <span class="label-hint">optional</span></label>
-      <select id="new-ws-tts-model"><option value="">Default TTS model</option></select>
-      <label for="new-ws-vision-eval-model">Vision Evaluator Model <span class="label-hint">optional</span></label>
-      <select id="new-ws-vision-eval-model"><option value="">Default vision evaluator</option></select>
-      <label for="new-ws-av-eval-model">Audio/Video Evaluator Model <span class="label-hint">optional</span></label>
-      <select id="new-ws-av-eval-model"><option value="">Default audio/video evaluator</option></select>
-      <label for="new-ws-intent-eval-model">Intent Evaluator Model <span class="label-hint">optional</span></label>
-      <select id="new-ws-intent-eval-model"><option value="">Default intent evaluator</option></select>
-    </details>
-    <div id="new-ws-buttons">
-      <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
-      <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
-    </div>
-  </div>
-</div>
-
 <!-- GitHub Import Modal -->
 <div id="github-import-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="github-import-title">
   <div id="github-import-box" class="admin-modal">

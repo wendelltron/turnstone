@@ -537,18 +537,35 @@ def required_scope(method: str, path: str) -> str:
     # endpoints (e.g. `attachments` is a collection with a POST that
     # uploads a file — not a verb, but semantically a write). `events`
     # falls through to the GET-default `read` and is intentionally not
-    # listed here.
-    if (
-        method == "POST"
-        and normalized.startswith("/api/workstreams/")
-        and normalized.rsplit("/", 1)[-1]
-        in {"delete", "open", "refresh-title", "title", "attachments", "speech-to-text"}
-    ):
-        return "write"
+    # listed here. `approve` is handled separately because it requires
+    # the stronger approve scope.
+    if method == "POST" and normalized.startswith("/api/workstreams/"):
+        tail = normalized.rsplit("/", 1)[-1]
+        if tail == "approve":
+            return "approve"
+        if tail in {
+            "send",
+            "cancel",
+            "close",
+            "delete",
+            "open",
+            "refresh-title",
+            "title",
+            "attachments",
+            "speech-to-text",
+        }:
+            return "write"
     # Attachment deletion: DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}.
     # Tight regex avoids false positives on unrelated deeper paths under
     # /attachments/.
     if method == "DELETE" and _ATTACHMENT_DELETE_RE.match(normalized):
+        return "write"
+    # Path-keyed dequeue: DELETE /api/workstreams/{ws_id}/send.
+    if (
+        method == "DELETE"
+        and normalized.startswith("/api/workstreams/")
+        and normalized.rsplit("/", 1)[-1] == "send"
+    ):
         return "write"
     # Memory delete: /api/memories/{name}
     if method == "DELETE" and normalized.startswith("/api/memories/"):
@@ -563,17 +580,22 @@ def required_scope(method: str, path: str) -> str:
             if proxied in WRITE_PATHS:
                 return "write"
             # Parametric workstream sub-resource mutations
-            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] in {
-                "delete",
-                "open",
-                "refresh-title",
-                "title",
-                "attachments",
-                "speech-to-text",
-            }:
-                return "write"
-            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] == "approve":
-                return "approve"
+            if proxied.startswith("/api/workstreams/"):
+                tail = proxied.rsplit("/", 1)[-1]
+                if tail == "approve":
+                    return "approve"
+                if tail in {
+                    "send",
+                    "cancel",
+                    "close",
+                    "delete",
+                    "open",
+                    "refresh-title",
+                    "title",
+                    "attachments",
+                    "speech-to-text",
+                }:
+                    return "write"
 
     # Proxied attachment deletion: /node/.../api/workstreams/{ws}/attachments/{id}
     if method == "DELETE" and normalized.startswith("/node/"):
