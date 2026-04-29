@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import functools
 import hashlib
@@ -1717,40 +1718,71 @@ async def _interactive_create_validate_request(
                 {"error": "parent_ws_id must reference a coordinator you own"},
                 status_code=403,
             )
-    try:
-        ws = mgr.create(
-            name=body.get("name", ""),
-            ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=uid, **kw),
-            model=resolved_model,
-            skill=resolved_skill,
-            skill_id=skill_data["template_id"] if skill_data else "",
-            skill_version=applied_skill_version,
-            ws_id=requested_ws_id,
-            client_type=body.get("client_type", "") or "",
-            judge_model=body.get("judge_model", "") or None,
-            stt_model=body.get("stt_model", "") or None,
-            tts_model=body.get("tts_model", "") or None,
-            vision_eval_model=body.get("vision_eval_model", "") or None,
-            av_eval_model=body.get("av_eval_model", "") or None,
-            intent_eval_model=body.get("intent_eval_model", "") or None,
-            user_id=uid,
-            kind=body_kind,
-            parent_ws_id=body_parent,
-        )
-        if not isinstance(ws.ui, WebUI):
-            raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
-        with contextlib.suppress(Exception):
-            if ws.session is not None:
-                ws.session._save_config()
-        if skip or body.get("auto_approve", False):
-            ws.ui.auto_approve = True
-        # Register watch runner for this workstream
-        runner = getattr(request.app.state, "watch_runner", None)
-        if runner and ws.session:
-            ws.session.set_watch_runner(
-                runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
-            )
-        gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+    notify_targets_raw = body.get("notify_targets", "[]")
+    if isinstance(notify_targets_raw, list):
+        notify_targets_raw = json.dumps(notify_targets_raw)
+    _, nt_err = _validate_notify_targets(notify_targets_raw)
+    if nt_err:
+        return JSONResponse({"error": nt_err}, status_code=400)
+    return None
+
+
+def _interactive_create_build_kwargs(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    skill_id: str,
+    applied_skill_version: int,
+) -> dict[str, Any]:
+    """Build kwargs for ``mgr.create`` from a parsed interactive create body.
+
+    Wired onto :attr:`SessionEndpointConfig.create_build_kwargs`. The
+    factory threads the resolved skill_data + skill_id + version
+    through; this builder picks the right model (skill override
+    beats body) and assembles the full kwargs dict that
+    ``SessionManager.create`` accepts (including the kind-specific
+    ``judge_model`` / ``client_type`` / ``parent_ws_id`` extras).
+    """
+    del request  # builder depends only on parsed body + resolved skill context
+    resolved_model = body.get("model") or None
+    if skill_data and skill_data.get("model"):
+        resolved_model = skill_data["model"]
+    requested_ws_id = body.get("ws_id", "") or ""
+    if not isinstance(requested_ws_id, str):
+        requested_ws_id = ""
+    canonical_skill = str(skill_data["name"]) if skill_data and skill_data.get("name") else None
+    return {
+        "user_id": uid,
+        "name": body.get("name", ""),
+        "model": resolved_model,
+        "skill": canonical_skill,
+        "skill_id": skill_id,
+        "skill_version": applied_skill_version,
+        "ws_id": requested_ws_id,
+        "client_type": body.get("client_type", "") or "",
+        "judge_model": body.get("judge_model", "") or None,
+        "stt_model": body.get("stt_model", "") or None,
+        "tts_model": body.get("tts_model", "") or None,
+        "vision_eval_model": body.get("vision_eval_model", "") or None,
+        "av_eval_model": body.get("av_eval_model", "") or None,
+        "intent_eval_model": body.get("intent_eval_model", "") or None,
+        "parent_ws_id": body.get("parent_ws_id") or None,
+        "kind": WorkstreamKind.INTERACTIVE,
+    }
+
+
+async def _interactive_create_post_install(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    applied_skill_version: int,
+    attachment_ids: list[str],
+) -> dict[str, Any]:
+    """Interactive create tail hook used by the lifted session routes."""
+    gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
 
     # Atomic workstream resume during creation.
     resumed = False
@@ -1803,11 +1835,6 @@ async def _interactive_create_validate_request(
                 tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
             if tools_list:
                 ws.ui.auto_approve_tools = set(tools_list)
-                # Tag each as skill-sourced so the dashboard can show
-                # "auto-approved by skill X" instead of a generic
-                # auto-approval pill — distinguishes the (often
-                # surprising) skill-template path from a deliberate
-                # operator "Approve + Always" click.
                 ws.ui._auto_approve_tools_source = {t: AutoApproveReason.SKILL for t in tools_list}
         sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
         sess._applied_skill_id = skill_data["template_id"]
@@ -1816,10 +1843,6 @@ async def _interactive_create_validate_request(
             sess._applied_skill_content = skill_data["content"]
         sess._save_config()
 
-    # notify_targets: schedule targets override skill targets. The
-    # validator already gated malformed input as 400; here we just
-    # canonicalise (list → JSON-encoded string) and apply the skill
-    # fallback if the caller didn't supply targets.
     notify_targets_raw = body.get("notify_targets", "[]")
     if isinstance(notify_targets_raw, list):
         notify_targets_raw = json.dumps(notify_targets_raw)
@@ -1832,7 +1855,6 @@ async def _interactive_create_validate_request(
                 nt_str = fallback_str
     ws.notify_targets = nt_str
 
-    # Pin locally-created workstreams so the console routes to this node.
     requested_ws_id = body.get("ws_id", "") or ""
     if not requested_ws_id:
         node_id = getattr(request.app.state, "node_id", "")
@@ -1844,12 +1866,9 @@ async def _interactive_create_validate_request(
             except Exception:
                 log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
 
-    # Initial-message worker thread.
     initial_message = body.get("initial_message", "").strip()
     if initial_message and ws.session is not None:
-        from turnstone.core.attachments import (
-            reserve_and_resolve_attachments as _reserve_and_resolve,
-        )
+        from turnstone.core.attachments import reserve_and_resolve_attachments as _reserve_and_resolve
 
         session = ws.session
         send_id = uuid.uuid4().hex
@@ -1866,9 +1885,7 @@ async def _interactive_create_validate_request(
                 )
             except (Exception, GenerationCancelled):
                 if attachment_ids:
-                    from turnstone.core.memory import (
-                        unreserve_attachments as _unreserve,
-                    )
+                    from turnstone.core.memory import unreserve_attachments as _unreserve
 
                     with contextlib.suppress(Exception):
                         _unreserve(send_id, ws.id, uid)
@@ -1884,14 +1901,6 @@ async def _interactive_create_validate_request(
                 with ws._lock:
                     ws._worker_running = False
 
-        # Inlined rather than via ``session_worker.send`` because at
-        # workstream creation no live worker can exist by
-        # construction — the enqueue branch of the shared dispatch
-        # is dead code here. ``_worker_running`` + ``ws.worker_thread``
-        # are set together under ``ws._lock`` so a path-keyed send
-        # arriving immediately after creation observes the running
-        # state via the shared session_worker gate instead of racing
-        # into a parallel worker.
         with ws._lock:
             ws._worker_running = True
             t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
@@ -2324,34 +2333,7 @@ def _require_ws_access(
     """
     from turnstone.core.web_helpers import resolve_workstream_owner
 
-    if mgr is not None:
-        ws_mem = mgr.get(ws_id)
-        if ws_mem is not None:
-            owner_mem = ws_mem.user_id
-            if is_service:
-                return owner_mem or caller, None
-            if owner_mem and owner_mem != caller:
-                return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-            return caller, None
-        # Not in memory — fall through to storage so /delete etc.
-        # still resolve persisted-but-not-loaded rows.
-
-    from turnstone.core.memory import get_workstream_owner
-
-    owner = get_workstream_owner(ws_id)
-    if owner is None:
-        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-    if is_service:
-        # Trust the service caller; file under its own user_id if no owner
-        # is set, otherwise under the existing owner.
-        return owner or caller, None
-    # Authenticated user must own the workstream.  If the workstream was
-    # created before user tracking (owner blank) or by the same user, allow.
-    if owner and owner != caller:
-        # Return 404 (not 403) so non-owners cannot enumerate workstream
-        # existence by response code.
-        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-    return caller, None
+    return resolve_workstream_owner(request, ws_id, mgr=mgr, not_found_label="Workstream not found")
 
 
 async def upload_attachment(request: Request) -> JSONResponse:
@@ -4105,60 +4087,10 @@ def create_app(
             Mount(
                 "/v1",
                 routes=[
-                    Route("/api/events", events_sse),
-                    Route("/api/events/global", global_events_sse),
-                    Route("/api/workstreams", list_workstreams),
-                    Route("/api/dashboard", dashboard),
-                    Route("/api/workstreams/saved", list_saved_workstreams),
-                    Route("/api/workstreams/new", create_workstream, methods=["POST"]),
-                    Route("/api/workstreams/close", close_workstream, methods=["POST"]),
-                    Route(
-                        "/api/workstreams/{ws_id}/delete",
-                        delete_workstream_endpoint,
-                        methods=["POST"],
-                    ),
-                    Route("/api/workstreams/{ws_id}/open", open_workstream, methods=["POST"]),
-                    Route(
-                        "/api/workstreams/{ws_id}/refresh-title",
-                        refresh_workstream_title,
-                        methods=["POST"],
-                    ),
-                    Route("/api/workstreams/{ws_id}/title", set_workstream_title, methods=["POST"]),
-                    Route(
-                        "/api/workstreams/{ws_id}/attachments",
-                        upload_attachment,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/workstreams/{ws_id}/speech-to-text",
-                        speech_to_text,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/workstreams/{ws_id}/attachments",
-                        list_attachments,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
-                        get_attachment_content,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/workstreams/{ws_id}/attachments/{attachment_id}/evaluate",
-                        evaluate_attachment,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/workstreams/{ws_id}/attachments/{attachment_id}",
-                        delete_attachment,
-                        methods=["DELETE"],
-                    ),
+                    *v1_routes,
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
-                    Route("/api/send", send_message, methods=["POST", "DELETE"]),
                     Route("/api/tts", text_to_speech, methods=["POST"]),
-                    Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
                     Route("/api/watches", list_watches),
