@@ -162,6 +162,41 @@ _JS_PROXY_SHIM = """\
   window.EventSource.CONNECTING=_oE.CONNECTING;
   window.EventSource.OPEN=_oE.OPEN;
   window.EventSource.CLOSED=_oE.CLOSED;
+
+  function _wireConsoleBannerControls(){
+    var adminBtn=document.getElementById("proxied-admin-btn");
+    if(adminBtn){
+      adminBtn.addEventListener("click",function(){
+        window.location.href="/?view=admin";
+      });
+    }
+    var logoutBtn=document.getElementById("proxied-logout-btn");
+    if(logoutBtn){
+      logoutBtn.addEventListener("click",function(){
+        if(typeof window.logout==="function") window.logout();
+        else window.location.href="/";
+      });
+    }
+    var themeBtn=document.getElementById("proxied-theme-toggle");
+    if(themeBtn){
+      var syncTheme=function(){
+        var isLight=document.documentElement.dataset.theme==="light";
+        themeBtn.textContent=isLight?"\u2600":"\u263E";
+        themeBtn.title=isLight?"Switch to dark theme":"Switch to light theme";
+        themeBtn.setAttribute("aria-label", themeBtn.title);
+      };
+      syncTheme();
+      themeBtn.addEventListener("click",function(){
+        if(typeof window.toggleTheme==="function") {
+          window.toggleTheme();
+          setTimeout(syncTheme,0);
+        }
+      });
+      document.addEventListener("themechange", syncTheme);
+    }
+  }
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", _wireConsoleBannerControls);
+  else _wireConsoleBannerControls();
 })();
 """
 
@@ -175,6 +210,10 @@ _CONSOLE_BANNER_TEMPLATE = (
     '<a href="NODE_LINK_PLACEHOLDER" class="console-banner-node"'
     ' aria-label="Node: NODE_ID_PLACEHOLDER">'
     "NODE_ID_PLACEHOLDER</a>"
+    '<span class="console-banner-spacer"></span>'
+    '<button id="proxied-admin-btn" class="header-btn console-banner-btn" type="button" title="Open console admin">admin</button>'
+    '<button id="proxied-logout-btn" class="header-btn console-banner-btn" type="button" title="Log out">logout</button>'
+    '<button id="proxied-theme-toggle" class="header-btn console-banner-btn" type="button" aria-label="Toggle light/dark theme">&#9790;</button>'
     "</div>"
 )
 
@@ -196,6 +235,8 @@ _CONSOLE_PROXY_STYLE = (
     ".console-banner-node{color:var(--fg-dim);text-decoration:none;"
     "font-size:10px;letter-spacing:0.02em}"
     ".console-banner-node:hover{color:var(--accent)}"
+    ".console-banner-spacer{flex:1}"
+    ".console-banner-btn{font-size:11px;padding:3px 8px}"
     "</style>"
 )
 

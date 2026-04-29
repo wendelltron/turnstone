@@ -2233,7 +2233,14 @@ function _ensureSSE() {
     connectSSE();
   }
 }
-history.replaceState({ view: "home" }, "");
+(function () {
+  var params = new URLSearchParams(window.location.search || "");
+  if (params.get("view") === "admin") {
+    history.replaceState({ view: "admin" }, "");
+  } else {
+    history.replaceState({ view: "home" }, "");
+  }
+})();
 initLogin();
 // loadOverview fetches the cluster snapshot — both the node list AND
 // the active-coordinators list come from the same snapshot + SSE patch
@@ -2241,6 +2248,9 @@ initLogin();
 // ws_created / ws_closed / cluster_state events.
 loadOverview();
 _ensureHomeComposerInit();
+if (window.location.search.indexOf("view=admin") !== -1 && typeof showAdmin === "function") {
+  showAdmin();
+}
 // Refresh the coord button visibility once auth.js has populated
 // sessionStorage from the initial whoami.  window.permissionsReady
 // resolves after that completes (success or failure); fall back to a
