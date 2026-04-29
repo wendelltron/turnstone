@@ -44,42 +44,26 @@
       </span>
     </div>
 
-<div id="split-root"></div>
-
-<!-- New workstream modal -->
-<div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
-  <div id="new-ws-box">
-    <h3 id="new-ws-title">New Workstream</h3>
-    <div id="new-ws-error" role="alert" aria-live="assertive"></div>
-    <label for="new-ws-name">Name <span class="nws-hint">optional</span></label>
-    <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
-    <label for="new-ws-model">Model <span class="nws-hint">optional</span></label>
-    <select id="new-ws-model"><option value="">Default model</option></select>
-    <label for="new-ws-judge-model">Judge Model <span class="nws-hint">optional</span></label>
-    <select id="new-ws-judge-model"><option value="">Default (agent model)</option></select>
-    <details id="new-ws-media-routing" class="new-ws-media-routing">
-      <summary>Advanced media routing</summary>
-      <label for="new-ws-stt-model">Speech-to-Text Model <span class="nws-hint">optional</span></label>
-      <select id="new-ws-stt-model"><option value="">Default STT model</option></select>
-      <label for="new-ws-tts-model">Text-to-Speech Model <span class="nws-hint">optional</span></label>
-      <select id="new-ws-tts-model"><option value="">Default TTS model</option></select>
-      <label for="new-ws-vision-eval-model">Vision Evaluator Model <span class="nws-hint">optional</span></label>
-      <select id="new-ws-vision-eval-model"><option value="">Default vision evaluator</option></select>
-      <label for="new-ws-av-eval-model">Audio/Video Evaluator Model <span class="nws-hint">optional</span></label>
-      <select id="new-ws-av-eval-model"><option value="">Default audio/video evaluator</option></select>
-      <label for="new-ws-intent-eval-model">Intent Evaluator Model <span class="nws-hint">optional</span></label>
-      <select id="new-ws-intent-eval-model"><option value="">Default intent evaluator</option></select>
-    </details>
-    <label for="new-ws-skill">Skill <span class="nws-hint">optional</span></label>
-    <select id="new-ws-skill"><option value="">Use defaults</option></select>
-    <label for="new-ws-initial-message">First message <span class="nws-hint">optional</span></label>
-    <textarea id="new-ws-initial-message" rows="3" placeholder="Sent as the first turn after the workstream is created"></textarea>
-    <div id="new-ws-attach-row">
-      <button id="new-ws-attach-btn" type="button" title="Attach files to the first turn" aria-label="Attach files">
-        <span aria-hidden="true">&#128206;</span> Attach
+    <div id="tab-bar" role="toolbar" aria-label="Workstreams">
+      <div id="tab-list" role="tablist"></div>
+      <button
+        id="new-tab-btn"
+        onclick="newWorkstream()"
+        title="New workstream (Ctrl+T)"
+        aria-label="New workstream"
+        aria-keyshortcuts="Control+t"
+      >
+        +
       </button>
-      <input id="new-ws-attach-input" type="file" multiple style="display:none" accept="image/png,image/jpeg,image/gif,image/webp,audio/wav,audio/x-wav,audio/mpeg,audio/mp3,audio/ogg,audio/flac,audio/mp4,audio/m4a,audio/webm,video/mp4,video/quicktime,video/x-msvideo,video/webm,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf,.wav,.mp3,.ogg,.flac,.m4a,.webm,.mp4,.mov,.avi">
-      <div id="new-ws-attach-chips" role="list" aria-label="Pending attachments"></div>
+      <button
+        id="split-btn"
+        onclick="splitFocusedPane()"
+        title="Split pane (Ctrl+\)"
+        aria-label="Split pane"
+        aria-keyshortcuts="Control+Backslash"
+      >
+        &#x29C9;
+      </button>
     </div>
 
     <div

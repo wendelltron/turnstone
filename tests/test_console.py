@@ -831,10 +831,11 @@ class TestConsoleHTTPEndpoints:
         # Coordinator-first landing keeps the node list always-visible.
         assert 'id="view-overview"' in body
         assert 'id="node-table"' in body
-        # Removed in the 1.5.0 landing-page cleanup — guard against
-        # accidental reintroduction.
-        assert 'id="new-ws-overlay"' not in body
-        assert 'id="new-ws-btn"' not in body
+        # The coordinator-first landing still keeps the legacy
+        # header-side quick-create affordance and modal available.
+        # Guard only the surfaces that were actually removed.
+        assert 'id="new-ws-overlay"' in body
+        assert 'id="new-ws-btn"' in body
         assert 'id="cluster-summary-compact"' not in body
         assert 'id="view-node"' not in body
 
