@@ -1768,7 +1768,6 @@ def _interactive_create_build_kwargs(
         "av_eval_model": body.get("av_eval_model", "") or None,
         "intent_eval_model": body.get("intent_eval_model", "") or None,
         "parent_ws_id": body.get("parent_ws_id") or None,
-        "kind": WorkstreamKind.INTERACTIVE,
     }
 
 
@@ -4076,8 +4075,42 @@ def create_app(
             cancel=cancel_handler,  # lifted: shared body
             events=events_handler,  # lifted: shared body
             history=history_handler,  # lifted: shared body (interactive feature gain)
-            attachments=attachment_handlers,  # lifted: shared body (P1.5)
+            attachments=None,
         ),
+    )
+    v1_routes.extend(
+        [
+            Route(
+                "/api/workstreams/{ws_id}/attachments",
+                upload_attachment,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/workstreams/{ws_id}/attachments",
+                list_attachments,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+                get_attachment_content,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/workstreams/{ws_id}/attachments/{attachment_id}/evaluate",
+                evaluate_attachment,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/workstreams/{ws_id}/attachments/{attachment_id}",
+                delete_attachment,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/api/workstreams/{ws_id}/speech-to-text",
+                speech_to_text,
+                methods=["POST"],
+            ),
+        ]
     )
     v1_routes.append(Route("/api/dashboard", dashboard))
 

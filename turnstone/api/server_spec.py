@@ -79,7 +79,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             "under the new workstream. When `initial_message` is also set, "
             "attachments are reserved onto that turn before the worker thread "
             "dispatches; otherwise they remain pending for a follow-up "
-            "`POST /v1/api/send`. The request may also carry per-workstream "
+            "`POST /v1/api/workstreams/{ws_id}/send`. The request may also carry per-workstream "
             "routing overrides such as `judge_model`, `stt_model`, `tts_model`, "
             "`vision_eval_model`, `av_eval_model`, and `intent_eval_model`."
         ),
@@ -116,7 +116,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Chat"],
     ),
     EndpointSpec(
-        "/v1/api/approve",
+        "/v1/api/workstreams/{ws_id}/approve",
         "POST",
         "Approve or deny a tool call",
         request_model=ApproveRequest,
