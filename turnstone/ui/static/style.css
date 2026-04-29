@@ -487,6 +487,37 @@
    tool-message shape with the yellow accent bar the instrument-panel
    look established. */
 .ts-msg--info { white-space: pre-wrap; }
+
+.ws-facilitator-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 12px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+}
+.ws-facilitator-row {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ws-facilitator-prompt {
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+}
 .ts-msg--tool {
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -911,6 +942,24 @@ body { position: static; }
    ========================================================================== */
 
 /* Attachment chips — pill cluster above the textarea */
+.ts-msg--evaluator {
+  border-left-color: var(--cyan);
+}
+.ts-evaluator-title {
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-bottom: 6px;
+}
+.ts-evaluator-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+}
 .ts-composer-media-btn {
   background: transparent;
   border: 1px solid var(--border);

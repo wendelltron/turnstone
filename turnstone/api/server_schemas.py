@@ -107,6 +107,33 @@ class TextToSpeechRequest(BaseModel):
     )
 
 
+class EvaluateAttachmentRequest(BaseModel):
+    role: str = Field(
+        default="vision_eval",
+        description="Evaluation route: vision_eval, av_eval, or intent_eval",
+    )
+    prompt: str = Field(
+        default="",
+        description="Optional custom prompt override for the evaluator",
+    )
+    include_audio_in_video: bool = Field(
+        default=False,
+        description="Whether a video attachment should be evaluated with its audio track enabled",
+    )
+
+
+class EvaluateAttachmentResponse(BaseModel):
+    status: str = Field(default="ok", description="Request outcome")
+    role: str = Field(description="Evaluation route used")
+    model_alias: str = Field(default="", description="Effective evaluator model alias")
+    backend: str = Field(default="llm", description="Backend class used for the evaluation")
+    content: str = Field(default="", description="Raw evaluator text response")
+    parsed: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Best-effort parsed JSON object when the evaluator returned JSON",
+    )
+
+
 class ApproveRequest(BaseModel):
     approved: bool = Field(description="True to approve, false to deny")
     feedback: str | None = Field(default=None, description="Optional denial reason")

@@ -3648,6 +3648,71 @@ async def text_to_speech(request: Request) -> Response:
     )
 
 
+async def evaluate_attachment(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/attachments/{attachment_id}/evaluate.
+
+    Runs a configured media evaluator against an attachment and returns a
+    best-effort structured observation.  This is the first bridge from
+    explicit media capture toward the longer-term facilitator sidecar.
+    """
+    from turnstone.core.audio_routing import resolve_media_alias
+    from turnstone.core.media_evaluator import evaluate_attachment as _evaluate_attachment
+    from turnstone.core.memory import get_attachment
+    from turnstone.core.web_helpers import read_json_or_400
+
+    ws_id = request.path_params.get("ws_id", "")
+    attachment_id = request.path_params.get("attachment_id", "")
+    if not ws_id or not attachment_id:
+        return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
+    user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+    row = get_attachment(attachment_id)
+    if not row or row.get("ws_id") != ws_id or row.get("user_id") != user_id:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    role = str(body.get("role") or "vision_eval").strip() or "vision_eval"
+    if role not in {"vision_eval", "av_eval", "intent_eval"}:
+        return JSONResponse({"error": "invalid role"}, status_code=400)
+    prompt = str(body.get("prompt") or "")
+    include_audio_in_video = bool(body.get("include_audio_in_video", False))
+
+    session = _ws_session_from_request(request, ws_id)
+    config_store = getattr(request.app.state, "config_store", None)
+    registry = getattr(request.app.state, "registry", None)
+    if registry is None:
+        return JSONResponse({"error": "Model registry not available"}, status_code=503)
+    alias = resolve_media_alias(session=session, config_store=config_store, role=role)
+    if not alias:
+        return JSONResponse({"error": f"No model alias configured for role {role}"}, status_code=503)
+    try:
+        result = _evaluate_attachment(
+            registry=registry,
+            model_alias=alias,
+            row=row,
+            role=role,
+            prompt=prompt,
+            include_audio_in_video=include_audio_in_video,
+        )
+    except Exception as exc:
+        log.warning("evaluate_attachment.failed", error=str(exc), exc_info=True)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+
+    return JSONResponse(
+        {
+            "status": "ok",
+            "role": result.role,
+            "model_alias": result.model_alias,
+            "backend": result.backend,
+            "content": result.content,
+            "parsed": result.parsed,
+        }
+    )
+
+
 async def list_attachments(request: Request) -> JSONResponse:
     """GET /v1/api/workstreams/{ws_id}/attachments — list current user's
     pending (unconsumed) attachments for this workstream.
@@ -4912,6 +4977,11 @@ def create_app(
                         "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
                         get_attachment_content,
                         methods=["GET"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/attachments/{attachment_id}/evaluate",
+                        evaluate_attachment,
+                        methods=["POST"],
                     ),
                     Route(
                         "/api/workstreams/{ws_id}/attachments/{attachment_id}",

@@ -40,8 +40,10 @@
   "use strict";
 
   var ATTACH_DEFAULT_ACCEPT =
-    "image/png,image/jpeg,image/gif,image/webp,text/*," +
-    ".md,.py,.js,.ts,.tsx,.jsx,.json,.yaml,.yml,.toml,.html,.css,.sh," +
+    "image/png,image/jpeg,image/gif,image/webp," +
+    "audio/wav,audio/x-wav,audio/mpeg,audio/mp3,audio/ogg,audio/flac,audio/mp4,audio/m4a,audio/webm," +
+    "video/mp4,video/quicktime,video/x-msvideo,video/webm,text/*," +
+    ".md,.py,.js,.ts,.tsx,.jsx,.json,.yaml,.yml,.toml,.html,.css,.sh,.wav,.mp3,.ogg,.flac,.m4a,.webm,.mp4,.mov,.avi," +
     ".rs,.go,.java,.c,.cpp,.h,.hpp,.sql,.xml,.ini,.conf";
 
   var AUTO_RESIZE_MAX_PX = 200;

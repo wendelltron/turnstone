@@ -22,6 +22,8 @@ from turnstone.api.server_schemas import (
     ApproveRequest,
     AvailableModelInfo,
     CancelRequest,
+    EvaluateAttachmentRequest,
+    EvaluateAttachmentResponse,
     CloseWorkstreamRequest,
     CommandRequest,
     CreateWorkstreamRequest,
@@ -227,6 +229,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "send path so the existing SSE/UI flow is preserved.",
         response_model=SpeechToTextResponse,
         error_codes=[400, 403, 404, 413, 502, 503],
+        tags=["Attachments"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/evaluate",
+        "POST",
+        "Run a multimodal evaluator over an attachment using the configured media routing role. "
+        "Image attachments typically use `vision_eval`; audio/video attachments typically use `av_eval` or `intent_eval`.",
+        request_model=EvaluateAttachmentRequest,
+        response_model=EvaluateAttachmentResponse,
+        error_codes=[400, 403, 404, 502, 503],
         tags=["Attachments"],
     ),
     EndpointSpec(

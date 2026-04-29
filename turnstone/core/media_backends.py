@@ -234,7 +234,7 @@ def synthesize_speech(text: str, voice: str, selected_alias: str = "") -> Speech
                 model=_DEFAULT_TTS_MODEL,
                 voice=voice,
                 input=text,
-                format="wav",
+                response_format="wav",
             )
             data = resp.read() if hasattr(resp, "read") else bytes(resp.content)
             return SpeechResult(

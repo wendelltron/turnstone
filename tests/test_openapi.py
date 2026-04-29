@@ -38,6 +38,7 @@ class TestServerSpec:
             "/v1/api/workstreams/new",
             "/v1/api/workstreams/close",
             "/v1/api/workstreams/{ws_id}/speech-to-text",
+            "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/evaluate",
             "/v1/api/auth/login",
             "/v1/api/auth/logout",
             "/health",
