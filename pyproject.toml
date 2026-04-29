@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "1.5.0a2"
+version = "1.5.0"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "BUSL-1.1"
@@ -77,6 +77,7 @@ include = [
   "turnstone/console/static/*.css",
   "turnstone/console/static/*.js",
   "turnstone/console/static/coordinator/*.html",
+  "turnstone/console/static/coordinator/*.css",
   "turnstone/console/static/coordinator/*.js",
   "turnstone/shared_static/*.css",
   "turnstone/shared_static/*.js",

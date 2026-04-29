@@ -15,7 +15,6 @@ from turnstone.core.workstream import WorkstreamKind
 
 class SendRequest(BaseModel):
     message: str = Field(description="User message text")
-    ws_id: str = Field(description="Target workstream ID")
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -25,6 +24,17 @@ class SendRequest(BaseModel):
             "auto-consumption for this send."
         ),
     )
+
+
+class DequeueRequest(BaseModel):
+    """Body for ``DELETE /v1/api/workstreams/{ws_id}/send``.
+
+    Removes a previously-queued message from the workstream's pending
+    queue. ``msg_id`` is the id returned in a prior ``send`` response
+    when the workstream was busy and the message was queued.
+    """
+
+    msg_id: str = Field(description="Id of the queued message to remove")
 
 
 class SendResponse(BaseModel):
@@ -140,7 +150,6 @@ class ApproveRequest(BaseModel):
     always: bool = Field(
         default=False, description="Auto-approve the tools in this batch going forward"
     )
-    ws_id: str = Field(description="Target workstream ID")
 
 
 class PlanFeedbackRequest(BaseModel):
@@ -154,7 +163,6 @@ class CommandRequest(BaseModel):
 
 
 class CancelRequest(BaseModel):
-    ws_id: str = Field(description="Target workstream ID")
     force: bool = Field(
         default=False,
         description="Force cancel: abandon the stuck worker thread immediately. "
@@ -228,7 +236,7 @@ class CreateWorkstreamRequest(BaseModel):
         description=(
             "Workstream kind — 'interactive' (default) or 'coordinator'. "
             "Coordinator workstreams are created by the console's own "
-            "/v1/api/coordinator/new endpoint; clients hitting "
+            "/v1/api/workstreams/new endpoint; clients hitting "
             "/v1/api/workstreams/new should leave this at the default."
         ),
     )
@@ -254,13 +262,30 @@ class CreateWorkstreamResponse(BaseModel):
         description=(
             "Ids of attachments saved by this request (multipart variant only). "
             "Already reserved onto the initial_message turn when one was provided; "
-            "otherwise left pending for a follow-up POST /v1/api/send."
+            "otherwise left pending for a follow-up POST "
+            "/v1/api/workstreams/{ws_id}/send."
         ),
     )
 
 
 class CloseWorkstreamRequest(BaseModel):
-    ws_id: str = Field(description="Workstream ID to close")
+    """Body for ``POST /v1/api/workstreams/{ws_id}/close``.
+
+    The body must be valid JSON; send ``{}`` when omitting all
+    fields. Pre-1.5 the model also carried a body-keyed ``ws_id``;
+    1.5 moved that to the path so the body shrinks to the optional
+    ``reason``. Coord ignores the body entirely (its close handler
+    is wired ``supports_close_reason=False``).
+    """
+
+    reason: str | None = Field(
+        default=None,
+        description=(
+            "Optional close reason persisted to ``workstream_config`` "
+            "for postmortem. Capped at 512 UTF-8 bytes server-side; "
+            "credential-redaction is applied via the output guard."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -269,19 +294,124 @@ class CloseWorkstreamRequest(BaseModel):
 
 
 class WorkstreamInfo(BaseModel):
-    id: str
+    """Active-list row shape, shared across both kinds.
+
+    Renamed ``id`` → ``ws_id`` and added ``user_id`` in the Stage 2
+    ``list``/``saved`` verb lift so the active-list response shape
+    matches the rest of the v1 surface (every other shared verb's
+    payload uses ``ws_id``). ``user_id`` was previously coord-only;
+    interactive now populates it too. SDK consumers reading
+    ``row.id`` should swap to ``row.ws_id``.
+    """
+
+    ws_id: str
     name: str
     state: str
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     parent_ws_id: str | None = None
+    user_id: str = ""
 
 
 class ListWorkstreamsResponse(BaseModel):
+    """Response body for ``GET /v1/api/workstreams`` on either kind.
+
+    Top-level key is ``workstreams`` regardless of the kind serving
+    the request — pre-lift coord returned ``{"coordinators": [...]}``;
+    convergence lifted both kinds onto the same shape. Coord SDK /
+    frontend consumers branching on ``data.coordinators`` swap to
+    ``data.workstreams``.
+    """
+
     workstreams: list[WorkstreamInfo]
 
 
+class PendingApprovalItem(BaseModel):
+    """One pending tool-call inside a ``PendingApprovalDetail`` envelope.
+
+    Mirrors the dict ``SessionUIBase.serialize_pending_approval_detail``
+    emits per item. ``heuristic_verdict`` / ``judge_verdict`` are kept
+    loosely-typed because the underlying verdict shape varies by tier;
+    consumers that want the full structure can decode against
+    :class:`turnstone.sdk.events.IntentVerdictEvent`.
+    """
+
+    call_id: str = ""
+    header: str = ""
+    preview: str = ""
+    func_name: str = ""
+    approval_label: str = ""
+    needs_approval: bool = False
+    error: str | None = None
+    heuristic_verdict: dict[str, Any] | None = None
+    judge_verdict: dict[str, Any] | None = None
+
+
+class RecentAutoApproval(BaseModel):
+    """One ring-buffer entry for ``DashboardWorkstream.recent_auto_approvals``.
+
+    Records a tool call that bypassed the operator approval gate
+    (admin tool policy / skill ``allowed_tools`` allowlist / blanket
+    ``auto_approve`` / "Approve + Always" memory).  The coord-tree
+    pill reads this list to surface "auto-approved by skill X" so
+    the operator can see WHICH calls bypassed and WHY.
+    """
+
+    call_id: str = ""
+    func_name: str = ""
+    approval_label: str = ""
+    auto_approve_reason: str = Field(
+        default="",
+        description=(
+            "Source that fired the bypass.  ``skill`` (skill template's "
+            "``allowed_tools``), ``always`` (user 'Approve + Always' "
+            "click), ``policy`` (admin tool-policy ``allow`` rule), "
+            "``blanket`` (workstream-level ``auto_approve=True``), or "
+            "``auto_approve_tools`` (legacy / unknown writer)."
+        ),
+    )
+    ts: float = Field(
+        default=0.0,
+        description="Unix epoch seconds when the auto-approve fired.",
+    )
+
+
+class PendingApprovalDetail(BaseModel):
+    """Inline approval payload merged into ``DashboardWorkstream``.
+
+    Set when a workstream's ``approve_tools`` is parked on
+    ``_approval_event``; ``None`` (omitted) otherwise. Cross-tenant
+    exposure here follows the same trusted-team posture as
+    ``activity`` / ``tokens`` — see ``server.py``'s ``dashboard``
+    handler comment.
+    """
+
+    call_id: str = Field(
+        default="",
+        description=(
+            "Primary call_id — first non-empty call_id in items list "
+            "order. Matches the 409 ``current_call_id`` response from "
+            "``POST /v1/api/workstreams/{ws_id}/approve`` so the UI "
+            "can render the same identifier the server reports as "
+            "current."
+        ),
+    )
+    judge_pending: bool = Field(
+        default=False,
+        description="LLM judge tier still running; heuristic verdicts may already be present on items.",
+    )
+    items: list[PendingApprovalItem] = Field(default_factory=list)
+
+
 class DashboardWorkstream(BaseModel):
-    id: str
+    """Dashboard row shape for ``GET /v1/api/dashboard``.
+
+    Renamed ``id`` → ``ws_id`` for v1 row-shape consistency with
+    the rest of the workstream surface (active list, saved list,
+    history, detail, etc.). Frontend consumers reading
+    ``dashboard.workstreams[].id`` swap to ``.ws_id``.
+    """
+
+    ws_id: str
     name: str
     state: str
     title: str = ""
@@ -296,6 +426,31 @@ class DashboardWorkstream(BaseModel):
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     parent_ws_id: str | None = None
     user_id: str = ""
+    pending_approval_detail: PendingApprovalDetail | None = Field(
+        default=None,
+        description=(
+            "Inline approval payload for the coordinator children-tree "
+            "UI. Carries the merged ``_pending_approval`` items list + "
+            "per-call_id LLM verdict cache so a coord can render "
+            "approve/deny buttons + judge pill without a separate "
+            "per-child round-trip. ``None`` when no approval is pending. "
+            "Also surfaced (verbatim) on ``GET /v1/api/cluster/ws/live`` "
+            "via the ``_CLUSTER_WS_LIVE_KEYS`` projection."
+        ),
+    )
+    recent_auto_approvals: list[RecentAutoApproval] = Field(
+        default_factory=list,
+        description=(
+            "Per-ws ring buffer (cap 10) of recent tool calls that "
+            "bypassed the operator approval gate. Surfaces "
+            "``WebUI._recent_auto_approvals`` so the coord-tree row "
+            "can render an 'auto-approved by ...' pill when the "
+            "child's skill / blanket / admin-policy rules silently "
+            "let a tool through. Also projected onto "
+            "``GET /v1/api/cluster/ws/live`` via "
+            "``_CLUSTER_WS_LIVE_KEYS``."
+        ),
+    )
 
 
 class DashboardAggregate(BaseModel):
@@ -328,6 +483,69 @@ class SavedWorkstreamInfo(BaseModel):
 
 class ListSavedWorkstreamsResponse(BaseModel):
     workstreams: list[SavedWorkstreamInfo]
+
+
+# ---------------------------------------------------------------------------
+# Detail / history (Stage 2 verb lift — both kinds expose these)
+# ---------------------------------------------------------------------------
+
+
+class WorkstreamDetailResponse(BaseModel):
+    """Response body for ``GET /v1/api/workstreams/{ws_id}``.
+
+    Renamed and relocated from ``CoordinatorDetailResponse`` in the
+    Stage 2 history/detail verb lift. Both kinds populate every field;
+    SDK consumers don't branch on kind to read them. The lift adds the
+    endpoint to interactive as a feature gain (pre-lift only coord
+    exposed it).
+    """
+
+    ws_id: str
+    name: str
+    state: str
+    user_id: str
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    pending_approval: bool = Field(
+        default=False,
+        description=(
+            "True when the workstream is parked on ``_approval_event`` "
+            "awaiting an operator approve/deny.  Mirrors the same field "
+            "on ``DashboardWorkstream`` / cluster live projections so a "
+            "freshly-loaded chat tab can render the inline approval gate "
+            "from the detail snapshot before SSE replay arrives."
+        ),
+    )
+    pending_approval_detail: PendingApprovalDetail | None = Field(
+        default=None,
+        description=(
+            "Inline approval payload — same shape as ``DashboardWorkstream"
+            ".pending_approval_detail``.  ``None`` when no approval is "
+            "pending.  Lets a reload paint the action row + judge "
+            "verdicts immediately instead of relying on the SSE "
+            "approve_request replay timing window."
+        ),
+    )
+
+
+class WorkstreamHistoryResponse(BaseModel):
+    """Response body for ``GET /v1/api/workstreams/{ws_id}/history``.
+
+    Renamed and relocated from ``CoordinatorHistoryResponse`` in the
+    Stage 2 history/detail verb lift. Same OpenAI-like message-row
+    shape on both kinds; the lift adds the endpoint to interactive as
+    a feature gain (pre-lift interactive only exposed history through
+    the SSE replay on ``/events``).
+    """
+
+    ws_id: str
+    messages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Tail of the workstream's reconstructed message history "
+            "(provider-fidelity OpenAI-like shape). Bounded by the "
+            "``limit`` query parameter (default 100, max 500)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

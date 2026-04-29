@@ -9,149 +9,12 @@
    ========================================================================== */
 
 /* ==========================================================================
-   Messages — single-column left-aligned blocks
-   Differentiation is by left-border colour only (no role labels).
-   ========================================================================== */
-.ts-msg {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  padding: 8px 12px;
-  margin-bottom: 8px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-left-width: 3px;
-  border-radius: var(--radius-sm);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.55;
-  word-wrap: break-word;
-  overflow-wrap: break-word;
-}
-
-.ts-msg--user {
-  border-left-color: var(--accent);
-}
-.ts-msg--assistant {
-  border-left-color: var(--border-strong);
-}
-.ts-msg--reasoning {
-  /* Dashed on the left-accent only — the other three sides keep the
-     solid 1px outline so the block stays a crisp card rather than
-     turning into a fully dotted box. */
-  border-left-style: dashed;
-  border-left-color: var(--fg-dim);
-  color: var(--fg-dim);
-  font-style: italic;
-}
-.ts-msg--tool {
-  font-family: var(--font-mono);
-  background: var(--code-bg);
-  border-left-color: var(--cyan);
-}
-.ts-msg--error {
-  border-left-color: var(--red);
-  color: var(--red);
-}
-.ts-msg--info {
-  border-left-color: var(--cyan);
-  color: var(--cyan);
-  font-size: 12px;
-}
-
-/* Content container.  Markdown renders here (streamingRender writes
-   innerHTML; renderer.js is the trust boundary for that sink). */
-.ts-msg-body {
-  min-width: 0;
-  white-space: pre-wrap;
-}
-.ts-msg-body > *:first-child { margin-top: 0; }
-.ts-msg-body > *:last-child { margin-bottom: 0; }
-.ts-msg-body pre {
-  margin: 6px 0;
-  padding: 8px 10px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow-x: auto;
-  font-size: 12px;
-}
-.ts-msg-body code {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  background: var(--bg-highlight);
-  padding: 1px 4px;
-  border-radius: 2px;
-}
-.ts-msg-body pre code { background: none; padding: 0; border-radius: 0; }
-.ts-msg-body a { color: var(--accent); text-decoration: underline; }
-.ts-msg-body h1, .ts-msg-body h2, .ts-msg-body h3,
-.ts-msg-body h4, .ts-msg-body h5, .ts-msg-body h6 {
-  font-family: var(--font-display);
-  font-weight: 600;
-  margin: 8px 0 4px;
-  color: var(--fg-bright);
-}
-.ts-msg-body h1 { font-size: 16px; }
-.ts-msg-body h2 { font-size: 14px; }
-.ts-msg-body h3 { font-size: 13px; }
-.ts-msg-body h4, .ts-msg-body h5, .ts-msg-body h6 {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-.ts-msg-body ul, .ts-msg-body ol { margin: 4px 0 4px 20px; }
-.ts-msg-body li { margin: 2px 0; }
-.ts-msg-body strong { color: var(--fg-bright); }
-.ts-msg-body em { font-style: italic; }
-.ts-msg-body blockquote {
-  border-left: 2px solid var(--border-strong);
-  padding-left: 10px;
-  margin: 6px 0;
-  color: var(--fg-dim);
-}
-
-/* Floating action toolbar — edit / rewind / retry / copy slots.
-   Absolute top-right so the message body stays full-width. */
-.ts-msg-actions {
-  position: absolute;
-  top: 4px;
-  right: 6px;
-  display: flex;
-  gap: 4px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-.ts-msg:hover .ts-msg-actions,
-.ts-msg:focus-within .ts-msg-actions { opacity: 1; }
-.ts-msg-action-btn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--fg-dim);
-  border-radius: var(--radius-sm);
-  padding: 2px 6px;
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-  transition: background 0.1s, border-color 0.1s, color 0.1s;
-}
-.ts-msg-action-btn:hover {
-  background: var(--bg-highlight);
-  color: var(--fg-bright);
-  border-color: var(--accent-dim);
-}
-.ts-msg-action-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-/* On coarse-pointer / hover-none devices, keep the toolbar visible — no hover. */
-@media (hover: none) and (pointer: coarse) {
-  .ts-msg-actions { opacity: 1; }
-  .ts-msg-action-btn { padding: 4px 8px; font-size: 12px; }
-}
-
-/* ==========================================================================
    Approval shell — shared by inline (per-tool, interactive UI) and
    batch (pinned bottom bar, coordinator).  Same visual vocabulary,
    different layout hook.
+
+   The message primitive (.msg / .msg-body / .msg-actions / .msg-action-btn)
+   used by inline approval blocks is defined further down in this file.
    ========================================================================== */
 .ts-approval {
   display: flex;
@@ -159,11 +22,15 @@
   gap: 6px;
 }
 
-/* Inline variant: an approval block living as a .ts-msg in the
-   message stream, one per tool call awaiting approval. */
-.ts-msg.ts-approval--inline {
-  border-left-color: var(--yellow);
-  background: var(--bg-elevated);
+/* Inline variant: an approval block living as a .msg in the message
+   stream, one per tool call awaiting approval.  Cyan to match the
+   .msg.tool execution-result colour — both are tool-role surfaces,
+   distinct from user (amber) and assistant (neutral).  Selector qualifier
+   choice (.msg.ts-approval--inline vs bare) is explained at the matching
+   rule in ui/static/style.css. */
+.msg.ts-approval--inline {
+  border-left-color: var(--cyan);
+  background: var(--panel-2);
 }
 
 /* Batch variant: pinned to the bottom of the chat pane, batches all
@@ -172,19 +39,21 @@
   position: relative;
   padding: 10px 14px;
   background: var(--bg-surface);
-  border-top: 1px solid var(--yellow);
-  border-left: 3px solid var(--yellow);
+  border-top: 1px solid var(--cyan);
+  border-left: 3px solid var(--cyan);
   display: none;
 }
-.ts-approval--batch.visible { display: flex; }
+.ts-approval--batch.visible {
+  display: flex;
+}
 
 .ts-approval-header {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--yellow);
+  color: var(--cyan);
   margin-bottom: 2px;
 }
 .ts-approval-tool {
@@ -195,9 +64,17 @@
   border-radius: var(--radius-sm);
   background: var(--code-bg);
 }
-.ts-approval-tool + .ts-approval-tool { margin-top: 4px; }
-.ts-approval-tool-name { color: var(--yellow); font-weight: 600; }
-.ts-approval-tool-cmd { color: var(--fg-bright); white-space: pre-wrap; }
+.ts-approval-tool + .ts-approval-tool {
+  margin-top: 4px;
+}
+.ts-approval-tool-name {
+  color: var(--cyan);
+  font-weight: 600;
+}
+.ts-approval-tool-cmd {
+  color: var(--fg-bright);
+  white-space: pre-wrap;
+}
 .ts-approval-actions {
   display: flex;
   gap: 6px;
@@ -214,20 +91,44 @@
   border-radius: var(--radius-sm);
   color: var(--fg);
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
 }
 .ts-approval-btn:hover {
   background: var(--bg-highlight);
   color: var(--fg-bright);
   border-color: var(--accent-dim);
 }
-.ts-approval-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.ts-approval-btn--approve { border-color: var(--green); color: var(--green); }
-.ts-approval-btn--approve:hover { background: var(--green-glow); color: var(--green); }
-.ts-approval-btn--deny { border-color: var(--red); color: var(--red); }
-.ts-approval-btn--deny:hover { background: var(--red-glow); color: var(--red); }
-.ts-approval-btn--always { border-color: var(--accent); color: var(--accent); }
-.ts-approval-btn--always:hover { background: var(--accent-dim); color: var(--accent); }
+.ts-approval-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ts-approval-btn--approve {
+  border-color: var(--green);
+  color: var(--green);
+}
+.ts-approval-btn--approve:hover {
+  background: var(--green-glow);
+  color: var(--green);
+}
+.ts-approval-btn--deny {
+  border-color: var(--red);
+  color: var(--red);
+}
+.ts-approval-btn--deny:hover {
+  background: var(--red-glow);
+  color: var(--red);
+}
+.ts-approval-btn--always {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.ts-approval-btn--always:hover {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
 .ts-approval-btn .ts-approval-key {
   display: inline-block;
   background: var(--bg);
@@ -238,7 +139,10 @@
   font-size: 10px;
   color: var(--fg-dim);
 }
-.ts-approval-btn:disabled { opacity: 0.5; cursor: wait; }
+.ts-approval-btn:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
 
 .ts-approval-feedback {
   font: inherit;
@@ -256,10 +160,13 @@
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
-.ts-approval-feedback::placeholder { color: var(--fg-dim); opacity: 0.7; }
+.ts-approval-feedback::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
 
 .ts-approval-badge {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   padding: 2px 8px;
@@ -270,9 +177,19 @@
   gap: 4px;
   width: max-content;
 }
-.ts-approval-badge--approved { color: var(--green); border: 1px solid var(--green); }
-.ts-approval-badge--denied { color: var(--red); border: 1px solid var(--red); }
-.ts-approval-badge--error { color: var(--red); background: var(--red-glow); border: 1px solid var(--red); }
+.ts-approval-badge--approved {
+  color: var(--green);
+  border: 1px solid var(--green);
+}
+.ts-approval-badge--denied {
+  color: var(--red);
+  border: 1px solid var(--red);
+}
+.ts-approval-badge--error {
+  color: var(--red);
+  background: var(--red-glow);
+  border: 1px solid var(--red);
+}
 
 /* Verdict badge (LLM judge) — inline in the approval block on
    interactive UI.  Coordinator doesn't render verdicts today but the
@@ -289,13 +206,31 @@
   background: var(--bg-surface);
   width: max-content;
 }
-.ts-verdict-badge[data-risk="low"] { border-left-color: var(--green); }
-.ts-verdict-badge[data-risk="medium"] { border-left-color: var(--yellow); }
-.ts-verdict-badge[data-risk="high"] { border-left-color: var(--red); }
-.ts-verdict-badge[data-risk="critical"] { border-left-color: var(--red); background: var(--red-glow); }
-.ts-verdict-risk { font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
-.ts-verdict-rec { color: var(--fg-dim); }
-.ts-verdict-conf { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.ts-verdict-badge[data-risk="low"] {
+  border-left-color: var(--green);
+}
+.ts-verdict-badge[data-risk="medium"] {
+  border-left-color: var(--yellow);
+}
+.ts-verdict-badge[data-risk="high"] {
+  border-left-color: var(--red);
+}
+.ts-verdict-badge[data-risk="critical"] {
+  border-left-color: var(--red);
+  background: var(--red-glow);
+}
+.ts-verdict-risk {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ts-verdict-rec {
+  color: var(--fg-dim);
+}
+.ts-verdict-conf {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
 .ts-verdict-expand {
   background: none;
   border: none;
@@ -337,23 +272,29 @@
    send button.  Coordinator omits chips + paperclip; interactive
    includes both.  Same wrapper, same textarea + send styling.
    ========================================================================== */
-.ts-composer {
+.composer {
   display: flex;
   flex-direction: column;
   gap: 6px;
   padding: 10px 14px;
-  background: var(--bg-surface);
-  border-top: 1px solid var(--border);
+  /* Recessed wrapper — the textarea inside reads as the prominent
+     input surface above this background.  In light mode --bg
+     (#f7f7f4) on --bg-surface (#ffffff) gave near-identical contrast
+     and made the textarea invisible; the inversion fixes both modes. */
+  background: var(--bg);
+  border-top: 1px solid var(--border-strong);
 }
 
-.ts-composer-chips {
+.composer-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
 }
-.ts-composer-chips:empty { display: none; }
+.composer-chips:empty {
+  display: none;
+}
 
-.ts-composer-chip {
+.composer-chip {
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -365,8 +306,11 @@
   border-radius: var(--radius-sm);
   color: var(--fg);
 }
-.ts-composer-chip-size { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
-.ts-composer-chip-remove {
+.composer-chip-size {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+.composer-chip-remove {
   background: none;
   border: none;
   color: var(--fg-dim);
@@ -376,15 +320,17 @@
   font-size: 13px;
   line-height: 1;
 }
-.ts-composer-chip-remove:hover { color: var(--red); }
+.composer-chip-remove:hover {
+  color: var(--red);
+}
 
-.ts-composer-row {
+.composer-row {
   display: flex;
   align-items: flex-end;
   gap: 6px;
 }
 
-.ts-composer-attach {
+.composer-attach {
   background: transparent;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -394,41 +340,55 @@
   padding: 4px 8px;
   line-height: 1;
   height: 32px;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  transition:
+    background 0.12s,
+    color 0.12s,
+    border-color 0.12s;
 }
-.ts-composer-attach:hover {
+.composer-attach:hover {
   background: var(--bg-highlight);
   color: var(--accent);
   border-color: var(--accent-dim);
 }
-.ts-composer-attach:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.composer-attach:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
 
-.ts-composer-input {
+.composer-input {
   flex: 1;
   min-height: 32px;
   max-height: 160px;
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--fg);
-  background: var(--bg);
-  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
   /* resize: none — max-height + auto-resize handlers in app.js /
      coordinator.js cap growth; letting the user drag-resize pushes
      the messages pane off-screen on small viewports. */
   resize: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
-.ts-composer-input:focus-visible {
+.composer-input:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
-.ts-composer-input:disabled { opacity: 0.55; cursor: not-allowed; }
-.ts-composer-input::placeholder { color: var(--fg-dim); opacity: 0.7; }
+.composer-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.composer-input::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
 
-.ts-composer-send {
+.composer-send {
   font: inherit;
   font-family: var(--font-mono);
   font-size: 12px;
@@ -443,20 +403,32 @@
   transition: filter 0.12s;
   letter-spacing: 0.02em;
 }
-.ts-composer-send:hover { filter: brightness(1.08); }
-.ts-composer-send:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
-.ts-composer-send:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
-.ts-composer-send--queue {
+.composer-send:hover {
+  filter: brightness(1.08);
+}
+.composer-send:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 2px;
+}
+.composer-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: none;
+}
+.composer-send--queue {
   background: transparent;
   color: var(--accent);
   border-color: var(--accent);
 }
-.ts-composer-send--queue:hover { background: var(--accent-dim); filter: none; }
+.composer-send--queue:hover {
+  background: var(--accent-dim);
+  filter: none;
+}
 
 /* Stop button — only rendered when the composer was constructed with
    stopBtn=true.  Distinct red colour signals "interrupt the in-flight
    generation" rather than "send another message". */
-.ts-composer-stop {
+.composer-stop {
   background: var(--red, #c94040);
   min-width: 120px;
   text-align: center;
@@ -471,11 +443,56 @@
   cursor: pointer;
   height: 32px;
 }
-.ts-composer-stop:focus-visible {
+.composer-stop:focus-visible {
   outline: 2px solid var(--fg-bright, #e8ecf4);
   outline-offset: 2px;
 }
-[data-theme="light"] .ts-composer-stop { color: #fff; }
+[data-theme="light"] .composer-stop {
+  color: #fff;
+}
+
+/* ============================================================
+   Queued-message bubble — optimistic UI when the user sends
+   while the worker is still mid-turn (queueWhileBusy=true).
+   The bubble dims, gains a dashed border, and carries a
+   "queued" badge + dismiss button until the shared queue
+   controller observes the busy → idle edge via
+   ``queue.onIdleEdge()`` and promotes it to a normal user
+   message. The "important" variant is the !!! priority
+   prefix path.
+   ============================================================ */
+.msg-queued {
+  opacity: 0.65;
+  border-style: dashed;
+}
+.msg-queued-important {
+  opacity: 0.8;
+  border-color: var(--yellow, var(--warn));
+}
+.queued-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--fg-dim, var(--ink-3));
+  margin-right: 4px;
+}
+.msg-queued-important .queued-badge {
+  color: var(--yellow, var(--warn));
+}
+.queued-dismiss {
+  background: none;
+  border: none;
+  color: var(--fg-dim, var(--ink-3));
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  margin-left: 8px;
+  float: right;
+  line-height: 1;
+}
+.queued-dismiss:hover {
+  color: var(--red, var(--err));
+}
 
 /* ============================================================
    Stacked layout — textarea above, actions row below.
@@ -484,15 +501,15 @@
    row pairs an attach / options cluster on the left with a
    primary "Create" / "Start" button on the right.
    ============================================================ */
-.ts-composer--stacked {
+.composer--stacked {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
-.ts-composer--stacked .ts-composer-text {
+.composer--stacked .composer-text {
   display: flex;
 }
-.ts-composer--stacked .ts-composer-input {
+.composer--stacked .composer-input {
   flex: 1;
   min-height: 72px;
   /* Blend the textarea into its enclosing panel in stacked layout —
@@ -506,18 +523,18 @@
   padding: 6px 8px;
   resize: vertical;
 }
-.ts-composer--stacked .ts-composer-input:focus-visible {
+.composer--stacked .composer-input:focus-visible {
   box-shadow: none;
   border-bottom-color: var(--accent);
 }
-.ts-composer--stacked .ts-composer-row {
+.composer--stacked .composer-row {
   align-items: center;
 }
 /* Space the primary action button away from the left-clustered
    attach + options buttons in the stacked layout.  The send
    button is always the LAST element in the action row; push it
    to the right edge via margin-left:auto. */
-.ts-composer--stacked .ts-composer-send {
+.composer--stacked .composer-send {
   margin-left: auto;
 }
 
@@ -525,7 +542,7 @@
    Options disclosure — toggle button + collapsible panel.
    Rendered when the composer is constructed with opts.options.
    ============================================================ */
-.ts-composer-options-btn {
+.composer-options-btn {
   background: transparent;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -538,38 +555,40 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  transition: background 0.12s, border-color 0.12s;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
 }
-.ts-composer-options-btn:hover {
+.composer-options-btn:hover {
   background: var(--bg-highlight);
   border-color: var(--accent-dim);
 }
-.ts-composer-options-btn:focus-visible {
+.composer-options-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.ts-composer-options-btn[aria-expanded="true"] .ts-composer-options-caret {
+.composer-options-btn[aria-expanded="true"] .composer-options-caret {
   /* Flip ▾ to ▴ via transform so the glyph file stays single-char. */
   display: inline-block;
   transform: rotate(180deg);
 }
-.ts-composer-options-summary {
+.composer-options-summary {
   color: var(--fg-dim);
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.02em;
 }
-.ts-composer-options-panel {
+.composer-options-panel {
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 6px 12px;
   align-items: center;
   padding: 8px;
-  /* Darker inset — visually distinct from the enclosing panel so
-     the options zone reads as its own settings surface.  Matches
-     the interactive dashboard composer's options-panel shade. */
-  background: var(--bg);
-  border: 1px solid var(--border);
+  /* Most recessed surface — sits below the wrapper (--bg) and
+     well below the textarea (--bg-surface) in the depth hierarchy
+     so the options zone reads as its own settings tier. */
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
   font-size: 12px;
@@ -579,17 +598,19 @@
    and comes later in the cascade, so a bare [hidden] attribute
    alone doesn't hide the panel.  Override here so toggleOptions()
    works via the standard hidden attribute. */
-.ts-composer-options-panel[hidden] { display: none; }
-.ts-composer-options-field {
+.composer-options-panel[hidden] {
+  display: none;
+}
+.composer-options-field {
   display: contents;
 }
-.ts-composer-options-field > label {
+.composer-options-field > label {
   color: var(--fg-dim);
   text-transform: uppercase;
   font-size: 10px;
   letter-spacing: 0.05em;
 }
-.ts-composer-options-control {
+.composer-options-control {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--fg);
@@ -599,14 +620,14 @@
   padding: 4px 6px;
   width: 100%;
 }
-.ts-composer-options-control:focus-visible {
+.composer-options-control:focus-visible {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
 /* Active-state flip on the toggle button itself (mirrors the
    dashboard composer's affordance). */
-.ts-composer-options-btn[aria-expanded="true"] {
+.composer-options-btn[aria-expanded="true"] {
   color: var(--fg);
   background: var(--bg);
 }
@@ -629,36 +650,52 @@
   position: relative;
 }
 .ts-header::after {
-  content: '';
+  content: "";
   position: absolute;
   bottom: 0;
   left: 0;
   right: 0;
   height: 1px;
-  background: linear-gradient(90deg, transparent, var(--accent-dim), transparent);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--accent-dim),
+    transparent
+  );
 }
 /* Suppress the accent gradient when the header is immediately followed
    by a #tab-bar (server UI) — the tab-bar already carries its own
    border-bottom and the two decorative lines stack visually otherwise. */
-.ts-header:has(+ #tab-bar)::after { display: none; }
+.ts-header:has(+ #tab-bar)::after {
+  display: none;
+}
 .ts-header-title {
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 700;
   color: var(--accent);
   letter-spacing: 0.02em;
   margin: 0;
 }
-.ts-header-title-dim { color: var(--fg-dim); font-weight: 400; }
+.ts-header-title-dim {
+  color: var(--fg-dim);
+  font-weight: 400;
+}
 .ts-header-status {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--fg-dim);
   letter-spacing: 0.03em;
 }
-.ts-header-status--ok { color: var(--green); }
-.ts-header-status--err { color: var(--red); }
-.ts-header-spacer { flex: 1; }
+.ts-header-status--ok {
+  color: var(--green);
+}
+.ts-header-status--err {
+  color: var(--red);
+}
+.ts-header-spacer {
+  flex: 1;
+}
 
 /* Back-to-console navigation — shared affordance used by the
    coordinator page header and by the console's redirect banner
@@ -675,7 +712,10 @@
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   letter-spacing: 0.02em;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  transition:
+    background 0.12s,
+    border-color 0.12s,
+    color 0.12s;
 }
 .ts-header-back-link:hover {
   color: var(--accent);
@@ -686,7 +726,9 @@
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.ts-header-back-link-arrow { font-family: var(--font-mono); }
+.ts-header-back-link-arrow {
+  font-family: var(--font-mono);
+}
 .ts-header-actions {
   display: flex;
   align-items: center;
@@ -721,7 +763,7 @@
 .ts-sidebar-section-heading {
   margin: 0;
   padding: 6px 10px;
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -733,7 +775,10 @@
   align-items: center;
   gap: 6px;
 }
-.ts-sidebar-section-count { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.ts-sidebar-section-count {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
 .ts-sidebar-section-body {
   flex: 1 1 auto;
   overflow-y: auto;
@@ -750,27 +795,439 @@
    Mobile (<700px) — chat.css components stack vertically.
    ========================================================================== */
 @media (max-width: 700px) {
-  .ts-msg { padding: 6px 10px; }
-  .ts-msg-body pre { margin: 4px -6px; border-radius: 0; }
-  .ts-composer { padding: 6px 10px; }
-  .ts-composer-input { min-height: 40px; max-height: 120px; resize: none; }
-  .ts-composer-send { height: 40px; padding: 6px 14px; }
+  .msg {
+    padding: 6px 10px;
+  }
+  .msg-body pre {
+    margin: 4px -6px;
+    border-radius: 0;
+  }
+  .composer {
+    padding: 6px 10px;
+  }
+  .composer-input {
+    min-height: 40px;
+    max-height: 120px;
+    resize: none;
+  }
+  .composer-send {
+    height: 40px;
+    padding: 6px 14px;
+  }
   .ts-sidebar {
     width: 100%;
     border-left: none;
     border-top: 1px solid var(--border);
   }
-  .ts-approval--batch { padding: 8px 10px; }
+  .ts-approval--batch {
+    padding: 8px 10px;
+  }
 }
 
 /* ==========================================================================
    Reduced motion — disable chat.css transitions.
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
-  .ts-msg-actions,
-  .ts-msg-action-btn,
+  .msg-actions,
+  .msg-action-btn,
   .ts-approval-btn,
-  .ts-composer-attach,
-  .ts-composer-input,
-  .ts-composer-send { transition: none; }
+  .composer-attach,
+  .composer-input,
+  .composer-send {
+    transition: none;
+  }
+}
+
+/* ==========================================================================
+   Message primitive — chat-style single-column message block.  Semantic
+   variant carries via 3px left-border colour (and text colour for
+   error/info).  Shared by the coordinator chat view and the per-node
+   server chat UI; both render pure .msg classes.
+
+   Variants:
+     .msg                 base (assistant / generic)
+     .msg.user            user-authored turn (accent left-border)
+     .msg.assistant       explicit assistant (same as base, clarity class)
+     .msg.reasoning       <thinking> / reasoning trace — dashed left-border
+     .msg.tool            tool output / tool response — accent-tinted
+     .msg.error           error states — err red
+     .msg.info            transient info — think indigo, smaller
+     .msg.system          system-injected turns (policy notices, etc.)
+
+   Content sub-elements:
+     .msg-meta            author / timestamp / model label (optional);
+                          placed above .msg-body in mono 11px --ink-3
+     .msg-body            markdown target — styles code, pre, headings,
+                          lists, blockquotes, strong/em
+     .msg-actions         hover-revealed action buttons (copy / regenerate)
+
+   Streaming indicator: add `data-streaming="true"` to the .msg and a
+   blinking caret appears at the end of .msg-body. Avoids per-view
+   reinvention.
+   ========================================================================== */
+.msg {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px;
+  margin-bottom: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--hair);
+  border-left-width: 3px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  line-height: 1.55;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* Variant left-borders */
+.msg.user {
+  border-left-color: var(--accent);
+}
+.msg.assistant {
+  border-left-color: var(--hair-2);
+}
+.msg.reasoning {
+  border-left-style: dashed;
+  border-left-color: var(--ink-4);
+  color: var(--ink-3);
+  font-style: italic;
+}
+.msg.tool {
+  background: var(--panel);
+  /* Cyan for tool-role surfaces — shared with .ts-approval borders so
+     user (amber) / assistant (neutral) / tool (cyan) read distinctly. */
+  border-left-color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.msg.error {
+  border-left-color: var(--err);
+  color: var(--err);
+}
+.msg.info {
+  border-left-color: var(--think);
+  color: color-mix(in srgb, var(--think) 70%, var(--ink));
+  font-size: 12px;
+}
+.msg.system {
+  border-left-color: var(--ink-4);
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+/* Author / timestamp slot — optional label row above the body. Use
+   this for "assistant · 10:42:18 · claude-opus-4-7" style headers. */
+.msg-meta {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* Markdown body — renderer.js writes innerHTML here; trust boundary
+   lives there, not in CSS. Keep styles tight so streamed content
+   doesn't jitter layout as tokens arrive.
+
+   ``white-space: normal`` is intentional (and explicit so a future edit
+   doesn't "simplify" by reaching for ``pre-wrap``).  The markdown
+   converter leaves ``\n`` text nodes between block siblings (headings →
+   paragraphs → katex-display → ...).  ``pre-wrap`` rendered every one
+   of those as visible vertical space, stacking 20-30px gaps between
+   every section.  ``<pre>`` blocks have ``white-space: pre`` built in
+   so fenced code still preserves formatting; mid-stream partial fences
+   before the closing ``\`\`\`` arrives render as collapsed text for a
+   frame and then snap back when the next render tick wraps them in
+   ``<pre>``.  User-typed messages render through ``.msg-user-text`` (a
+   separate path that preserves its own newlines), so this default only
+   affects assistant markdown output. */
+.msg-body {
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+}
+
+/* Streaming caret — append to the end of .msg-body when the message is
+   still being streamed. Opt in via `data-streaming="true"` on the .msg. */
+.msg[data-streaming="true"] .msg-body::after {
+  content: "▍";
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--accent);
+  animation: ts-caret 1s steps(2, start) infinite;
+}
+
+@keyframes ts-caret {
+  to {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg[data-streaming="true"] .msg-body::after {
+    animation: none;
+  }
+}
+
+.msg-body > *:first-child {
+  margin-top: 0;
+}
+.msg-body > *:last-child {
+  margin-bottom: 0;
+}
+
+.msg-body pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair);
+  border-radius: var(--r-sm);
+  overflow-x: auto;
+}
+
+.msg-body code {
+  padding: 1px 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--panel);
+  border: 1px solid var(--hair-2);
+  border-radius: 3px;
+  /* Preserve internal whitespace + allow wrapping.  The body's
+     ``white-space: normal`` (above) would otherwise collapse multiple
+     spaces inside backtick spans; ``<pre>`` blocks rely on the
+     user-agent ``pre { white-space: pre }`` rule and don't need this. */
+  white-space: pre-wrap;
+}
+
+.msg-body pre code {
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 0;
+}
+
+/* Tool messages have a --panel background, same colour as the default
+   .msg-body pre bg — shift the pre/code inside tool blocks to --panel-2
+   so the inline code stands out from the message surface. */
+.msg.tool .msg-body pre,
+.msg.tool .msg-body code {
+  background: var(--panel-2);
+}
+
+.msg-body a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.msg-body h1,
+.msg-body h2,
+.msg-body h3,
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 {
+  margin: 10px 0 4px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.msg-body h1 {
+  font-size: 16px;
+}
+.msg-body h2 {
+  font-size: 14px;
+}
+.msg-body h3 {
+  font-size: 13px;
+}
+.msg-body h4,
+.msg-body h5,
+.msg-body h6 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+.msg-body p {
+  margin: 6px 0;
+}
+
+.msg-body ul,
+.msg-body ol {
+  margin: 4px 0 4px 20px;
+  padding: 0;
+}
+.msg-body li {
+  margin: 2px 0;
+}
+
+.msg-body strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+.msg-body em {
+  font-style: italic;
+}
+
+.msg-body blockquote {
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-left: 2px solid var(--hair);
+  color: var(--ink-3);
+}
+
+/* Hover-revealed action row — copy / regenerate / feedback buttons.
+   pointer-events toggles alongside opacity so the invisible toolbar
+   doesn't intercept clicks in the top-right corner of the message
+   (would otherwise break text selection on the last word of a short
+   one-line msg). */
+.msg-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.msg-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 24px;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  background: transparent;
+  border: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.msg-action-btn:hover {
+  background: var(--hair-2);
+  color: var(--ink);
+}
+
+.msg-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Touch-only: keep actions visible; hover-reveal isn't reachable.
+   `(pointer: coarse)` narrows the match to true touch devices —
+   `(hover: none)` alone fires on stylus and some laptops too. Matches
+   the `@media (hover: none) and (pointer: coarse)` convention above.
+   Keyboard users are handled by :focus-within on .msg above. */
+@media (hover: none) and (pointer: coarse) {
+  .msg-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  /* WCAG 2.5.5 — 24×24 minimum touch target; we go to 36×36 to match
+     the previously-shipped ui/static/style.css override that the merge
+     replaced. */
+  .msg-action-btn {
+    min-width: 36px;
+    min-height: 36px;
+    padding: 4px 8px;
+    font-size: 12px;
+  }
+}
+
+/* ==========================================================================
+   Per-workstream status bar — pinned above the composer.
+   Rendered by both the interactive pane (ui/static/app.js) and the
+   coordinator dashboard (console/static/coordinator/coordinator.js).
+   Both consume the same on_status SSE event shape (see
+   turnstone/core/session_ui_base.py SessionUI.on_status).
+   ========================================================================== */
+.ws-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 16px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+  min-height: 22px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  transition:
+    background 0.3s,
+    border-color 0.3s;
+}
+.ws-sb-model {
+  font-family: var(--font-ui);
+  font-weight: 500;
+  color: var(--accent);
+  font-size: 10px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-sb-tokens {
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.ws-sb-tools {
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+.ws-sb-turns {
+  color: var(--fg-dim);
+  white-space: nowrap;
+  margin-left: auto;
+}
+.ws-status-bar.ws-sb-warn .ws-sb-tokens {
+  color: var(--yellow);
+  font-weight: 600;
+}
+.ws-status-bar.ws-sb-danger .ws-sb-tokens {
+  color: var(--red);
+  font-weight: 600;
+  text-shadow: 0 0 4px var(--red-glow);
+}
+[data-theme="light"] .ws-status-bar.ws-sb-danger .ws-sb-tokens {
+  text-shadow: none;
+}
+.ws-status-bar.ws-sb-disconnected {
+  border-top: 2px solid var(--red);
+  background: rgba(248, 113, 113, 0.04);
+}
+.ws-status-bar.ws-sb-disconnected .ws-sb-tokens {
+  color: var(--red);
+}
+.ws-status-bar.ws-sb-disconnected .ws-sb-model,
+.ws-status-bar.ws-sb-disconnected .ws-sb-tools,
+.ws-status-bar.ws-sb-disconnected .ws-sb-turns {
+  opacity: 0.4;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ws-status-bar {
+    transition: none;
+  }
 }

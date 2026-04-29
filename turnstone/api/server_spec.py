@@ -29,6 +29,7 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamRequest,
     CreateWorkstreamResponse,
     DashboardResponse,
+    DequeueRequest,
     HealthResponse,
     ListAttachmentsResponse,
     SpeechToTextResponse,
@@ -46,6 +47,8 @@ from turnstone.api.server_schemas import (
     TextToSpeechRequest,
     SkillSummary,
     UploadAttachmentResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
 )
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
@@ -86,17 +89,17 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Workstreams"],
     ),
     EndpointSpec(
-        "/v1/api/workstreams/close",
+        "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Close a workstream",
         request_model=CloseWorkstreamRequest,
         response_model=StatusResponse,
-        error_codes=[400],
+        error_codes=[400, 404],
         tags=["Workstreams"],
     ),
     # --- Chat ---
     EndpointSpec(
-        "/v1/api/send",
+        "/v1/api/workstreams/{ws_id}/send",
         "POST",
         "Send a user message",
         request_model=SendRequest,
@@ -140,7 +143,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Chat"],
     ),
     EndpointSpec(
-        "/v1/api/cancel",
+        "/v1/api/workstreams/{ws_id}/cancel",
         "POST",
         "Cancel the active generation in a workstream",
         request_model=CancelRequest,
@@ -150,12 +153,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     ),
     # --- Streaming ---
     EndpointSpec(
-        "/v1/api/events",
+        "/v1/api/workstreams/{ws_id}/events",
         "GET",
         "Per-workstream SSE event stream",
         description="Opens a Server-Sent Events stream scoped to a single workstream. "
         "Returns text/event-stream. See API reference for event types.",
-        query_params=[QueryParam("ws_id", "Workstream identifier", required=True)],
         error_codes=[404],
         tags=["Streaming"],
     ),
@@ -196,6 +198,46 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Regenerate workstream title via LLM",
         error_codes=[404],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}",
+        "GET",
+        "Get workstream detail (rehydrates lazily on miss)",
+        description=(
+            "Returns the persisted workstream's display fields. If the "
+            "session isn't currently in memory the manager rehydrates it "
+            "before responding; ``500`` on rehydrate failure carries a "
+            "correlation id matching the server log line. Lifted from "
+            "the coord-only surface in the Stage 2 history/detail verb "
+            "lift — interactive previously had no detail endpoint."
+        ),
+        response_model=WorkstreamDetailResponse,
+        error_codes=[400, 404, 500, 503],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/history",
+        "GET",
+        "Read the workstream's reconstructed message history",
+        description=(
+            "Returns the tail of the conversation in OpenAI-like message "
+            "format. Persisted-but-not-loaded workstreams (closed / "
+            "evicted) serve history without rehydrating. Lifted from "
+            "the coord-only surface in the Stage 2 history/detail verb "
+            "lift — interactive previously only exposed history through "
+            "the SSE replay on ``/events``."
+        ),
+        response_model=WorkstreamHistoryResponse,
+        query_params=[
+            QueryParam(
+                "limit",
+                "Max conversation rows to fetch from storage (default 100, max 500).",
+                schema_type="integer",
+                default=100,
+            ),
+        ],
+        error_codes=[400, 404, 500, 503],
         tags=["Workstreams"],
     ),
     # --- Workstream attachments ---
@@ -423,6 +465,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     AuthStatusResponse,
     SendRequest,
     SendResponse,
+    DequeueRequest,
     ApproveRequest,
     PlanFeedbackRequest,
     CommandRequest,
@@ -431,6 +474,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CreateWorkstreamResponse,
     CloseWorkstreamRequest,
     ListWorkstreamsResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
     DashboardResponse,
     ListSavedWorkstreamsResponse,
     UploadAttachmentResponse,

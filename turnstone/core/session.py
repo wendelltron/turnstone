@@ -194,6 +194,38 @@ def _encode_image_data_uri(raw: bytes, mime: str) -> str:
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
 
+# Memory scopes accepted by the ``memory`` tool's preparer + executor.
+# Single source of truth — every action validator imports this rather
+# than literal-listing the four values, so adding a fifth scope is a
+# one-site change.  ``coordinator`` is COORDINATOR-only (see
+# :meth:`ChatSession._validate_scope`); the others are kind-agnostic.
+_VALID_MEMORY_SCOPES: tuple[str, ...] = ("global", "workstream", "user", "coordinator")
+
+# Implicit-scope walk for INTERACTIVE ``memory(action='get'/'delete')``
+# when no scope is specified.  Narrowest → widest so the most
+# session-specific row wins on a name collision.  Coord sessions use a
+# different walk (just ``("coordinator",)``) — see
+# :meth:`ChatSession._implicit_scope_walk`.
+_IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
+
+# ``list_nodes`` reserves four top-level kwargs for control parameters
+# (filters / paging / output verbosity / liveness toggle).  Anything
+# else the model passes at the top level is treated as a flat filter
+# entry — see :meth:`ChatSession._prepare_list_nodes`.
+_LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
+    {"filters", "limit", "include_network_detail", "include_inactive"}
+)
+
+
+# ``tasks`` action classifier — partitions actions into read vs write
+# so the parallel-batch guard can permit homogeneous batches (all
+# writes serialise under the per-ws lock and converge to a consistent
+# result; all reads can't race) and reject only the mixed read+write
+# shape where ``tasks(list)`` paralleled with ``tasks(add=...)`` has
+# unspecified ordering inside ``_execute_tools``'s ThreadPoolExecutor.
+_TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
+_TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
+
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
     r"(?<![/\w-])(?:scripts|references|assets)/[\w./-]+\."
@@ -424,9 +456,20 @@ class ChatSession:
         self._watch_runner: Any = None  # WatchRunner | None
         self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=20)
         self._watch_dispatch_depth = 0
-        # Metacognitive nudges: ephemeral prompts for proactive memory use
+        # Metacognitive nudges: ephemeral prompts for proactive memory use.
+        # Two buffers, one per delivery channel — the system message no
+        # longer carries nudges, so neither buffer triggers a system-prefix
+        # rebuild (and therefore neither busts the prompt cache):
+        #   - tool advisories drain into the next tool-result envelope via
+        #     _collect_advisories (alongside GuardAdvisory / UserInterjection)
+        #   - user advisories splice as <system-reminder> blocks at the
+        #     end of the next user message in _append_user_turn
+        # Both store ``(nudge_type, text)`` so readers don't have to track
+        # which channel boxes its payload — the tool channel constructs
+        # ``MetacognitiveAdvisory`` at drain time inside _collect_advisories.
         self._metacog_state: dict[str, float] = {}
-        self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
+        self._pending_tool_advisories: list[tuple[str, str]] = []  # (type, text)
+        self._pending_user_advisories: list[tuple[str, str]] = []  # (type, text)
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         #
@@ -454,6 +497,12 @@ class ChatSession:
         self._procs_lock = threading.Lock()
         self._cancelled_partial_msg: dict[str, Any] | None = None
         self._pending_retry: str | None = None
+        # True when a fatal exception's text has been persisted to
+        # workstream_config["last_error"] for the coord's inspect/wait
+        # surface.  Cleared when state transitions back to idle/running
+        # so a once-leaked exception body doesn't outlive the workstream
+        # — see ``_emit_state``.
+        self._has_persisted_error: bool = False
         # Intent validation judge (lazy-initialized)
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
@@ -1385,7 +1434,7 @@ class ChatSession:
             memory_count=self._visible_memory_count(),
             cooldown_secs=self._mem_cfg.nudge_cooldown,
         ):
-            self._pending_nudge.append(("resume", format_nudge("resume")))
+            self._queue_user_advisory("resume", format_nudge("resume"))
         self._init_system_messages()
         return True
 
@@ -1451,8 +1500,13 @@ class ChatSession:
             except Exception:
                 log.debug("Failed to load prompt policies from storage", exc_info=True)
             now = datetime.now().astimezone()
+            # Round to the top of the hour. Anthropic and OpenAI both cache the
+            # system prefix; minute-precision time stamps invalidated the cache
+            # on every turn that crossed a minute boundary. Hour-precision still
+            # gives the model time-of-day awareness without paying for a full
+            # prefix recompute every ~60 seconds.
             ctx = SessionContext(
-                current_datetime=now.strftime("%Y-%m-%dT%H:%M"),
+                current_datetime=now.strftime("%Y-%m-%dT%H:00"),
                 timezone=now.tzname() or "UTC",
                 username=self._username or self._user_id or "unknown",
             )
@@ -1599,16 +1653,6 @@ class ChatSession:
                     f"You have {len(visible_mems)} memories in scope. "
                     "Use memory(action='search') or memory(action='list') for more."
                 )
-        if self._pending_nudge:
-            types = []
-            for nudge_type, nudge_text in self._pending_nudge:
-                dev_parts.append("")
-                dev_parts.append(nudge_text)
-                types.append(nudge_type)
-            # Surface nudge activity to the user so they can see
-            # the metacognitive prompts being applied.
-            self.ui.on_info(f"{GRAY}[metacognition: nudge injected — {', '.join(types)}]{RESET}")
-            self._pending_nudge.clear()
         new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
         # Atomic swap — readers see either old or new, never partial
         self.system_messages = new_system_messages
@@ -1620,8 +1664,52 @@ class ChatSession:
         return self.system_messages + self.messages
 
     def _emit_state(self, state: str) -> None:
-        """Notify UI of a workstream state transition."""
+        """Notify UI of a workstream state transition.
+
+        Also clears any persisted ``last_error`` row when the transition
+        is a real recovery (``idle`` / ``running``) — a once-leaked
+        exception body shouldn't outlive the failure that produced it,
+        and the inspect/wait surface only displays ``last_error`` for
+        ``state=='error'`` rows so a stale value would be invisible to
+        the model but still queryable in storage forever.
+        """
+        if state in ("idle", "running") and self._has_persisted_error:
+            from turnstone.core.memory import clear_last_error
+
+            clear_last_error(self._ws_id)
+            self._has_persisted_error = False
         self.ui.on_state_change(state)
+
+    def _record_fatal_error(self, exc: BaseException) -> None:
+        """Surface, sanitize, and persist a fatal exception, then emit state=error.
+
+        Single chokepoint for the worker-thread fatal path: every
+        ``except`` branch in :meth:`send` routes here so the
+        sequence is fixed (sanitize → ``ui.on_error`` → persist →
+        emit state=error) and the persist always lands BEFORE the
+        synchronous state write in ``state_writer.record(flush_now=True)``.
+        That ordering is what makes a coord polling at the moment of
+        failure see ``state=error`` paired with a meaningful
+        ``last_error``, not bare state=error with a missing config row.
+
+        ``ui.on_error`` and the persist BOTH receive the sanitized
+        text — a misconfigured ``OPENAI_BASE_URL`` of the form
+        ``https://user:pass@host`` produces an httpx ``ConnectError``
+        whose ``str()`` carries the credentials verbatim, and they'd
+        otherwise land in (a) the dashboard via ``on_error`` and (b)
+        the coord LLM's prompt via inspect/wait.
+        """
+        from turnstone.core.memory import persist_last_error, sanitize_error_text
+
+        raw = f"{type(exc).__name__}: {exc}"
+        safe = sanitize_error_text(raw)
+        try:
+            self.ui.on_error(safe)
+        except Exception:
+            log.debug("session.on_error_dispatch_failed", exc_info=True)
+        persist_last_error(self._ws_id, safe)
+        self._has_persisted_error = True
+        self._emit_state("error")
 
     def _provider_extra_params(
         self,
@@ -2065,6 +2153,15 @@ class ChatSession:
                 }
                 for a in attachments
             ]
+        # Metacognitive user-channel drain: any nudges queued via
+        # _queue_user_advisory (correction/start/completion from this
+        # turn, denial from the previous tool batch, resume from
+        # rehydrate) splice in as <system-reminder> blocks at the
+        # trailing edge of the user content. The DB row stores
+        # ``user_input`` only (line below) so these blocks stay
+        # ephemeral — they advise the next assistant turn and do not
+        # persist across reloads.
+        self._splice_pending_user_advisories(user_msg)
         self.messages.append(user_msg)
         self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
         # DB row stores the raw text only; attachments are joined back in
@@ -2131,13 +2228,15 @@ class ChatSession:
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg = None
 
-        self._append_user_turn(user_input, attachments or (), send_id=send_id)
-
         # Metacognitive nudge: check for correction/completion signals
+        # before _append_user_turn so any fired nudge (plus any nudges
+        # queued earlier — e.g. denial during the previous tool batch,
+        # resume on rehydrate) splice into this user message body.
         nudge = self._check_metacognitive_nudge(user_input)
         if nudge:
-            self._pending_nudge.append(nudge)
-            self._init_system_messages()
+            self._queue_user_advisory(*nudge)
+
+        self._append_user_turn(user_input, attachments or (), send_id=send_id)
 
         try:
             while True:
@@ -2333,8 +2432,35 @@ class ChatSession:
                         message_count=len(self.messages),
                         cooldown_secs=self._mem_cfg.nudge_cooldown,
                     ):
-                        self._pending_nudge.append(("repeat", format_nudge("repeat")))
-                        self._init_system_messages()
+                        self._queue_tool_advisory("repeat", format_nudge("repeat"))
+
+                # Tool-error nudge — checked here (pre-iteration) so the
+                # MetacognitiveAdvisory rides the same _collect_advisories
+                # drain pass that handles guard findings and user
+                # interjections.  Cooldown gating in should_nudge keeps
+                # this to one nudge per batch even with many failing
+                # tools.
+                if (
+                    self._mem_cfg.nudges
+                    and any(
+                        isinstance(out, str)
+                        and (
+                            out.startswith("Error")
+                            or " error: " in out[:50]
+                            or out.startswith("Command timed out")
+                            or out.startswith("Unknown tool:")
+                        )
+                        for _, out in results
+                    )
+                    and should_nudge(
+                        "tool_error",
+                        self._metacog_state,
+                        message_count=len(self.messages),
+                        memory_count=self._visible_memory_count(),
+                        cooldown_secs=self._mem_cfg.nudge_cooldown,
+                    )
+                ):
+                    self._queue_tool_advisory("tool_error", format_nudge("tool_error"))
 
                 # Map tool_call_id → tool name for logging
                 from turnstone.core.tool_advisory import wrap_tool_result
@@ -2432,29 +2558,6 @@ class ChatSession:
                             _tname,
                             tool_call_id=tc_id,
                         )
-                # Metacognitive nudge: check memories on tool error
-                if (
-                    self._mem_cfg.nudges
-                    and any(
-                        isinstance(out, str)
-                        and (
-                            out.startswith("Error")
-                            or " error: " in out[:50]
-                            or out.startswith("Command timed out")
-                            or out.startswith("Unknown tool:")
-                        )
-                        for _, out in results
-                    )
-                    and should_nudge(
-                        "tool_error",
-                        self._metacog_state,
-                        message_count=len(self.messages),
-                        memory_count=self._visible_memory_count(),
-                        cooldown_secs=self._mem_cfg.nudge_cooldown,
-                    )
-                ):
-                    self._pending_nudge.append(("tool_error", format_nudge("tool_error")))
-                    self._init_system_messages()
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
@@ -2476,20 +2579,44 @@ class ChatSession:
             # orphaned — skip all message mutations and state changes.
             if self._generation != my_generation:
                 return
-            # Cooperative cancellation — preserve partial content if available.
+            # Cooperative cancellation — preserve partial content if
+            # available and annotate it so downstream readers can
+            # distinguish a cancelled fragment from a completed turn.
+            # Without the annotation, an inspect_workstream / wait
+            # surface caller (or a coord-LLM reading the child's
+            # transcript on the next turn) sees a truncated-but-real
+            # text fragment with no marker and may treat it as the
+            # final answer — same hazard the operator-shakedown report
+            # flagged ("…cannot simultaneously guarantee Consistency,"
+            # surfaced as if it were a complete sentence).
             if self._cancelled_partial_msg:
-                # _stream_response was interrupted — save partial assistant msg
+                # _stream_response was interrupted — save partial
+                # assistant msg.  Two shapes:
+                #
+                # - Some text streamed before cancel: append the
+                #   marker so downstream readers can distinguish a
+                #   cancelled fragment from a completed turn.
+                # - Cancel landed before the first content token:
+                #   keep the marker AS the message so the in-memory
+                #   history and the persisted row stay consistent
+                #   (the prior shape skipped persistence in this
+                #   case, leaving the next-turn replay with an
+                #   empty-content assistant message in messages but
+                #   nothing in storage — divergent on rehydrate).
                 msg = self._cancelled_partial_msg
                 self._cancelled_partial_msg = None
+                content = msg.get("content", "")
+                if content:
+                    msg["content"] = content + "\n\n[generation cancelled before completion]"
+                else:
+                    msg["content"] = "[generation cancelled before completion]"
+                save_message(self._ws_id, "assistant", msg["content"])
                 self.messages.append(msg)
                 tok_est = max(
                     1,
                     int(self._msg_char_count(msg) / self._chars_per_token),
                 )
                 self._msg_tokens.append(tok_est)
-                content = msg.get("content", "")
-                if content:
-                    save_message(self._ws_id, "assistant", content)
             else:
                 # Cancelled during tool execution — synthesize cancelled
                 # tool_result for any tool_calls that lack a matching result.
@@ -2499,20 +2626,26 @@ class ChatSession:
             # Drain any queued user messages so they appear in the
             # conversation and are visible on the next send().
             self._flush_queued_messages()
+            # Tool-channel nudges queued earlier in this generation
+            # (tool_error, repeat) belong to the abandoned batch — drop
+            # them so they don't bleed into the next send()'s tool loop.
+            self._pending_tool_advisories.clear()
             # No need to clear _cancel_event — it's replaced per-generation
             # in send(), so this generation's event is simply discarded.
             self.ui.on_info("[Generation cancelled]")
             self._emit_state("idle")
             # Do NOT re-raise — return normally so server worker thread
             # completes cleanly.
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as exc:
             self._synthesize_cancelled_results("Interrupted by user.")
             self._flush_queued_messages()
-            self._emit_state("error")
+            self._pending_tool_advisories.clear()
+            self._record_fatal_error(exc)
             raise
-        except Exception:
+        except Exception as exc:
             self._flush_queued_messages()
-            self._emit_state("error")
+            self._pending_tool_advisories.clear()
+            self._record_fatal_error(exc)
             raise
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
@@ -2829,16 +2962,25 @@ class ChatSession:
                 if chunk.provider_blocks:
                     provider_blocks = chunk.provider_blocks
         except GenerationCancelled:
-            # Flush whatever was buffered and build a partial message
+            # Flush whatever was buffered and build a partial message.
+            # Both ``tool_calls`` and ``_provider_content`` are
+            # DELIBERATELY OMITTED:
+            #   * ``tool_calls`` — incomplete, no matching tool_result;
+            #     re-emitting on the next turn would orphan them.
+            #   * ``_provider_content`` — the Anthropic provider reads
+            #     this lane verbatim ahead of plain ``content`` (see
+            #     ``providers/_anthropic.py``), and a cancellation can
+            #     leave partial tool_use blocks here too.  Keeping it
+            #     would also cause the next-turn replay to bypass the
+            #     ``[generation cancelled before completion]`` marker
+            #     the cancel handler appends to ``content``, hiding
+            #     the partial-output signal from the model.
             if pending:
                 _flush_text(pending, in_think)
             self.ui.on_stream_end()
             partial: dict[str, Any] = {"role": "assistant"}
             partial_content = "".join(content_parts)
             partial["content"] = partial_content or ""
-            # Deliberately omit tool_calls — they are incomplete
-            if provider_blocks:
-                partial["_provider_content"] = provider_blocks
             self._cancelled_partial_msg = partial
             raise
         except Exception:
@@ -2852,8 +2994,11 @@ class ChatSession:
                 self.ui.on_stream_end()
                 partial = {"role": "assistant"}
                 partial["content"] = "".join(content_parts) or ""
-                if provider_blocks:
-                    partial["_provider_content"] = provider_blocks
+                # Same reasoning as the cooperative-cancel branch
+                # above: ``_provider_content`` is omitted so the
+                # next-turn replay reads from the marker-bearing
+                # plain content and any partial tool_use blocks
+                # inside provider_blocks don't leak through.
                 self._cancelled_partial_msg = partial
                 raise GenerationCancelled() from None
             raise
@@ -3391,11 +3536,81 @@ class ChatSession:
                     "name": it.get("watch_name", ""),
                 }
             elif name == "notify":
-                it["func_args"] = {"message": it.get("message", "")[:200]}
+                it["func_args"] = {"message": (it.get("message") or "")[:200]}
             elif name == "task_agent":
-                it["func_args"] = {"prompt": it.get("prompt", "")[:200]}
+                it["func_args"] = {"prompt": (it.get("prompt") or "")[:200]}
             elif name == "plan_agent":
-                it["func_args"] = {"goal": it.get("prompt", "")[:200]}
+                it["func_args"] = {"goal": (it.get("prompt") or "")[:200]}
+            # Coordinator tool args — only the ``needs_approval=True`` set
+            # reaches this point (read-only inspect / list_* / wait
+            # tools are filtered above), so this matches the auditable
+            # surface 1:1. Free-form fields capped to keep the verdict
+            # row size bounded.
+            elif name == "spawn_workstream":
+                it["func_args"] = {
+                    "skill": it.get("skill", ""),
+                    "initial_message": (it.get("initial_message") or "")[:200],
+                    "target_node": it.get("target_node", ""),
+                    "name": it.get("name", ""),
+                    "model": it.get("model", ""),
+                }
+            elif name == "spawn_batch":
+                # Project every child so the judge sees the full fan-out.
+                # First-child-only projection (the prior shape) hid a
+                # malicious mid-batch entry from both heuristic and LLM
+                # tiers. Tool schema caps ``children`` at 10, so worst
+                # case is ~3 KiB of JSON in the verdict row — comparable
+                # to the existing ``reasoning`` / ``evidence`` fields.
+                # ``name`` (cosmetic) and ``model`` (registry alias)
+                # skipped to keep the payload lean; risk-relevant fields
+                # are skill, initial_message, target_node.
+                children = it.get("children") or []
+                it["func_args"] = {
+                    "child_count": len(children),
+                    "children": [
+                        {
+                            "skill": c.get("skill", "") if isinstance(c, dict) else "",
+                            "initial_message": (
+                                (c.get("initial_message") or "")[:200]
+                                if isinstance(c, dict)
+                                else ""
+                            ),
+                            "target_node": (
+                                c.get("target_node", "") if isinstance(c, dict) else ""
+                            ),
+                        }
+                        for c in children
+                    ],
+                }
+            elif name == "send_to_workstream":
+                it["func_args"] = {
+                    "ws_id": it.get("ws_id", ""),
+                    "message": (it.get("message") or "")[:200],
+                }
+            elif name == "close_workstream":
+                it["func_args"] = {
+                    "ws_id": it.get("ws_id", ""),
+                    "reason": (it.get("reason") or "")[:200],
+                }
+            elif name == "close_all_children":
+                it["func_args"] = {"reason": (it.get("reason") or "")[:200]}
+            elif name in ("cancel_workstream", "delete_workstream"):
+                it["func_args"] = {"ws_id": it.get("ws_id", "")}
+            elif name == "tasks":
+                # ``title`` is optional on update — _prepare_tasks stores
+                # ``None`` when omitted, so dict.get(x, "") returns None
+                # (not the default) and slicing crashes.  Collapse via
+                # ``or ""`` so absent and explicit-None both fall back to
+                # empty string.  The other projections above use the same
+                # pattern defensively — a future preparer that stores
+                # None for any of these fields shouldn't take down the
+                # whole batch (every sibling tool call gets reported as
+                # cancelled) on a single missing optional field.
+                it["func_args"] = {
+                    "action": it.get("action", ""),
+                    "task_id": it.get("task_id", ""),
+                    "title": (it.get("title") or "")[:100],
+                }
             elif it.get("mcp_args"):
                 it["func_args"] = it["mcp_args"]
 
@@ -3621,9 +3836,13 @@ class ChatSession:
 
         # When the model doesn't support advisory tags, still drain queued
         # messages so they aren't silently orphaned — flush them as regular
-        # user messages instead.
+        # user messages instead. Metacognitive tool advisories (tool_error
+        # / repeat) are dropped silently: the model wouldn't reliably parse
+        # them anyway, and the user-channel nudges still fire on the next
+        # user turn.
         if not caps.supports_tool_advisories:
             if is_last_in_batch:
+                self._pending_tool_advisories.clear()
                 self._flush_queued_messages()
             return []
 
@@ -3632,6 +3851,19 @@ class ChatSession:
         # Output guard advisory
         if assessment is not None:
             advisories.append(GuardAdvisory(assessment=assessment, func_name=func_name))
+
+        # Metacognitive tool-channel drain — fires once per batch on the
+        # last result. Queued by _queue_tool_advisory from the
+        # tool_error and repeat detection paths just before this loop.
+        if is_last_in_batch and self._pending_tool_advisories:
+            from turnstone.core.tool_advisory import MetacognitiveAdvisory
+
+            drained = list(self._pending_tool_advisories)
+            self._pending_tool_advisories.clear()
+            advisories.extend(
+                MetacognitiveAdvisory(nudge_type=nt, message=text) for nt, text in drained
+            )
+            self._emit_nudge_ping(nt for nt, _ in drained)
 
         # Drain queued user messages on the last result in the batch.
         # Attachment-bearing items fall back to a full multipart user
@@ -3671,9 +3903,70 @@ class ChatSession:
 
         Returns (results, user_feedback) where user_feedback is an optional
         message the user typed alongside their approval (e.g. "y, use full path").
+
+        Per-call exception isolation: a buggy preparer or runtime
+        failure is converted into an error tool_result for THAT call
+        only — sibling calls in a parallel batch keep running.  The
+        prior shape let a single ``_prepare_tool`` raise propagate out
+        of the list comprehension and abort the whole batch, leaving
+        the assistant's ``tool_calls`` orphaned (no matching
+        tool_results, conversation invalid for the next turn).
         """
-        # Phase 1: prepare all tool calls
-        items = [self._prepare_tool(tc) for tc in tool_calls]
+        # Phase 1: prepare all tool calls.  Each preparer call is
+        # individually shielded so a single failure (buggy preparer,
+        # MCP server in a weird state, etc.) becomes an error item
+        # for that call only — the other parallel siblings keep
+        # going.  Without the shield, the list comprehension would
+        # propagate, _execute_tools would raise to send()'s except
+        # clause, and EVERY tool_call in the batch would lose its
+        # result entry — the conversation would then be invalid on
+        # the next turn (assistant tool_calls with no matching tool
+        # results).  See the docstring on this method.
+        items = [self._safe_prepare_tool(tc) for tc in tool_calls]
+
+        # Reject the read+write mix on ``tasks`` within a single
+        # parallel batch.  ``tasks`` mutates an ordered planning
+        # list and supports a ``list`` read; a batch like
+        # ``[tasks(add=...), tasks(list)]`` has unspecified
+        # ordering inside ``_execute_tools.run_one``'s
+        # ThreadPoolExecutor — the read can land before or after
+        # the write and produce inconsistent state to the model.
+        #
+        # All-write and all-read batches are SAFE:
+        #   - Writes serialise under the per-ws lock in
+        #     ``CoordinatorClient.tasks_*``, AND a batch containing
+        #     any ``tasks`` write runs serially in input order (see
+        #     the run-loop branch below) so the final task list
+        #     ordering matches what the model emitted, not the
+        #     scheduler's acquisition order.
+        #   - Reads can't race against anything.
+        #
+        # The rule below only fires on the MIX, so the natural
+        # batch shapes ("add four tasks at once", "list nodes +
+        # list skills + tasks(list) for a planning snapshot") are
+        # both permitted; only the genuinely-broken shape gets
+        # rejected.  Non-tasks siblings paralleled with tasks()
+        # are unaffected — they don't touch the tasks state.
+        if len(items) > 1:
+            tasks_items = [
+                it
+                for it in items
+                if it.get("func_name") == "tasks" and not it.get("error") and not it.get("denied")
+            ]
+            if tasks_items:
+                has_read = any(it.get("action") in _TASKS_READ_ACTIONS for it in tasks_items)
+                has_write = any(it.get("action") in _TASKS_WRITE_ACTIONS for it in tasks_items)
+                if has_read and has_write:
+                    for it in tasks_items:
+                        it["error"] = (
+                            "Error: tasks(...) read (`list`) and write "
+                            "(`add` / `update` / `remove` / `reorder`) actions "
+                            "cannot run in the same parallel tool batch — the "
+                            "read-after-write ordering is not guaranteed. "
+                            "All-reads or all-writes are fine; mix only by "
+                            "splitting them across separate assistant turns."
+                        )
+                        it["needs_approval"] = False
 
         # Intent validation (advisory, non-blocking).
         # Cancel any prior judge thread before spawning a new one.
@@ -3706,8 +3999,7 @@ class ChatSession:
                 memory_count=self._visible_memory_count(),
                 cooldown_secs=self._mem_cfg.nudge_cooldown,
             ):
-                self._pending_nudge.append(("denial", format_nudge("denial")))
-                self._init_system_messages()
+                self._queue_user_advisory("denial", format_nudge("denial"))
 
         # Phase 3: execute (check cancellation before starting)
         self._check_cancelled()
@@ -3732,17 +4024,58 @@ class ChatSession:
             except (KeyboardInterrupt, GenerationCancelled):
                 raise
             except Exception as e:
+                from turnstone.core.memory import sanitize_error_text
+
                 func = item.get("func_name", "unknown")
-                msg = f"Error executing {func}: {e}"
-                log.warning("tool_exec.failed", tool=func, error=str(e), exc_info=True)
+                # Include the exception class so triage doesn't have
+                # to guess (RateLimitError vs. TimeoutError vs. a
+                # tool-policy reject vs. a real bug all look very
+                # different to a coord trying to recover).  Append a
+                # short hint that the failure is local — sibling
+                # tool calls in this parallel batch returned their
+                # own results, the model can adapt instead of
+                # treating this as a session-wide failure.
+                #
+                # Redact before formatting both the log and the
+                # model-facing result: tool exceptions can carry
+                # credentials in their str() (HTTP error bodies, env
+                # values, etc.) and the same pattern set as the
+                # fatal-error path applies.
+                safe_exc_text = sanitize_error_text(f"{type(e).__name__}: {e}")
+                msg = (
+                    f"Error executing {func}: {safe_exc_text}\n"
+                    f"This tool raised an unexpected exception. "
+                    f"Sibling tool calls in this batch (if any) "
+                    f"completed independently. You can retry with "
+                    f"adjusted arguments or try a different approach."
+                )
+                log.warning("tool_exec.failed", tool=func, error=safe_exc_text, exc_info=True)
                 self._report_tool_result(item["call_id"], func, msg, is_error=True)
                 return item["call_id"], msg
 
         if len(items) == 1:
             results = [run_one(items[0])]
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(run_one, items))
+            # When the batch contains any ``tasks`` write, run every
+            # item serially in input order.  ``tasks_add`` appends
+            # under a per-ws lock; a parallel ThreadPoolExecutor's
+            # scheduler-dependent acquisition order would otherwise
+            # produce a final task list whose ordering varies
+            # run-to-run, even though the SET of tasks is consistent.
+            # The model emitted the writes in a particular order;
+            # respecting that is the deterministic shape both
+            # operators and the model expect.  Other batches stay
+            # parallel — the perf payoff is real and there's no
+            # ordering hazard against state outside ``tasks``.
+            has_tasks_write = any(
+                it.get("func_name") == "tasks" and it.get("action") in _TASKS_WRITE_ACTIONS
+                for it in items
+            )
+            if has_tasks_write:
+                results = [run_one(it) for it in items]
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(run_one, items))
 
         # Post-plan gate: iterative review loop.  When the user gives
         # feedback the plan agent re-runs and the revised plan is shown
@@ -3830,6 +4163,70 @@ class ChatSession:
         for tc in items:
             if not tc.get("id"):
                 tc["id"] = f"call_{uuid.uuid4().hex}"
+
+    def _safe_prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
+        """Wrap :meth:`_prepare_tool` so a single failing preparer is
+        an error item, not a propagating exception.
+
+        ``_prepare_tool`` is the per-call dispatcher into per-tool
+        preparers (validation, arg coercion, preview building).  A
+        bug in any one of those — KeyError on a missing optional, an
+        MCP client raising during ``is_mcp_tool``, anything — would
+        otherwise blow up the list comprehension in
+        :meth:`_execute_tools` and abort EVERY sibling call in the
+        same parallel batch.  Worse, the caught-too-late exception
+        leaves the assistant message's ``tool_calls`` orphaned
+        (no matching ``tool_result`` rows), which makes the next
+        turn invalid for both OpenAI and Anthropic schemas.
+
+        Cancellation semantics: ``KeyboardInterrupt`` /
+        ``GenerationCancelled`` re-raise so the cooperative cancel
+        path still works (the worker thread observes the cancel and
+        synthesizes results for orphaned tool_calls in
+        :meth:`_synthesize_cancelled_results`).
+        """
+        from turnstone.core.memory import sanitize_error_text
+
+        try:
+            return self._prepare_tool(tc)
+        except (KeyboardInterrupt, GenerationCancelled):
+            raise
+        except Exception as exc:
+            call_id = str(tc.get("id") or f"call_{uuid.uuid4().hex}")
+            func_name = ""
+            try:
+                func_name = str(tc.get("function", {}).get("name", "") or "").strip()
+            except Exception:
+                func_name = ""
+            if not func_name:
+                func_name = "unknown"
+            # Redact before logging AND before returning.  The raw
+            # exception text can carry credentials (e.g. a misconfigured
+            # base URL with userinfo, an echoed Bearer token, a
+            # connection-string envvar) — both the structured log and
+            # the model-facing tool_result must scrub via the same
+            # pattern set the audit log + output guard use.
+            safe_exc_text = sanitize_error_text(f"{type(exc).__name__}: {exc}")
+            log.warning(
+                "tool_prepare.failed tool=%s call_id=%s error=%s",
+                func_name,
+                call_id[:32],
+                safe_exc_text,
+                exc_info=True,
+            )
+            return {
+                "call_id": call_id,
+                "func_name": func_name,
+                "header": f"✗ {func_name}: prepare failed",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Internal error preparing {func_name}: {safe_exc_text}\n"
+                    f"Sibling tool calls in this batch were unaffected. "
+                    f"You can retry this tool with adjusted arguments "
+                    f"or pick a different approach."
+                ),
+            }
 
     def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
@@ -3962,6 +4359,8 @@ class ChatSession:
             # Coordinator tools: only reachable when this session was
             # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
             "spawn_workstream": self._prepare_spawn_workstream,
+            "spawn_batch": self._prepare_spawn_batch,
+            "close_all_children": self._prepare_close_all_children,
             "inspect_workstream": self._prepare_inspect_workstream,
             "send_to_workstream": self._prepare_send_to_workstream,
             "close_workstream": self._prepare_close_workstream,
@@ -3970,7 +4369,7 @@ class ChatSession:
             "list_workstreams": self._prepare_list_workstreams,
             "list_nodes": self._prepare_list_nodes,
             "list_skills": self._prepare_list_skills,
-            "task_list": self._prepare_task_list,
+            "tasks": self._prepare_tasks,
             "wait_for_workstream": self._prepare_wait_for_workstream,
         }
         preparer = preparers.get(func_name)
@@ -4784,15 +5183,56 @@ class ChatSession:
         }
 
     def _resolve_scope_id(self, scope: str) -> str:
-        """Map a scope name to its scope_id."""
+        """Map a scope name to its scope_id.
+
+        ``coordinator`` is COORDINATOR-only \u2014 the coord can save and
+        read memories in its own private namespace, but its child
+        interactive workstreams cannot see or write the row.  This
+        closes the cross-session prompt-injection lane that an
+        adversarially-steered child would otherwise have through the
+        coord's system message: the coord's children consume external
+        content (MCP tool output, attachments) which can be steered to
+        plant instructions, and the new scope must not become a
+        delivery channel back into the parent's prompt.
+        """
         if scope == "workstream":
             return self._ws_id
         if scope == "user":
             return self._user_id
+        if scope == "coordinator":
+            return self._coordinator_scope_id()
+        return ""
+
+    def _coordinator_scope_id(self) -> str:
+        """Return the ws_id anchoring the ``coordinator`` memory scope, or ``""``.
+
+        Only a coordinator session has a coord scope \u2014 returns
+        ``self._ws_id`` for ``kind == COORDINATOR``, ``""`` otherwise.
+        Children of a coord get an empty scope_id, which
+        :meth:`_validate_scope` translates into an explicit reject \u2014
+        children must use ``workstream`` or ``user`` scope for their
+        own memories.
+
+        See :meth:`_resolve_scope_id`'s docstring for the security
+        rationale (cross-session prompt-injection containment).
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return self._ws_id
         return ""
 
     def _validate_scope(self, scope: str, call_id: str) -> dict[str, Any] | None:
-        """Return an error dict if scope is invalid, None if OK."""
+        """Return an error dict if scope is invalid, None if OK.
+
+        Coord sessions are isolated to coord-scope: they reject every
+        other scope (``global`` / ``workstream`` / ``user``) so the
+        coord's memory namespace stays focused on orchestration and
+        doesn't accidentally mutate or read user-context rows.
+
+        Interactive sessions reject ``coordinator`` for the symmetric
+        reason \u2014 coord-scope rows are private to a coordinator
+        session, and an IC writer could otherwise be a cross-session
+        prompt-injection lane into the parent coord's system message.
+        """
         if scope == "user" and not self._user_id:
             return {
                 "call_id": call_id,
@@ -4802,10 +5242,75 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: 'user' scope requires authenticated user identity",
             }
+        if self._kind == WorkstreamKind.COORDINATOR and scope != "coordinator":
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": f"\u2717 memory: scope '{scope}' unavailable to coordinator",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Error: '{scope}' scope is not available to coordinator "
+                    "sessions. Coord sessions only see and write the "
+                    "'coordinator' scope \u2014 their orchestration namespace is "
+                    "isolated from the user's interactive memory. Use "
+                    "scope='coordinator' or omit scope (it defaults to "
+                    "'coordinator' for coord sessions)."
+                ),
+            }
+        if scope == "coordinator" and self._kind != WorkstreamKind.COORDINATOR:
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": "\u2717 memory: coordinator scope unavailable",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    "Error: 'coordinator' scope is only valid for coordinator "
+                    "sessions. This is an interactive workstream \u2014 use "
+                    "'workstream' or 'user' scope for context private to this "
+                    "session, or ask the parent coordinator to manage shared "
+                    "context on your behalf."
+                ),
+            }
         return None
 
+    def _default_memory_scope(self) -> str:
+        """Default ``scope`` for a memory(action='save') with no explicit scope.
+
+        Coord sessions default to ``coordinator`` (the only scope they
+        can write); interactive sessions default to ``global`` to match
+        the existing IC behaviour.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return "coordinator"
+        return "global"
+
+    def _implicit_scope_walk(self) -> tuple[str, ...]:
+        """Walk for memory(action='get'/'delete') with no explicit scope.
+
+        Coord sessions only walk ``coordinator`` \u2014 anything else would
+        search namespaces the coord can't write to.  Interactive sessions
+        keep the narrowest-first walk (workstream \u2192 user \u2192 global); a
+        ``coordinator`` step there would always resolve to empty
+        scope_id and be a wasted lookup.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return ("coordinator",)
+        return _IMPLICIT_SCOPE_WALK
+
     def _visible_memory_count(self) -> int:
-        """Count memories visible to this session (cheap — counts only)."""
+        """Count memories visible to this session.
+
+        Coord sessions are isolated to their own coord-scope namespace —
+        they don't see global / workstream / user rows.  The orchestration
+        role doesn't need user-context memory and pulling those rows in
+        would also surface memories from sibling interactive sessions
+        (same user, different workstream) into the coord's system
+        message, which the coord shouldn't be reasoning over.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return count_structured_memories(scope="coordinator", scope_id=self._ws_id)
         n = count_structured_memories(scope="global")
         n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
         if self._user_id:
@@ -4813,7 +5318,17 @@ class ChatSession:
         return n
 
     def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
-        """List memories visible to this session with optional type filter."""
+        """List memories visible to this session with optional type filter.
+
+        See :meth:`_visible_memory_count` for the coord-isolation rule.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return list_structured_memories(
+                mem_type=mem_type,
+                scope="coordinator",
+                scope_id=self._ws_id,
+                limit=limit,
+            )
         global_mems = list_structured_memories(mem_type=mem_type, scope="global", limit=limit)
         ws_mems = list_structured_memories(
             mem_type=mem_type, scope="workstream", scope_id=self._ws_id, limit=limit
@@ -4830,7 +5345,18 @@ class ChatSession:
     def _search_visible_memories(
         self, query: str, mem_type: str = "", limit: int = 20
     ) -> list[dict[str, str]]:
-        """Search memories visible to this session (scope-filtered)."""
+        """Search memories visible to this session (scope-filtered).
+
+        See :meth:`_visible_memory_count` for the coord-isolation rule.
+        """
+        if self._kind == WorkstreamKind.COORDINATOR:
+            return search_structured_memories(
+                query,
+                mem_type=mem_type,
+                scope="coordinator",
+                scope_id=self._ws_id,
+                limit=limit,
+            )
         global_mems = search_structured_memories(
             query, mem_type=mem_type, scope="global", limit=limit
         )
@@ -4847,14 +5373,19 @@ class ChatSession:
         return combined[:limit]
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
-        """Check if a metacognitive nudge should be injected.
+        """Check if a metacognitive nudge should fire for *user_message*.
 
-        Returns (nudge_type, nudge_text) or None.
+        Called *before* the user turn is appended to ``self.messages``,
+        so ``msg_count`` counts the about-to-be-appended message — this
+        keeps the ``should_nudge('start', ..., message_count=1)`` semantic
+        intact (one user message = first turn).
+
+        Returns ``(nudge_type, nudge_text)`` or ``None``.
         """
         if not self._mem_cfg.nudges:
             return None
         mem_count = self._visible_memory_count()
-        msg_count = len(self.messages)
+        msg_count = len(self.messages) + 1
         cd = self._mem_cfg.nudge_cooldown
 
         if should_nudge(
@@ -4885,6 +5416,73 @@ class ChatSession:
             return ("completion", format_nudge("completion"))
 
         return None
+
+    def _queue_user_advisory(self, nudge_type: str, text: str) -> None:
+        """Queue a metacognitive nudge for the next user turn.
+
+        Drains in ``_append_user_turn`` as a ``<system-reminder>`` block
+        appended to the user message body. Used for nudges that respond
+        to user behaviour: ``correction``, ``denial``, ``resume``,
+        ``start``, ``completion``.
+        """
+        self._pending_user_advisories.append((nudge_type, text))
+
+    def _splice_pending_user_advisories(self, user_msg: dict[str, Any]) -> None:
+        """Drain ``_pending_user_advisories`` into *user_msg*'s content.
+
+        Mutates *user_msg* in place — the caller appends it after.
+        Renders each queued nudge as a ``<system-reminder>`` block
+        (same envelope as ``wrap_tool_result``) and attaches them to
+        the trailing edge of the user content. Every text segment in
+        the user content is passed through ``escape_wrapper_tags``
+        first so a user typing literal ``<system-reminder>`` cannot
+        fabricate an envelope the model would treat as a
+        Turnstone-issued reminder. For attachment-bearing turns the
+        blocks land on the trailing text part so they stay glued to
+        the same multipart turn.
+        """
+        if not self._pending_user_advisories:
+            return
+        from turnstone.core.tool_advisory import escape_wrapper_tags, render_system_reminder
+
+        items = list(self._pending_user_advisories)
+        self._pending_user_advisories.clear()
+
+        block = "\n\n" + "\n\n".join(render_system_reminder(text) for _, text in items)
+        content = user_msg["content"]
+        if isinstance(content, str):
+            user_msg["content"] = escape_wrapper_tags(content) + block
+        else:
+            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            for part in text_parts:
+                part["text"] = escape_wrapper_tags(part.get("text", ""))
+            if text_parts:
+                text_parts[-1]["text"] = text_parts[-1]["text"] + block
+            else:
+                content.append({"type": "text", "text": block})
+
+        self._emit_nudge_ping(nudge_type for nudge_type, _ in items)
+
+    def _emit_nudge_ping(self, types: Iterable[str]) -> None:
+        """Surface the ``[metacognition: nudge injected — …]`` UI line.
+
+        Centralised so both drain sites (tool channel via
+        ``_collect_advisories``, user channel via
+        ``_splice_pending_user_advisories``) emit the same wording.
+        """
+        joined = ", ".join(types)
+        if joined:
+            self.ui.on_info(f"{GRAY}[metacognition: nudge injected — {joined}]{RESET}")
+
+    def _queue_tool_advisory(self, nudge_type: str, text: str) -> None:
+        """Queue a metacognitive nudge for the next tool-result batch.
+
+        Drains in ``_collect_advisories`` alongside guard findings and
+        user interjections; ``wrap_tool_result`` then renders it inside
+        the tool-result envelope. Used for nudges that respond to model
+        behaviour at a tool boundary: ``tool_error``, ``repeat``.
+        """
+        self._pending_tool_advisories.append((nudge_type, text))
 
     # ------------------------------------------------------------------
     # Coordinator tools — reachable only when ``kind == "coordinator"``.
@@ -5024,19 +5622,205 @@ class ChatSession:
             return call_id, msg
         # Successful spawn — surface ws_id + node_id + name + routing
         # strategy so the coordinator can follow up with inspect / send
-        # and explain why a given node was chosen.
+        # and explain why a given node was chosen.  ``status`` was
+        # historically included but it was the routing-proxy's HTTP
+        # code (always 200 on this branch); the absence of an
+        # ``error`` field is the success signal.  Dropped here to
+        # avoid the silent footgun where ``if result["status"] ==
+        # "idle"`` looked plausible against the (incorrectly
+        # documented) lifecycle-state-string contract.  Lifecycle
+        # state lives on the workstream row — read it via
+        # ``inspect_workstream``.
         summary = json.dumps(
             {
                 "ws_id": result.get("ws_id"),
                 "name": result.get("name"),
                 "node_id": result.get("node_id"),
                 "routing_strategy": result.get("routing_strategy"),
-                "status": result.get("status"),
             },
             separators=(",", ":"),
         )
         self._report_tool_result(call_id, "spawn_workstream", f"spawned {result.get('ws_id', '?')}")
         return call_id, summary
+
+    # Cap per batch call.  Matches the ``wait_for_workstream`` ws_ids
+    # intuition (small enough to fit an operator's eyes in one approval
+    # card; if the model wants more, make a second call).  Hard error
+    # rather than silent truncation — a silently-dropped child is much
+    # harder to notice than an explicit retry prompt.
+    _SPAWN_BATCH_MAX_CHILDREN = 10
+
+    def _prepare_spawn_batch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(call_id, "spawn_batch", "coordinator client unavailable")
+        raw_children = args.get("children")
+        if not isinstance(raw_children, list) or not raw_children:
+            return self._coord_tool_error(
+                call_id, "spawn_batch", "children must be a non-empty list"
+            )
+        if len(raw_children) > self._SPAWN_BATCH_MAX_CHILDREN:
+            return self._coord_tool_error(
+                call_id,
+                "spawn_batch",
+                f"children exceeds cap ({len(raw_children)} > "
+                f"{self._SPAWN_BATCH_MAX_CHILDREN}); split across multiple calls",
+            )
+
+        # Per-item normalisation.  Invalid items surface in ``denied`` at
+        # exec time rather than failing the whole batch — we want
+        # partial-success semantics so a single malformed row doesn't
+        # poison the other approved spawns.
+        normalised: list[dict[str, Any]] = []
+        preview_rows: list[str] = []
+        for idx, raw in enumerate(raw_children):
+            if not isinstance(raw, dict):
+                normalised.append({"idx": idx, "_error": "child spec must be an object"})
+                preview_rows.append(f"  {idx}. [invalid — not an object]")
+                continue
+            initial_message = self._coord_str_arg(raw, "initial_message").strip()
+            skill = self._coord_str_arg(raw, "skill").strip()
+            name = self._coord_str_arg(raw, "name").strip()
+            model = self._coord_str_arg(raw, "model").strip()
+            target_node = self._coord_str_arg(raw, "target_node").strip()
+            spec: dict[str, Any] = {
+                "idx": idx,
+                "initial_message": initial_message,
+                "skill": skill,
+                "name": name,
+                "model": model,
+                "target_node": target_node,
+            }
+            normalised.append(spec)
+            if initial_message:
+                first_line = initial_message.splitlines()[0]
+                preview_line = first_line[:80] + ("..." if len(first_line) > 80 else "")
+                tag_bits = []
+                if skill:
+                    tag_bits.append(f"skill={skill}")
+                if target_node:
+                    tag_bits.append(f"node={target_node}")
+                tags = (" [" + ", ".join(tag_bits) + "]") if tag_bits else ""
+                preview_rows.append(f"  {idx}. {preview_line}{tags}")
+            else:
+                preview_rows.append(f"  {idx}. (idle)")
+
+        # If every row was invalid at normalisation, skip the approval
+        # round — operators shouldn't approve a batch with nothing to
+        # spawn.  Surface the first denial reason directly so the model
+        # gets actionable feedback.
+        valid_count = sum(1 for spec in normalised if "_error" not in spec)
+        if valid_count == 0:
+            first_err = next(
+                (s.get("_error") for s in normalised if s.get("_error")), "batch rejected"
+            )
+            return self._coord_tool_error(call_id, "spawn_batch", first_err or "batch rejected")
+
+        header = f"\u2699 spawn_batch: {len(normalised)} children"
+        preview_body = f"{DIM}{chr(10).join(preview_rows)}{RESET}"
+        return {
+            "call_id": call_id,
+            "func_name": "spawn_batch",
+            "header": header,
+            "preview": preview_body,
+            "needs_approval": True,
+            "approval_label": "spawn_batch",
+            "execute": self._exec_spawn_batch,
+            "children": normalised,
+        }
+
+    def _exec_spawn_batch(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        children: list[dict[str, Any]] = item["children"]
+        total = len(children)
+
+        # Emit ``batch_started`` so the coordinator sidebar can show a
+        # "spawning N children" indicator.  Mirrors wait_for_workstream's
+        # _emit_wait_event plumbing (best-effort via ui._enqueue).
+        self._emit_batch_event(
+            "batch_started",
+            {"call_id": call_id, "op": "spawn_batch", "total": total},
+        )
+
+        results: dict[str, dict[str, Any]] = {}
+        denied: list[dict[str, Any]] = []
+        for spec in children:
+            idx = spec["idx"]
+            # Validation failures from _prepare surface here as denied
+            # rows — partial-success: don't abort the rest of the batch.
+            if "_error" in spec:
+                denied.append({"idx": idx, "reason": spec["_error"]})
+                continue
+            try:
+                result = self._coord_client.spawn(
+                    initial_message=spec["initial_message"],
+                    parent_ws_id=self._ws_id,
+                    user_id=self._user_id,
+                    skill=spec["skill"],
+                    name=spec["name"],
+                    model=spec["model"],
+                    target_node=spec["target_node"],
+                )
+            except Exception as e:
+                denied.append({"idx": idx, "reason": f"spawn failed: {e}"})
+                continue
+            if result.get("error"):
+                denied.append({"idx": idx, "reason": str(result["error"])})
+                continue
+            ws_id = str(result.get("ws_id") or "")
+            if not ws_id:
+                denied.append({"idx": idx, "reason": "spawn returned no ws_id"})
+                continue
+            results[str(idx)] = {
+                "ws_id": ws_id,
+                "name": result.get("name", ""),
+                "node_id": result.get("node_id", ""),
+                # ``status`` deliberately omitted — see the matching
+                # comment in ``_exec_spawn_workstream``: the routing
+                # proxy fills it with HTTP 200 on success, which the
+                # model can't usefully act on.  Errors land in
+                # ``denied[]`` instead.
+            }
+
+        # ``truncated`` intentionally omitted — the prepare step
+        # hard-errors on >10 children rather than silent truncation,
+        # so the bulk-shape flag would always be false and just pads
+        # the LLM's tool-result payload.
+        summary_payload = {
+            "results": results,
+            "denied": denied,
+        }
+        output = json.dumps(summary_payload, separators=(",", ":"), default=str)
+        desc = f"spawned {len(results)}/{total}"
+        if denied:
+            desc += f" ({len(denied)} denied)"
+        self._report_tool_result(call_id, "spawn_batch", desc)
+        self._emit_batch_event(
+            "batch_ended",
+            {
+                "call_id": call_id,
+                "op": "spawn_batch",
+                "total": total,
+                "succeeded": len(results),
+                "denied": len(denied),
+            },
+        )
+        return call_id, output
+
+    def _emit_batch_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Fan out a ``batch_*`` SSE event via the session UI.  Best-effort.
+
+        Matches the ``_emit_wait_event`` pattern — the batch itself must
+        never fail because of observer plumbing.  The sidebar keys on
+        ``call_id`` to pair started/ended into a single indicator.
+        """
+        ui = getattr(self, "ui", None)
+        enqueue = getattr(ui, "_enqueue", None)
+        if enqueue is None:
+            return
+        try:
+            enqueue({"type": event_type, **payload})
+        except Exception:
+            log.debug("batch_event.enqueue_failed type=%s", event_type, exc_info=True)
 
     def _prepare_inspect_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
@@ -5206,6 +5990,84 @@ class ChatSession:
         if reason:
             desc += f" ({reason[:60]})"
         self._report_tool_result(call_id, "close_workstream", desc)
+        return call_id, output
+
+    def _prepare_close_all_children(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "close_all_children", "coordinator client unavailable"
+            )
+        reason = self._coord_str_arg(args, "reason").strip()
+        header = "\u2699 close_all_children"
+        if reason:
+            header += f": {reason[:80]}"
+        return {
+            "call_id": call_id,
+            "func_name": "close_all_children",
+            "header": header,
+            "preview": "",
+            "needs_approval": True,
+            "approval_label": "close_all_children",
+            "execute": self._exec_close_all_children,
+            "reason": reason,
+        }
+
+    def _exec_close_all_children(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        reason = item.get("reason", "") or ""
+        self._emit_batch_event(
+            "batch_started",
+            {"call_id": call_id, "op": "close_all_children"},
+        )
+        try:
+            result = self._coord_client.close_all_children(reason=reason)
+        except Exception as e:
+            msg = f"Error: close_all_children failed: {e}"
+            self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
+            self._emit_batch_event(
+                "batch_ended",
+                {"call_id": call_id, "op": "close_all_children", "error": str(e)},
+            )
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "close_all_children", msg, is_error=True)
+            self._emit_batch_event(
+                "batch_ended",
+                {
+                    "call_id": call_id,
+                    "op": "close_all_children",
+                    "error": str(result["error"]),
+                },
+            )
+            return call_id, msg
+        closed = [str(x) for x in result.get("closed") or [] if x]
+        failed = [str(x) for x in result.get("failed") or [] if x]
+        skipped = [str(x) for x in result.get("skipped") or [] if x]
+        summary_payload: dict[str, Any] = {
+            "closed": closed,
+            "failed": failed,
+            "skipped": skipped,
+        }
+        if reason:
+            summary_payload["reason"] = reason
+        output = json.dumps(summary_payload, separators=(",", ":"))
+        desc = f"closed {len(closed)}"
+        if failed:
+            desc += f", {len(failed)} failed"
+        if skipped:
+            desc += f", {len(skipped)} skipped"
+        self._report_tool_result(call_id, "close_all_children", desc)
+        self._emit_batch_event(
+            "batch_ended",
+            {
+                "call_id": call_id,
+                "op": "close_all_children",
+                "closed": len(closed),
+                "failed": len(failed),
+                "skipped": len(skipped),
+            },
+        )
         return call_id, output
 
     def _prepare_cancel_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -5384,15 +6246,35 @@ class ChatSession:
     def _prepare_list_nodes(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(call_id, "list_nodes", "coordinator client unavailable")
+        # Metadata values are JSON-encoded at rest; the client handles
+        # the encode/decode so preserve the model's natural types (``4``
+        # stays an int, ``"gpu"`` stays a string) rather than
+        # stringifying here.
+        #
+        # Two accepted shapes:
+        #
+        #   list_nodes(filters={"os": "Linux"})   ← canonical, nested
+        #   list_nodes(os="Linux")                ← flat top-level args
+        #
+        # Several models drop the ``filters`` nesting and emit each
+        # filter as a top-level kwarg; the strict-nested-only shape
+        # silently degraded those calls to "no filter" and returned
+        # the full cluster, which an operator hit during shakedown
+        # ("``os="DefinitelyNotAnOS"`` returned all 10 nodes").
+        # Treating top-level non-reserved args as filters fixes the
+        # natural mistake without changing the canonical shape;
+        # nested entries still win on key collision.
         raw_filters = args.get("filters")
-        # Metadata values are JSON-encoded at rest; the client handles the
-        # encode/decode so preserve the model's natural types (``4`` stays
-        # an int, ``"gpu"`` stays a string) rather than stringifying here.
         filters: dict[str, Any] = {}
         if isinstance(raw_filters, dict):
             for k, v in raw_filters.items():
                 if isinstance(k, str) and k and isinstance(v, (str, int, float, bool)):
                     filters[k] = v
+        for k, v in args.items():
+            if k in _LIST_NODES_RESERVED_ARGS:
+                continue
+            if isinstance(k, str) and k and isinstance(v, (str, int, float, bool)):
+                filters.setdefault(k, v)
         try:
             limit = int(args.get("limit") or 100)
         except (TypeError, ValueError):
@@ -5510,33 +6392,33 @@ class ChatSession:
         self._report_tool_result(call_id, "list_skills", summary)
         return call_id, self._truncate_output(output)
 
-    def _prepare_task_list(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a task_list action — list is auto-approved, mutations gated."""
+    def _prepare_tasks(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a tasks action — list is auto-approved, mutations gated."""
         if self._coord_client is None:
-            return self._coord_tool_error(call_id, "task_list", "coordinator client unavailable")
+            return self._coord_tool_error(call_id, "tasks", "coordinator client unavailable")
         action = self._coord_str_arg(args, "action").strip().lower()
         if action not in {"add", "update", "remove", "reorder", "list"}:
             return self._coord_tool_error(
                 call_id,
-                "task_list",
+                "tasks",
                 "action must be one of: add, update, remove, reorder, list",
             )
         if action == "list":
             return {
                 "call_id": call_id,
-                "func_name": "task_list",
-                "header": "\u2699 task_list list",
+                "func_name": "tasks",
+                "header": "\u2699 tasks list",
                 "preview": "",
                 "needs_approval": False,
-                "execute": self._exec_task_list,
+                "execute": self._exec_tasks,
                 "action": "list",
             }
         # --- mutating actions -------------------------------------------------
         item: dict[str, Any] = {
             "call_id": call_id,
-            "func_name": "task_list",
+            "func_name": "tasks",
             "needs_approval": True,
-            "execute": self._exec_task_list,
+            "execute": self._exec_tasks,
             "action": action,
         }
         if action == "add":
@@ -5547,14 +6429,14 @@ class ChatSession:
                 raw = args.get(field_name)
                 if raw is not None and not isinstance(raw, str):
                     return self._coord_tool_error(
-                        call_id, "task_list", f"add: {field_name} must be a string"
+                        call_id, "tasks", f"add: {field_name} must be a string"
                     )
             title = self._coord_str_arg(args, "title").strip()
             if not title:
-                return self._coord_tool_error(call_id, "task_list", "add: title is required")
+                return self._coord_tool_error(call_id, "tasks", "add: title is required")
             status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
             child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
-            item["header"] = f"\u2699 task_list add: {title[:60]}"
+            item["header"] = f"\u2699 tasks add: {title[:60]}"
             item["preview"] = f"status={status} child_ws_id={child_ws_id or '-'}"
             item["title"] = title
             item["status"] = status
@@ -5562,7 +6444,7 @@ class ChatSession:
         elif action == "update":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
-                return self._coord_tool_error(call_id, "task_list", "update: task_id is required")
+                return self._coord_tool_error(call_id, "tasks", "update: task_id is required")
             # Reject non-string field values outright — avoids a
             # preview/execute divergence where the approver sees
             # ``title=42`` but the coercion below drops it to ``None`` and
@@ -5581,16 +6463,16 @@ class ChatSession:
                 if field_val is not None and not isinstance(field_val, str):
                     return self._coord_tool_error(
                         call_id,
-                        "task_list",
+                        "tasks",
                         f"update: {field_name} must be a string",
                     )
             if upd_title is None and upd_status is None and upd_child is None:
                 return self._coord_tool_error(
                     call_id,
-                    "task_list",
+                    "tasks",
                     "update: at least one of title / status / child_ws_id is required",
                 )
-            item["header"] = f"\u2699 task_list update: {task_id}"
+            item["header"] = f"\u2699 tasks update: {task_id}"
             bits: list[str] = []
             if upd_title is not None:
                 bits.append(f"title={upd_title[:60]}")
@@ -5606,40 +6488,40 @@ class ChatSession:
         elif action == "remove":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
-                return self._coord_tool_error(call_id, "task_list", "remove: task_id is required")
-            item["header"] = f"\u2699 task_list remove: {task_id}"
+                return self._coord_tool_error(call_id, "tasks", "remove: task_id is required")
+            item["header"] = f"\u2699 tasks remove: {task_id}"
             item["preview"] = ""
             item["task_id"] = task_id
         elif action == "reorder":
             raw_ids = args.get("task_ids")
             if not isinstance(raw_ids, list) or not all(isinstance(x, str) for x in raw_ids):
                 return self._coord_tool_error(
-                    call_id, "task_list", "reorder: task_ids must be a list of strings"
+                    call_id, "tasks", "reorder: task_ids must be a list of strings"
                 )
-            item["header"] = f"\u2699 task_list reorder: {len(raw_ids)} ids"
+            item["header"] = f"\u2699 tasks reorder: {len(raw_ids)} ids"
             item["preview"] = ",".join(raw_ids[:6]) + ("..." if len(raw_ids) > 6 else "")
             item["task_ids"] = raw_ids
         return item
 
-    def _exec_task_list(self, item: dict[str, Any]) -> tuple[str, str]:
+    def _exec_tasks(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
         action = item["action"]
         try:
             if action == "list":
-                envelope = self._coord_client.task_list_get(self._ws_id)
+                envelope = self._coord_client.tasks_get(self._ws_id)
                 tasks = envelope.get("tasks", [])
                 truncated = len(tasks) > 200
                 tasks = tasks[:200]
                 result: dict[str, Any] = {"tasks": tasks, "truncated": truncated}
             elif action == "add":
-                result = self._coord_client.task_list_add(
+                result = self._coord_client.tasks_add(
                     self._ws_id,
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
                 )
             elif action == "update":
-                result = self._coord_client.task_list_update(
+                result = self._coord_client.tasks_update(
                     self._ws_id,
                     task_id=item["task_id"],
                     title=item["title"],
@@ -5647,16 +6529,14 @@ class ChatSession:
                     child_ws_id=item["child_ws_id"],
                 )
             elif action == "remove":
-                result = self._coord_client.task_list_remove(self._ws_id, task_id=item["task_id"])
+                result = self._coord_client.tasks_remove(self._ws_id, task_id=item["task_id"])
             elif action == "reorder":
-                result = self._coord_client.task_list_reorder(
-                    self._ws_id, task_ids=item["task_ids"]
-                )
+                result = self._coord_client.tasks_reorder(self._ws_id, task_ids=item["task_ids"])
             else:  # unreachable — _prepare validated the enum
                 result = {"error": f"unknown action: {action}"}
         except Exception as e:
-            msg = f"Error: task_list {action} failed: {e}"
-            self._report_tool_result(call_id, "task_list", msg, is_error=True)
+            msg = f"Error: tasks {action} failed: {e}"
+            self._report_tool_result(call_id, "tasks", msg, is_error=True)
             return call_id, msg
         output = json.dumps(result, separators=(",", ":"), default=str)
         if action == "list":
@@ -5677,7 +6557,7 @@ class ChatSession:
         else:
             summary = action
         is_error = "error" in result
-        self._report_tool_result(call_id, "task_list", summary, is_error=is_error)
+        self._report_tool_result(call_id, "tasks", summary, is_error=is_error)
         return call_id, self._truncate_output(output)
 
     def _prepare_wait_for_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -5897,9 +6777,13 @@ class ChatSession:
             mem_type = (args.get("type") or "project").strip().lower()
             if mem_type not in ("user", "project", "feedback", "reference"):
                 mem_type = "project"
-            scope = (args.get("scope") or "global").strip().lower()
-            if scope not in ("global", "workstream", "user"):
-                scope = "global"
+            # Default scope is kind-aware: coord sessions default to
+            # ``coordinator`` (their only writable scope); IC sessions
+            # default to ``global`` (matches pre-fix behaviour).
+            default_scope = self._default_memory_scope()
+            scope = (args.get("scope") or default_scope).strip().lower()
+            if scope not in _VALID_MEMORY_SCOPES:
+                scope = default_scope
             scope_err = self._validate_scope(scope, call_id)
             if scope_err:
                 return scope_err
@@ -5932,7 +6816,7 @@ class ChatSession:
                     "error": "Error: 'name' is required for get",
                 }
             explicit_scope = (args.get("scope") or "").strip().lower()
-            valid_scopes = ("global", "workstream", "user")
+            valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
                 return {
                     "call_id": call_id,
@@ -5948,8 +6832,12 @@ class ChatSession:
                     return scope_err
                 scopes_to_try = [(explicit_scope, self._resolve_scope_id(explicit_scope))]
             else:
+                # Implicit fallback walk \u2014 kind-aware narrowest-to-widest.
+                # Coord sessions only walk ``coordinator``; IC sessions
+                # walk workstream \u2192 user \u2192 global.  See
+                # :meth:`_implicit_scope_walk`.
                 scopes_to_try = []
-                for s in ("workstream", "user", "global"):
+                for s in self._implicit_scope_walk():
                     sid = self._resolve_scope_id(s)
                     if sid or s == "global":
                         scopes_to_try.append((s, sid))
@@ -5977,7 +6865,7 @@ class ChatSession:
                     "error": "Error: name is required for delete",
                 }
             explicit_scope = (args.get("scope") or "").strip().lower()
-            valid_scopes = ("global", "workstream", "user")
+            valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
                 return {
                     "call_id": call_id,
@@ -5997,9 +6885,11 @@ class ChatSession:
                 scope_id = self._resolve_scope_id(explicit_scope)
                 scopes_to_try = [(explicit_scope, scope_id)]
             else:
-                # No scope specified — try narrowest first: workstream → user → global
+                # Kind-aware implicit walk — coord sessions stay in coord-scope;
+                # IC sessions walk narrowest-to-widest (workstream → user → global).
+                # See :meth:`_implicit_scope_walk`.
                 scopes_to_try = []
-                for s in ("workstream", "user", "global"):
+                for s in self._implicit_scope_walk():
                     sid = self._resolve_scope_id(s)
                     if sid or s == "global":
                         scopes_to_try.append((s, sid))
@@ -6021,7 +6911,7 @@ class ChatSession:
             if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
                 mem_type = ""
             scope = (args.get("scope") or "").strip().lower()
-            if scope and scope not in ("global", "workstream", "user"):
+            if scope and scope not in _VALID_MEMORY_SCOPES:
                 scope = ""
             if scope:
                 scope_err = self._validate_scope(scope, call_id)
@@ -6054,7 +6944,7 @@ class ChatSession:
             if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
                 mem_type = ""
             scope = (args.get("scope") or "").strip().lower()
-            if scope and scope not in ("global", "workstream", "user"):
+            if scope and scope not in _VALID_MEMORY_SCOPES:
                 scope = ""
             if scope:
                 scope_err = self._validate_scope(scope, call_id)
@@ -7437,7 +8327,7 @@ class ChatSession:
                 scope = item.get("scope", "")
                 scope_id = item.get("scope_id", "")
                 # Defense-in-depth: reject scoped queries with empty scope_id
-                if scope in ("user", "workstream") and not scope_id:
+                if scope in ("user", "workstream", "coordinator") and not scope_id:
                     msg = f"Error: '{scope}' scope requires a valid identity"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
@@ -7479,7 +8369,7 @@ class ChatSession:
             if action == "list":
                 scope = item.get("scope", "")
                 scope_id = item.get("scope_id", "")
-                if scope in ("user", "workstream") and not scope_id:
+                if scope in ("user", "workstream", "coordinator") and not scope_id:
                     msg = f"Error: '{scope}' scope requires a valid identity"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg

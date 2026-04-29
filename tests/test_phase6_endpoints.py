@@ -3,7 +3,7 @@
 Covers:
 
 - GET /v1/api/cluster/ws/live — bulk live-block fetch (admin.cluster.inspect).
-- GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot.
+- GET /v1/api/workstreams/{ws_id}/metrics — per-coordinator health snapshot.
 
 Both endpoints ride on the same test harness as
 ``test_coordinator_endpoints.py`` — a minimal Starlette app with an
@@ -13,48 +13,23 @@ upstream node fetches.
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import MagicMock
-
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from turnstone.console.coordinator import CoordinatorManager
-from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+from tests._coord_test_helpers import (
+    _AuthMiddleware,
+    _build_mgr,
+    _fake_registry,
+    _FakeConfigStore,
+)
 from turnstone.console.server import (
     cluster_ws_live_bulk,
     coordinator_metrics,
 )
-from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-class _AuthMiddleware(BaseHTTPMiddleware):
-    """Inject a configurable AuthResult from header-based contract."""
-
-    async def dispatch(self, request, call_next):
-        perms = request.headers.get("X-Test-Perms", "")
-        user_id = request.headers.get("X-Test-User", "")
-        if perms or user_id:
-            request.state.auth_result = AuthResult(
-                user_id=user_id,
-                scopes=frozenset({"approve"}),
-                token_source="test",
-                permissions=frozenset(p for p in perms.split(",") if p),
-            )
-        return await call_next(request)
-
-
-class _FakeConfigStore:
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._values.get(key, default)
 
 
 @pytest.fixture
@@ -62,30 +37,12 @@ def storage(tmp_path):
     return SQLiteBackend(str(tmp_path / "phase6.db"))
 
 
-def _build_mgr(storage) -> CoordinatorManager:
-    def _sf(ui, model_alias=None, ws_id=None, **kw):
-        return MagicMock()
-
-    return CoordinatorManager(
-        session_factory=_sf,
-        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
-        storage=storage,
-        max_active=3,
-    )
-
-
-def _fake_registry() -> MagicMock:
-    reg = MagicMock()
-    reg.resolve.return_value = (MagicMock(), "gpt-4", MagicMock())
-    return reg
-
-
 def _make_client(storage, *, coord_mgr=None) -> TestClient:
     app = Starlette(
         routes=[
             Route("/v1/api/cluster/ws/live", cluster_ws_live_bulk, methods=["GET"]),
             Route(
-                "/v1/api/coordinator/{ws_id}/metrics",
+                "/v1/api/workstreams/{ws_id}/metrics",
                 coordinator_metrics,
                 methods=["GET"],
             ),
@@ -93,6 +50,7 @@ def _make_client(storage, *, coord_mgr=None) -> TestClient:
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": "gpt-4"})
     app.state.coord_registry = _fake_registry() if coord_mgr is not None else None
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
@@ -220,11 +178,11 @@ def test_bulk_live_admin_bypass_returns_live(storage):
     assert body["denied"] == []
 
 
-def test_bulk_live_tenant_filter_marks_foreign_rows_denied(storage):
-    """A non-admin caller whose user_id doesn't match the row's owner
-    gets the ws_id in ``denied`` rather than ``results`` — no
-    existence-oracle leak."""
-    # Seed a foreign-owned interactive workstream.
+def test_bulk_live_cluster_wide_visibility(storage):
+    """Trusted-team visibility: any ``admin.cluster.inspect`` caller
+    sees every row in ``results``.  ``denied`` is reserved for ids
+    that don't correspond to a persisted workstream (no existence
+    oracle for unknown ids)."""
     ws_id = "b" * 32
     _seed_workstream(storage, ws_id=ws_id, node_id="node-a", user_id="stranger")
     client = _make_client(storage, coord_mgr=_build_mgr(storage))
@@ -234,22 +192,18 @@ def test_bulk_live_tenant_filter_marks_foreign_rows_denied(storage):
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["denied"] == [ws_id]
-    assert body["results"] == {}
+    assert ws_id in body["results"]
+    assert body["denied"] == []
 
 
-def test_bulk_live_empty_caller_uid_denies_empty_owner_rows(storage):
-    """Regression for #bug-3 / #sec-2: a caller with empty user_id
-    must NOT see rows with empty user_id (orphan / system-owned).
-    Either side empty → denied.  Admin bypass honoured (tested
-    elsewhere)."""
-    ws_id = "c" * 32
-    _seed_workstream(storage, ws_id=ws_id, node_id="node-a", user_id="")
+def test_bulk_live_unknown_ids_route_to_denied(storage):
+    """Unknown ids (not in storage) land in ``denied`` so the endpoint
+    can't be used as an existence oracle."""
+    ws_id = "c" * 32  # not seeded
     client = _make_client(storage, coord_mgr=_build_mgr(storage))
-    # caller_uid="" (empty X-Test-User) + non-admin perm.
     resp = client.get(
         f"/v1/api/cluster/ws/live?ids={ws_id}",
-        headers={"X-Test-User": "", "X-Test-Perms": "admin.cluster.inspect"},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.cluster.inspect"},
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -274,10 +228,56 @@ def test_bulk_live_coordinator_row_uses_manager_snapshot(storage):
     live = body["results"][ws.id]
     assert live is not None
     assert "pending_approval" in live
+    # New field always present on the wire — None when no approval
+    # is pending so the JS can `key in row` without surprise.
+    assert "pending_approval_detail" in live
+    assert live["pending_approval_detail"] is None
+
+
+def test_bulk_live_coordinator_row_includes_pending_approval_detail(storage):
+    """When _pending_approval is set on a coord UI, the live block
+    surfaces the merged items + judge_verdict payload through the
+    coord-pseudo-node path. End-to-end equivalent of the dashboard
+    test in test_server_authz, but for the console live-bulk
+    endpoint that the coord tree UI actually consumes."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    ws.ui._pending_approval = {
+        "type": "approve_request",
+        "items": [
+            {
+                "call_id": "c-99",
+                "header": "spawn_workstream",
+                "preview": "{...}",
+                "func_name": "spawn_workstream",
+                "approval_label": "spawn_workstream",
+                "needs_approval": True,
+            }
+        ],
+        "judge_pending": False,
+    }
+    ws.ui._llm_verdicts["c-99"] = {
+        "recommendation": "approve",
+        "risk_level": "low",
+        "tier": "llm",
+    }
+    client = _make_client(storage, coord_mgr=mgr)
+    resp = client.get(
+        f"/v1/api/cluster/ws/live?ids={ws.id}",
+        headers=_OWNER_HEADERS,
+    )
+    assert resp.status_code == 200
+    live = resp.json()["results"][ws.id]
+    assert live["pending_approval"] is True  # boolean derived flag
+    detail = live["pending_approval_detail"]
+    assert detail is not None
+    assert detail["call_id"] == "c-99"
+    assert detail["items"][0]["func_name"] == "spawn_workstream"
+    assert detail["items"][0]["judge_verdict"]["recommendation"] == "approve"
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot
+# GET /v1/api/workstreams/{ws_id}/metrics — per-coordinator health snapshot
 # ---------------------------------------------------------------------------
 
 
@@ -289,7 +289,7 @@ def test_metrics_requires_permission(storage):
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers={"X-Test-User": "user-1", "X-Test-Perms": "read"},
     )
     assert resp.status_code == 403
@@ -299,23 +299,24 @@ def test_metrics_invalid_ws_id_400(storage):
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        "/v1/api/coordinator/NOT-HEX/metrics",
+        "/v1/api/workstreams/NOT-HEX/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 400
 
 
-def test_metrics_ownership_404_mask(storage):
-    """A ws_id owned by another tenant returns 404, not 403 — no
-    existence-oracle leak (mirrors coordinator_detail)."""
+def test_metrics_any_admin_coordinator_caller_can_read(storage):
+    """Trusted-team visibility: metrics are readable by any caller
+    with ``admin.coordinator`` regardless of the coordinator owner."""
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="stranger")
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
+    assert resp.json()["ws_id"] == ws.id
 
 
 def test_metrics_empty_coordinator_defaults(storage):
@@ -325,7 +326,7 @@ def test_metrics_empty_coordinator_defaults(storage):
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -374,7 +375,7 @@ def test_metrics_spawns_and_state_counts(storage):
     )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -383,20 +384,13 @@ def test_metrics_spawns_and_state_counts(storage):
     assert body["child_state_counts"] == {"idle": 1, "running": 1, "closed": 1}
 
 
-def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
-    """Defense-in-depth: a non-admin caller's aggregate counts must
-    exclude children whose parent_ws_id matches the coord but whose
-    user_id drifted to another tenant (forged / migration-era rows).
-    The primary defense is the 404-mask on coord ownership; this is
-    the secondary defense inside the aggregate queries (Copilot
-    review finding on PR #381).
-
-    Admin bypass sees the raw aggregate (no tenant filter) — same
-    pattern coordinator_children follows.
+def test_metrics_cluster_wide_aggregates(storage):
+    """Trusted-team model: aggregates are cluster-wide across every
+    caller with ``admin.coordinator``.  Every child under the
+    coordinator counts, regardless of the ``user_id`` on the row.
     """
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="alice")
-    # Legitimate child owned by alice.
     _seed_workstream(
         storage,
         ws_id="aa" * 16,
@@ -405,7 +399,6 @@ def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
         parent_ws_id=ws.id,
         state="idle",
     )
-    # Forged / drifted child — same parent_ws_id but foreign owner.
     _seed_workstream(
         storage,
         ws_id="bb" * 16,
@@ -416,30 +409,16 @@ def test_metrics_tenant_filter_excludes_forged_cross_tenant_child(storage):
     )
     client = _make_client(storage, coord_mgr=mgr)
 
-    # Alice (non-admin) — counts must exclude bob's forged row.
-    resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
-        headers={"X-Test-User": "alice", "X-Test-Perms": "admin.coordinator"},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["spawns_total"] == 1
-    assert body["child_state_counts"] == {"idle": 1}
-    # "running" (bob's forged child) filtered out.
-    assert "running" not in body["child_state_counts"]
-
-    # Admin sees both.
-    resp_admin = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
-        headers={
-            "X-Test-User": "admin-1",
-            "X-Test-Perms": "admin.coordinator,admin.users",
-        },
-    )
-    assert resp_admin.status_code == 200
-    body_admin = resp_admin.json()
-    assert body_admin["spawns_total"] == 2
-    assert body_admin["child_state_counts"] == {"idle": 1, "running": 1}
+    # Every admin.coordinator caller sees both children.
+    for caller in ("alice", "bob", "admin-1"):
+        resp = client.get(
+            f"/v1/api/workstreams/{ws.id}/metrics",
+            headers={"X-Test-User": caller, "X-Test-Perms": "admin.coordinator"},
+        )
+        assert resp.status_code == 200, caller
+        body = resp.json()
+        assert body["spawns_total"] == 2, caller
+        assert body["child_state_counts"] == {"idle": 1, "running": 1}, caller
 
 
 def test_metrics_judge_fallback_rate_substring_match(storage):
@@ -471,7 +450,7 @@ def test_metrics_judge_fallback_rate_substring_match(storage):
         )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200
@@ -514,7 +493,7 @@ def test_metrics_spawns_last_hour_boundary(storage):
     )
     client = _make_client(storage, coord_mgr=mgr)
     resp = client.get(
-        f"/v1/api/coordinator/{ws.id}/metrics",
+        f"/v1/api/workstreams/{ws.id}/metrics",
         headers=_METRICS_HEADERS,
     )
     assert resp.status_code == 200

@@ -25,16 +25,15 @@ from turnstone.api.console_schemas import (
     CoordinatorApproveRequest,
     CoordinatorChildInfo,
     CoordinatorChildrenResponse,
+    CoordinatorCloseAllChildrenRequest,
+    CoordinatorCloseAllChildrenResponse,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
-    CoordinatorDetailResponse,
-    CoordinatorHistoryResponse,
-    CoordinatorInfo,
-    CoordinatorListResponse,
     CoordinatorOpenResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
+    CoordinatorSendResponse,
     CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
@@ -129,8 +128,14 @@ from turnstone.api.schemas import (
     UserInfo,
 )
 from turnstone.api.server_schemas import (
+    DequeueRequest,
+    ListAttachmentsResponse,
     ListSkillSummaryResponse,
+    ListWorkstreamsResponse,
     SkillSummary,
+    UploadAttachmentResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
 )
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
@@ -1130,34 +1135,36 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     # enforced per-row (callers without ``admin.system`` see only their
     # own coordinators); cross-tenant misses 404-mask.
     EndpointSpec(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         "POST",
         "Create a new coordinator workstream",
         description=(
             'Allocates a console-hosted ``kind="coordinator"`` ChatSession.  '
-            "201 on create; 429 when the ``coordinator.max_active`` cap is "
-            "reached and no idle coordinator can be evicted."
+            "200 on create; 429 when the ``coordinator.max_active`` cap is "
+            "reached and no idle coordinator can be evicted.  "
+            "Pre-1.5.0 this returned 201; the lifted ``create`` factory "
+            "(Stage 2 verb lift) converges on 200 across both kinds."
         ),
         request_model=CoordinatorCreateRequest,
         response_model=CoordinatorCreateResponse,
-        response_code=201,
+        response_code=200,
         error_codes=[400, 401, 403, 429, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator",
+        "/v1/api/workstreams",
         "GET",
         "List coordinator workstreams visible to the caller",
         description=(
             "Returns coordinators owned by the caller.  Callers with "
             "``admin.system`` see every coordinator across tenants."
         ),
-        response_model=CoordinatorListResponse,
+        response_model=ListWorkstreamsResponse,
         error_codes=[403, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}",
+        "/v1/api/workstreams/{ws_id}",
         "GET",
         "Get coordinator detail (rehydrates lazily on miss)",
         description=(
@@ -1166,12 +1173,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "before responding; ``500`` on rehydrate failure carries a "
             "correlation id matching the server log line."
         ),
-        response_model=CoordinatorDetailResponse,
+        response_model=WorkstreamDetailResponse,
         error_codes=[400, 403, 404, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/open",
+        "/v1/api/workstreams/{ws_id}/open",
         "POST",
         "Open (rehydrate) a coordinator workstream by ws_id",
         description=(
@@ -1185,20 +1192,88 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/send",
-        "POST",
-        "Queue a user message onto the coordinator session",
+        "/v1/api/workstreams/{ws_id}/send",
+        "DELETE",
+        "Cancel a queued coordinator message",
         description=(
-            "Worker thread picks up the message via the session's queue.  "
-            "``429`` when the worker queue is full — caller should back off."
+            "Removes a previously-queued message identified by ``msg_id`` "
+            "from the coordinator session's pending queue. Returns "
+            "``status: removed`` when the queue had the entry, "
+            "``status: not_found`` otherwise. Reservations attached to "
+            "the dequeued message are released so the attachments can be "
+            "reused — parity with the interactive surface."
         ),
-        request_model=CoordinatorSendRequest,
+        request_model=DequeueRequest,
         response_model=StatusResponse,
-        error_codes=[400, 403, 404, 429, 500, 503],
+        error_codes=[400, 403, 404, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/approve",
+        "/v1/api/workstreams/{ws_id}/send",
+        "POST",
+        "Queue a user message onto the coordinator session",
+        description=(
+            "Worker thread picks up the message via the session's queue. "
+            "Optional ``attachment_ids`` reserve attachments under the "
+            "message's send_id token (parity with the interactive surface). "
+            "Response carries ``attached_ids`` / ``dropped_attachment_ids`` "
+            "so callers can detect partial reservations and ``priority`` / "
+            "``msg_id`` on the queued path. "
+            "``status: queue_full`` when the worker queue is full — caller "
+            "should back off."
+        ),
+        request_model=CoordinatorSendRequest,
+        response_model=CoordinatorSendResponse,
+        error_codes=[400, 403, 404, 409, 500, 503],
+        tags=["Coordinator"],
+    ),
+    # --- Coordinator attachments (P1.5: parity with interactive) ---
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments",
+        "POST",
+        "Upload a file attachment to a coordinator workstream",
+        description=(
+            "Multipart upload (field ``file``). Same validation rules as "
+            "the interactive surface: magic-byte image sniff, UTF-8 text "
+            "decode, per-kind size cap, per-(ws,user) pending cap. "
+            "Attachments stay pending until a subsequent ``/send`` "
+            "reserves them under its ``send_id`` token."
+        ),
+        response_model=UploadAttachmentResponse,
+        error_codes=[400, 403, 404, 409, 413, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments",
+        "GET",
+        "List the caller's pending coordinator attachments",
+        response_model=ListAttachmentsResponse,
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        "GET",
+        "Return raw bytes of a coordinator attachment",
+        description=(
+            "Same byte-stream + headers as the interactive surface. Text "
+            "kinds are forced to ``text/plain`` so an HTML-shaped text "
+            "upload can't render same-origin."
+        ),
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+        "DELETE",
+        "Remove a pending coordinator attachment",
+        description="Consumed attachments return 404.",
+        response_model=StatusResponse,
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/approve",
         "POST",
         "Resolve a pending tool approval on the coordinator session",
         description=(
@@ -1213,7 +1288,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/cancel",
+        "/v1/api/workstreams/{ws_id}/cancel",
         "POST",
         "Cancel in-flight generation on the coordinator session",
         description=(
@@ -1226,7 +1301,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/close",
+        "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Soft-close the coordinator (unload from memory; storage preserved)",
         description=(
@@ -1240,7 +1315,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/events",
+        "/v1/api/workstreams/{ws_id}/events",
         "GET",
         "Subscribe to the coordinator's SSE event stream",
         description=(
@@ -1255,7 +1330,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/history",
+        "/v1/api/workstreams/{ws_id}/history",
         "GET",
         "Read the coordinator's reconstructed message history",
         description=(
@@ -1263,7 +1338,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "format.  Used by the page-load handshake; SSE handles updates "
             "after that.  Bounded by the ``limit`` query parameter."
         ),
-        response_model=CoordinatorHistoryResponse,
+        response_model=WorkstreamHistoryResponse,
         query_params=[
             QueryParam(
                 "limit",
@@ -1272,11 +1347,11 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
                 default=100,
             ),
         ],
-        error_codes=[403, 404, 503],
+        error_codes=[400, 403, 404, 500, 503],
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/children",
+        "/v1/api/workstreams/{ws_id}/children",
         "GET",
         "List the coordinator's spawned child workstreams",
         description=(
@@ -1289,12 +1364,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/tasks",
+        "/v1/api/workstreams/{ws_id}/tasks",
         "GET",
         "Read the coordinator's task list envelope",
         description=(
             "Returns the ``{version, tasks}`` envelope persisted via the "
-            "``task_list`` model tool.  Corrupt envelopes return an empty "
+            "``tasks`` model tool.  Corrupt envelopes return an empty "
             "list (the tool itself surfaces corruption errors on mutation)."
         ),
         response_model=CoordinatorTasksResponse,
@@ -1302,7 +1377,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/trust",
+        "/v1/api/workstreams/{ws_id}/trust",
         "POST",
         "Toggle trusted-session mode for send_to_workstream",
         description=(
@@ -1323,7 +1398,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/restrict",
+        "/v1/api/workstreams/{ws_id}/restrict",
         "POST",
         "Revoke tool access on a live coordinator session",
         description=(
@@ -1342,7 +1417,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
-        "/v1/api/coordinator/{ws_id}/stop_cascade",
+        "/v1/api/workstreams/{ws_id}/stop_cascade",
         "POST",
         "Cancel the coordinator and every direct child",
         description=(
@@ -1356,6 +1431,27 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "``coordinator.stopped_cascade`` with the two lists."
         ),
         response_model=CoordinatorStopCascadeResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/close_all_children",
+        "POST",
+        "Soft-close every direct child of the coordinator",
+        description=(
+            "Reads the in-memory child registry and dispatches "
+            "``close_workstream`` via the routing proxy for every direct "
+            "child under a bounded (16-concurrency) semaphore.  Unlike "
+            "``stop_cascade`` this does not touch grandchildren — the "
+            "model-facing tool asks for a bounded teardown of its own "
+            "fan-out.  Returns ``{closed, failed, skipped}`` where "
+            "``skipped`` distinguishes already-gone (404) from dispatch-"
+            "broken (``failed``).  The optional ``reason`` propagates to "
+            "every closed child's audit + workstream_config.  Writes "
+            "``coordinator.closed_all_children`` at the coord level."
+        ),
+        request_model=CoordinatorCloseAllChildrenRequest,
+        response_model=CoordinatorCloseAllChildrenResponse,
         error_codes=[400, 403, 404, 503],
         tags=["Coordinator"],
     ),
@@ -1425,16 +1521,15 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorApproveRequest,
     CoordinatorChildInfo,
     CoordinatorChildrenResponse,
+    CoordinatorCloseAllChildrenRequest,
+    CoordinatorCloseAllChildrenResponse,
     CoordinatorCreateRequest,
     CoordinatorCreateResponse,
-    CoordinatorDetailResponse,
-    CoordinatorHistoryResponse,
-    CoordinatorInfo,
-    CoordinatorListResponse,
     CoordinatorOpenResponse,
     CoordinatorRestrictRequest,
     CoordinatorRestrictResponse,
     CoordinatorSendRequest,
+    CoordinatorSendResponse,
     CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
@@ -1510,6 +1605,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     RouteCreateResponse,
     SkillSummary,
     ListSkillSummaryResponse,
+    WorkstreamDetailResponse,
+    WorkstreamHistoryResponse,
 ]
 
 

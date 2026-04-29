@@ -26,6 +26,13 @@ class TestServerSpec:
         paths = set(spec["paths"].keys())
         expected = {
             "/v1/api/workstreams",
+            "/v1/api/workstreams/{ws_id}",
+            "/v1/api/workstreams/{ws_id}/history",
+            "/v1/api/workstreams/{ws_id}/send",
+            "/v1/api/workstreams/{ws_id}/approve",
+            "/v1/api/workstreams/{ws_id}/cancel",
+            "/v1/api/workstreams/{ws_id}/close",
+            "/v1/api/workstreams/{ws_id}/events",
             "/v1/api/dashboard",
             "/v1/api/workstreams/saved",
             "/v1/api/send",
@@ -33,7 +40,6 @@ class TestServerSpec:
             "/v1/api/approve",
             "/v1/api/plan",
             "/v1/api/command",
-            "/v1/api/events",
             "/v1/api/events/global",
             "/v1/api/workstreams/new",
             "/v1/api/workstreams/close",
@@ -44,6 +50,17 @@ class TestServerSpec:
             "/health",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
+
+    def test_workstream_history_has_limit_query_param(self):
+        """Mirror of the coord-side history limit param test — server now
+        exposes the same endpoint via the lifted factory."""
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        op = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
+        param_names = [p["name"] for p in op.get("parameters", [])]
+        assert "ws_id" in param_names
+        assert "limit" in param_names
 
     def test_schemas_not_empty(self):
         from turnstone.api.server_spec import build_server_spec
@@ -62,7 +79,7 @@ class TestServerSpec:
         from turnstone.api.server_spec import build_server_spec
 
         spec = build_server_spec()
-        send = spec["paths"]["/v1/api/send"]["post"]
+        send = spec["paths"]["/v1/api/workstreams/{ws_id}/send"]["post"]
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
 
@@ -154,38 +171,42 @@ class TestConsoleSpec:
         spec = build_console_spec()
         paths = set(spec["paths"].keys())
         expected = {
-            "/v1/api/coordinator/new",
-            "/v1/api/coordinator",
-            "/v1/api/coordinator/{ws_id}",
-            "/v1/api/coordinator/{ws_id}/open",
-            "/v1/api/coordinator/{ws_id}/send",
-            "/v1/api/coordinator/{ws_id}/approve",
-            "/v1/api/coordinator/{ws_id}/cancel",
-            "/v1/api/coordinator/{ws_id}/close",
-            "/v1/api/coordinator/{ws_id}/events",
-            "/v1/api/coordinator/{ws_id}/history",
-            "/v1/api/coordinator/{ws_id}/children",
-            "/v1/api/coordinator/{ws_id}/tasks",
+            "/v1/api/workstreams/new",
+            "/v1/api/workstreams",
+            "/v1/api/workstreams/{ws_id}",
+            "/v1/api/workstreams/{ws_id}/open",
+            "/v1/api/workstreams/{ws_id}/send",
+            "/v1/api/workstreams/{ws_id}/approve",
+            "/v1/api/workstreams/{ws_id}/cancel",
+            "/v1/api/workstreams/{ws_id}/close",
+            "/v1/api/workstreams/{ws_id}/events",
+            "/v1/api/workstreams/{ws_id}/history",
+            "/v1/api/workstreams/{ws_id}/children",
+            "/v1/api/workstreams/{ws_id}/tasks",
             "/v1/api/cluster/ws/{ws_id}/detail",
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
 
-    def test_coordinator_create_has_request_body_and_201(self):
-        """Coordinator create returns 201 (not 200) and accepts a body."""
+    def test_coordinator_create_has_request_body_and_200(self):
+        """Coordinator create returns 200 and accepts a body.
+
+        Pre-1.5.0 this returned 201 (REST-strict for create); the lifted
+        ``make_create_handler`` factory converges on 200 across both
+        kinds for response-shape parity with every other shared verb.
+        """
         from turnstone.api.console_spec import build_console_spec
 
         spec = build_console_spec()
-        op = spec["paths"]["/v1/api/coordinator/new"]["post"]
+        op = spec["paths"]["/v1/api/workstreams/new"]["post"]
         assert "requestBody" in op
         assert "application/json" in op["requestBody"]["content"]
-        # Pin the 201 success code.
-        assert "201" in op["responses"]
+        assert "200" in op["responses"]
 
     def test_coordinator_history_has_limit_query_param(self):
         from turnstone.api.console_spec import build_console_spec
 
         spec = build_console_spec()
-        op = spec["paths"]["/v1/api/coordinator/{ws_id}/history"]["get"]
+        op = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
         param_names = [p["name"] for p in op.get("parameters", [])]
         assert "ws_id" in param_names  # auto-added from path
         assert "limit" in param_names

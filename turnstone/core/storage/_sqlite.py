@@ -387,6 +387,7 @@ class SQLiteBackend:
         *,
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
+        state: str | None = None,
     ) -> list[Any]:
         # ``kind`` filter applied at the SQL layer so coordinator rows
         # (which persist conversation history the same way interactive
@@ -397,15 +398,22 @@ class SQLiteBackend:
         # can't accidentally leak another tenant's workstreams.  None
         # = cluster-wide (service callers); empty string is a separate
         # filter value the caller chose deliberately.
+        # ``state`` filter — coordinator-saved surface passes "closed"
+        # so deleted / currently-active rows don't end up in the saved
+        # cards (which would 404 on click or duplicate the active list).
         params: dict[str, Any] = {"limit": limit}
         kind_clause = ""
         user_clause = ""
+        state_clause = ""
         if kind is not None:
             params["kind"] = WorkstreamKind(kind).value
             kind_clause = "AND w.kind = :kind "
         if user_id is not None:
             params["user_id"] = user_id
             user_clause = "AND w.user_id = :user_id "
+        if state is not None:
+            params["state"] = state
+            state_clause = "AND w.state = :state "
         with self._conn() as conn:
             return list(
                 conn.execute(
@@ -419,6 +427,7 @@ class SQLiteBackend:
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
                         f"{kind_clause}"
                         f"{user_clause}"
+                        f"{state_clause}"
                         "ORDER BY w.updated DESC LIMIT :limit"
                     ),
                     params,
@@ -569,6 +578,24 @@ class SQLiteBackend:
                 return str(value) if value is not None else None
             return None
 
+    def get_workstream_display_names(self, ws_ids: list[str]) -> dict[str, str | None]:
+        if not ws_ids:
+            return {}
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.alias,
+                    workstreams.c.title,
+                    workstreams.c.name,
+                ).where(workstreams.c.ws_id.in_(ws_ids))
+            ).fetchall()
+        result: dict[str, str | None] = dict.fromkeys(ws_ids)
+        for r in rows:
+            value = r[1] or r[2] or r[3]
+            result[r[0]] = str(value) if value is not None else None
+        return result
+
     def get_workstream_owner(self, ws_id: str) -> str | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -640,7 +667,7 @@ class SQLiteBackend:
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         # Kind validation at the storage edge — third of three layers
-        # (HTTP handler in server.py returns 400, WorkstreamManager.create
+        # (HTTP handler in server.py returns 400, SessionManager.create
         # raises for in-process callers, here we reject direct storage
         # callers: SDK inserts, restore paths, test doubles).  Each layer
         # targets a different audience; trimming any one of them opens a
@@ -2197,6 +2224,18 @@ class SQLiteBackend:
                 },
             )
             conn.commit()
+        # Drop both the org-specific slot AND the default ``""`` slot.
+        # ``list_tool_policies("")`` returns rows for every org_id (no
+        # WHERE filter when org_id is falsy), and the default
+        # evaluators (``SessionUIBase.approve_tools`` / ``cli.py``) use
+        # ``org_id=""``, so an org-scoped insert that only invalidated
+        # the org slot would leave the default slot serving stale data
+        # until the TTL window expired.
+        from turnstone.core.policy import invalidate_policy_cache
+
+        invalidate_policy_cache(org_id)
+        if org_id != "":
+            invalidate_policy_cache("")
 
     def get_tool_policy(self, policy_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -2230,7 +2269,15 @@ class SQLiteBackend:
                 .values(**fields)
             )
             conn.commit()
-            return result.rowcount > 0
+            updated = result.rowcount > 0
+        if updated:
+            # Invalidate every org slot — the update doesn't expose
+            # the row's org_id without a re-read, and policy mutations
+            # are admin-rate so a global drop is fine.
+            from turnstone.core.policy import invalidate_policy_cache
+
+            invalidate_policy_cache()
+        return updated
 
     def delete_tool_policy(self, policy_id: str) -> bool:
         with self._conn() as conn:
@@ -2238,7 +2285,12 @@ class SQLiteBackend:
                 sa.delete(tool_policies).where(tool_policies.c.policy_id == policy_id)
             )
             conn.commit()
-            return result.rowcount > 0
+            deleted = result.rowcount > 0
+        if deleted:
+            from turnstone.core.policy import invalidate_policy_cache
+
+            invalidate_policy_cache()
+        return deleted
 
     # -- Prompt templates ------------------------------------------------------
 
@@ -2934,6 +2986,7 @@ class SQLiteBackend:
         until: str = "",
         limit: int = 100,
         offset: int = 0,
+        resource_id: str = "",
     ) -> list[dict[str, Any]]:
         with self._conn() as conn:
             q = sa.select(
@@ -2955,6 +3008,8 @@ class SQLiteBackend:
                 q = q.where(audit_events.c.timestamp >= since)
             if until:
                 q = q.where(audit_events.c.timestamp <= until)
+            if resource_id:
+                q = q.where(audit_events.c.resource_id == resource_id)
             q = q.limit(limit).offset(offset)
             rows = conn.execute(q).fetchall()
             return [
@@ -3040,6 +3095,34 @@ class SQLiteBackend:
                     "created": now,
                 },
             )
+            conn.commit()
+
+    def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
+        if not verdicts:
+            return
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        rows = [
+            {
+                "verdict_id": v.get("verdict_id", ""),
+                "ws_id": v.get("ws_id", ""),
+                "call_id": v.get("call_id", ""),
+                "func_name": v.get("func_name", ""),
+                "func_args": v.get("func_args", ""),
+                "intent_summary": v.get("intent_summary", ""),
+                "risk_level": v.get("risk_level", "medium"),
+                "confidence": v.get("confidence", 0.5),
+                "recommendation": v.get("recommendation", "review"),
+                "reasoning": v.get("reasoning", ""),
+                "evidence": v.get("evidence", ""),
+                "tier": v.get("tier", "heuristic"),
+                "judge_model": v.get("judge_model", ""),
+                "latency_ms": v.get("latency_ms", 0),
+                "created": now,
+            }
+            for v in verdicts
+        ]
+        with self._conn() as conn:
+            conn.execute(sa.insert(intent_verdicts), rows)
             conn.commit()
 
     def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:

@@ -330,10 +330,81 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=StatusResponse,
         )
 
+    # -- coordinator workstreams (P1.5: parity with interactive) -------------
+    #
+    # These hit the console directly — coordinator workstreams live on
+    # the console process, no routing-proxy hop. URL shape mirrors
+    # interactive (``/v1/api/workstreams/{ws_id}/*``) since Stage 2 P0.
+
+    async def coordinator_send(
+        self,
+        ws_id: str,
+        message: str,
+        *,
+        attachment_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Send a message to a coordinator workstream.
+
+        ``attachment_ids`` reserves attachments under the message's
+        ``send_id`` token; pass ``None`` to auto-consume the caller's
+        pending attachments, or ``[]`` to disable auto-consume.
+        """
+        body: dict[str, Any] = {"message": message}
+        if attachment_ids is not None:
+            body["attachment_ids"] = attachment_ids
+        return await self._request("POST", f"/v1/api/workstreams/{ws_id}/send", json_body=body)
+
+    async def coordinator_upload_attachment(
+        self,
+        ws_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        mime_type: str | None = None,
+    ) -> UploadAttachmentResponse:
+        """Upload a file attachment to a coordinator workstream."""
+        files: list[tuple[str, tuple[str, bytes, str]]] = [
+            (
+                "file",
+                (filename, data, mime_type or "application/octet-stream"),
+            )
+        ]
+        return await self._request(
+            "POST",
+            f"/v1/api/workstreams/{ws_id}/attachments",
+            files=files,
+            response_model=UploadAttachmentResponse,
+        )
+
+    async def coordinator_list_attachments(self, ws_id: str) -> ListAttachmentsResponse:
+        """List the caller's pending attachments for a coordinator workstream."""
+        return await self._request(
+            "GET",
+            f"/v1/api/workstreams/{ws_id}/attachments",
+            response_model=ListAttachmentsResponse,
+        )
+
+    async def coordinator_get_attachment_content(self, ws_id: str, attachment_id: str) -> bytes:
+        """Fetch the raw bytes of a coordinator attachment."""
+        return await self._request_bytes(
+            "GET",
+            f"/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        )
+
+    async def coordinator_delete_attachment(self, ws_id: str, attachment_id: str) -> StatusResponse:
+        """Delete a pending coordinator attachment."""
+        return await self._request(
+            "DELETE",
+            f"/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+            response_model=StatusResponse,
+        )
+
     async def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
         """Send a message via the routing proxy."""
         return await self._request(
-            "POST", "/v1/api/route/send", json_body={"message": message, "ws_id": ws_id}
+            "POST",
+            f"/v1/api/route/workstreams/{ws_id}/send",
+            json_body={"message": message},
         )
 
     async def route_approve(
@@ -345,12 +416,14 @@ class AsyncTurnstoneConsole(_BaseClient):
         always: bool = False,
     ) -> dict[str, Any]:
         """Approve or reject a pending tool call via the routing proxy."""
-        body: dict[str, Any] = {"ws_id": ws_id, "approved": approved}
+        body: dict[str, Any] = {"approved": approved}
         if feedback:
             body["feedback"] = feedback
         if always:
             body["always"] = True
-        return await self._request("POST", "/v1/api/route/approve", json_body=body)
+        return await self._request(
+            "POST", f"/v1/api/route/workstreams/{ws_id}/approve", json_body=body
+        )
 
     async def route_plan_feedback(self, *, ws_id: str, feedback: str) -> dict[str, Any]:
         """Send plan feedback via the routing proxy."""
@@ -360,16 +433,16 @@ class AsyncTurnstoneConsole(_BaseClient):
 
     async def route_close(self, ws_id: str) -> dict[str, Any]:
         """Close a workstream via the routing proxy."""
-        return await self._request(
-            "POST", "/v1/api/route/workstreams/close", json_body={"ws_id": ws_id}
-        )
+        return await self._request("POST", f"/v1/api/route/workstreams/{ws_id}/close", json_body={})
 
     async def route_cancel(self, ws_id: str, *, force: bool = False) -> dict[str, Any]:
         """Cancel the current turn via the routing proxy."""
-        body: dict[str, Any] = {"ws_id": ws_id}
+        body: dict[str, Any] = {}
         if force:
             body["force"] = True
-        return await self._request("POST", "/v1/api/route/cancel", json_body=body)
+        return await self._request(
+            "POST", f"/v1/api/route/workstreams/{ws_id}/cancel", json_body=body
+        )
 
     async def route_command(self, *, ws_id: str, command: str) -> dict[str, Any]:
         """Send a slash command via the routing proxy."""
@@ -1193,6 +1266,42 @@ class TurnstoneConsole:
 
     def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
         return self._runner.run(self._async.route_send(message, ws_id))
+
+    # -- coordinator workstreams (P1.5: parity with interactive) -------------
+
+    def coordinator_send(
+        self,
+        ws_id: str,
+        message: str,
+        *,
+        attachment_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self._runner.run(
+            self._async.coordinator_send(ws_id, message, attachment_ids=attachment_ids)
+        )
+
+    def coordinator_upload_attachment(
+        self,
+        ws_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        mime_type: str | None = None,
+    ) -> UploadAttachmentResponse:
+        return self._runner.run(
+            self._async.coordinator_upload_attachment(ws_id, filename, data, mime_type=mime_type)
+        )
+
+    def coordinator_list_attachments(self, ws_id: str) -> ListAttachmentsResponse:
+        return self._runner.run(self._async.coordinator_list_attachments(ws_id))
+
+    def coordinator_get_attachment_content(self, ws_id: str, attachment_id: str) -> bytes:
+        return self._runner.run(
+            self._async.coordinator_get_attachment_content(ws_id, attachment_id)
+        )
+
+    def coordinator_delete_attachment(self, ws_id: str, attachment_id: str) -> StatusResponse:
+        return self._runner.run(self._async.coordinator_delete_attachment(ws_id, attachment_id))
 
     # -- routing proxy: attachments -----------------------------------------
 

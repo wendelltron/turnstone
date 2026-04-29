@@ -13,6 +13,7 @@ import json
 import queue
 import threading
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from starlette.testclient import TestClient
@@ -67,6 +68,66 @@ class _FakeUI:
         self._ws_activity_state = ""
         self._ws_messages = 0
         self._ws_turn_tool_calls = 0
+        self._llm_verdicts: dict[str, dict[str, Any]] = {}
+
+    def serialize_pending_approval_detail(self) -> dict[str, Any] | None:
+        # Mirrors SessionUIBase.serialize_pending_approval_detail —
+        # the fake is monkeypatched in for ``WebUI`` and the dashboard
+        # handler reads this method during projection. Real subclasses
+        # inherit from ``SessionUIBase``; the fake replicates the
+        # shape directly to stay decoupled.
+        pending = self._pending_approval
+        if pending is None:
+            return None
+        items = pending.get("items") or []
+        if not items:
+            return None
+        call_ids = [item.get("call_id", "") for item in items]
+        # Match the real impl's pattern (session_ui_base.py): snapshot
+        # references under the lock, copy after release. Writers only
+        # assign — never mutate — so the reference snapshot is stable
+        # outside the lock window.
+        with self._ws_lock:
+            verdict_refs = {
+                cid: self._llm_verdicts[cid]
+                for cid in call_ids
+                if cid and cid in self._llm_verdicts
+            }
+        verdicts = {cid: dict(v) for cid, v in verdict_refs.items()}
+        serialized: list[dict[str, Any]] = []
+        for item in items:
+            cid = item.get("call_id", "")
+            serialized.append(
+                {
+                    "call_id": cid,
+                    "header": item.get("header", ""),
+                    "preview": item.get("preview", ""),
+                    "func_name": item.get("func_name", ""),
+                    "approval_label": item.get("approval_label", ""),
+                    "needs_approval": item.get("needs_approval", False),
+                    "error": item.get("error"),
+                    "heuristic_verdict": item.get("verdict"),
+                    "judge_verdict": verdicts.get(cid),
+                }
+            )
+        # Primary call_id must mirror the real serializer: first
+        # *non-empty* in list order, not just first. Aligning the
+        # fake here keeps test-vs-prod behavioural drift from
+        # masking a real-shape regression.
+        primary = next((cid for cid in call_ids if cid), "")
+        return {
+            "call_id": primary,
+            "judge_pending": bool(pending.get("judge_pending", False)),
+            "items": serialized,
+        }
+
+    def serialize_recent_auto_approvals(self) -> list[dict[str, Any]]:
+        # Empty buffer for tests that don't exercise the auto-approve
+        # visibility path.  /dashboard handler reads this method
+        # unconditionally now (paired with serialize_pending_approval_detail);
+        # returning [] keeps the row payload compatible without
+        # modeling the full ring buffer in the fake.
+        return []
 
     def _register_listener(self) -> queue.Queue[dict[str, Any]]:
         q: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -131,10 +192,11 @@ class _FakeSession:
 @pytest.fixture
 def app_client(tmp_path, monkeypatch):
     """Full turnstone-server app with in-memory workstreams + fake sessions."""
+    from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
     from turnstone.core.metrics import MetricsCollector
+    from turnstone.core.session_manager import SessionManager
     from turnstone.core.storage import get_storage, init_storage, reset_storage
-    from turnstone.core.workstream import WorkstreamManager
-    from turnstone.server import create_app
+    from turnstone.server import WebUI, create_app
 
     reset_storage()
     init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -148,8 +210,19 @@ def app_client(tmp_path, monkeypatch):
         uid = getattr(ui, "_user_id", "")
         return _FakeSession(ws_id=ws_id, user_id=uid)
 
-    mgr = WorkstreamManager(_factory, max_workstreams=10, node_id="node-test")
-    gq: queue.Queue[dict[str, Any]] = queue.Queue()
+    gq: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
+    WebUI._global_queue = gq
+    adapter = InteractiveAdapter(
+        global_queue=gq,
+        ui_factory=lambda ws: _FakeUI(
+            ws_id=ws.id,
+            user_id=ws.user_id,
+        ),
+        session_factory=_factory,
+    )
+    mgr = SessionManager(
+        adapter, storage=get_storage(), max_active=10, node_id="node-test", event_emitter=adapter
+    )
     app = create_app(
         workstreams=mgr,
         global_queue=gq,
@@ -229,7 +302,19 @@ class TestKindValidationOnCreate:
 
 
 class TestOpenKindGate:
-    """POST /v1/api/workstreams/{ws_id}/open refuses coordinator rows."""
+    """POST /v1/api/workstreams/{ws_id}/open refuses coordinator rows.
+
+    Post-lift behavior change: the lifted ``open`` body delegates the
+    kind check to ``SessionManager.open()`` (which returns ``None``
+    for kind mismatch / missing row / tombstone — all the
+    "manager has no such ws_id" cases). The pre-lift handler had a
+    separate pre-mgr storage probe that returned a kind-specific
+    400 ("Workstream is not an interactive kind"); the lift
+    consolidates on a single 404 ("Workstream not found"). Security
+    boundary unchanged — caller still can't open a coord row from
+    the interactive node — but the error code + message converge
+    with the rest of the not-found paths.
+    """
 
     def test_refuses_to_open_coordinator(self, app_client):
         from turnstone.core.storage import get_storage
@@ -248,8 +333,8 @@ class TestOpenKindGate:
             "/v1/api/workstreams/coord-1/open",
             headers=_auth("user-1"),
         )
-        assert resp.status_code == 400
-        assert "interactive" in resp.json()["error"].lower()
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["error"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +347,10 @@ def _register_ws(storage: Any, ws_id: str, owner: str) -> None:
 
 
 class TestCrossTenantDelete:
-    def test_non_owner_cannot_delete(self, app_client):
+    def test_any_caller_can_delete(self, app_client):
+        # Trusted-team model: scope auth gates the endpoint, not
+        # row-level ownership.  ``user_id`` stays on audit + storage
+        # metadata.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -273,9 +361,7 @@ class TestCrossTenantDelete:
             "/v1/api/workstreams/ws-victim/delete",
             headers=_auth("attacker-user"),
         )
-        assert resp.status_code == 404
-        # Victim's workstream still present in storage.
-        assert storage.get_workstream("ws-victim") is not None
+        assert resp.status_code == 200
 
     def test_owner_delete_records_audit(self, app_client):
         from turnstone.core.storage import get_storage
@@ -302,8 +388,8 @@ class TestCrossTenantApprove:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.post(
-            "/v1/api/approve",
-            json={"ws_id": "ws-victim", "approved": True},
+            "/v1/api/workstreams/ws-victim/approve",
+            json={"approved": True},
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
@@ -318,15 +404,19 @@ class TestCrossTenantClose:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.post(
-            "/v1/api/workstreams/close",
-            json={"ws_id": "ws-victim"},
+            "/v1/api/workstreams/ws-victim/close",
+            json={},
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
 
 
 class TestCrossTenantTitle:
-    def test_non_owner_cannot_refresh_title(self, app_client):
+    def test_refresh_title_requires_live_session(self, app_client):
+        # Trusted-team model: scope-level auth is the gate; any caller
+        # can hit the endpoint.  A not-currently-active workstream
+        # still 404s because the refresh needs the live session, not
+        # because of tenant mismatch.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -338,8 +428,13 @@ class TestCrossTenantTitle:
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
+        assert "not active" in resp.json().get("error", "") or "not found" in resp.json().get(
+            "error", ""
+        )
 
-    def test_non_owner_cannot_set_title(self, app_client):
+    def test_any_caller_can_set_title(self, app_client):
+        # Trusted-team model: title is editable by any authenticated
+        # caller; ``user_id`` remains metadata.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -348,14 +443,16 @@ class TestCrossTenantTitle:
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.post(
             "/v1/api/workstreams/ws-victim/title",
-            json={"title": "phishing title"},
+            json={"title": "updated title"},
             headers=_auth("attacker-user"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 class TestCrossTenantOpen:
-    def test_non_owner_cannot_open_persisted(self, app_client):
+    def test_any_caller_can_open_persisted(self, app_client):
+        # Trusted-team model: open is gated on scope auth, not on row
+        # ownership.  The persisted ``user_id`` stays as metadata.
         from turnstone.core.storage import get_storage
 
         client, _mgr = app_client
@@ -366,13 +463,17 @@ class TestCrossTenantOpen:
             "/v1/api/workstreams/ws-victim/open",
             headers=_auth("attacker-user"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
-class TestListWorkstreamsFiltered:
-    def test_list_excludes_other_tenants(self, app_client):
-        client, mgr = app_client
-        # Seed two workstreams in the in-memory manager — one per tenant.
+class TestListWorkstreamsTrustedTeamVisibility:
+    """Listing endpoints (/workstreams, /dashboard, /workstreams/saved)
+    return the cluster-wide set to any authenticated caller.  Mutations
+    are gated independently on the per-workstream handlers — see
+    TestCrossTenant{Delete,Approve,Close,Title,Open} for those gates."""
+
+    def test_list_returns_all_owners(self, app_client):
+        client, _mgr = app_client
         resp_a = client.post(
             "/v1/api/workstreams/new",
             json={"name": "a"},
@@ -386,16 +487,56 @@ class TestListWorkstreamsFiltered:
         assert resp_a.status_code == 200 and resp_b.status_code == 200
         ws_a, ws_b = resp_a.json()["ws_id"], resp_b.json()["ws_id"]
 
-        # user-a sees only ws_a.
+        # user-a now sees both.
         resp = client.get("/v1/api/workstreams", headers=_auth("user-a"))
         assert resp.status_code == 200
-        ids = {w["id"] for w in resp.json()["workstreams"]}
-        assert ws_a in ids
-        assert ws_b not in ids
+        # Row key renamed id → ws_id in the Stage 2 list-verb lift.
+        ids = {w["ws_id"] for w in resp.json()["workstreams"]}
+        assert {ws_a, ws_b}.issubset(ids), ids
+
+    def test_active_list_row_shape_includes_unified_fields(self, app_client):
+        """Stage 2 list-verb-lift parity regression — interactive
+        active-list row carries the always-include fields (ws_id,
+        name, state, kind, parent_ws_id, user_id) that the lifted
+        ``make_list_handler`` produces on every kind. Mirrors the
+        coord-side ``test_active_list_row_shape_includes_unified_fields``
+        in ``test_coordinator_endpoints.py`` so a future regression
+        that drops a field on either branch is caught."""
+        client, _mgr = app_client
+        create_resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "shape-check"},
+            headers=_auth("user-shape"),
+        )
+        assert create_resp.status_code == 200
+        ws_id = create_resp.json()["ws_id"]
+
+        resp = client.get("/v1/api/workstreams", headers=_auth("user-shape"))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "workstreams" in body
+        rows = [w for w in body["workstreams"] if w["ws_id"] == ws_id]
+        assert len(rows) == 1
+        row = rows[0]
+        # Always-include row shape — interactive populates kind=
+        # INTERACTIVE; user_id is post-lift parity (was coord-only).
+        assert set(row.keys()) == {
+            "ws_id",
+            "name",
+            "state",
+            "kind",
+            "parent_ws_id",
+            "user_id",
+        }
+        assert row["kind"] == "interactive"
+        assert row["user_id"] == "user-shape"
+        # parent_ws_id is None for top-level interactive workstreams
+        # (only coord-spawned children carry it).
+        assert row["parent_ws_id"] is None
 
 
-class TestDashboardFiltered:
-    def test_dashboard_aggregate_scoped_to_caller(self, app_client):
+class TestDashboardTrustedTeamVisibility:
+    def test_dashboard_aggregate_includes_all_owners(self, app_client):
         client, _mgr = app_client
         client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
         client.post("/v1/api/workstreams/new", json={"name": "b"}, headers=_auth("user-b"))
@@ -404,19 +545,70 @@ class TestDashboardFiltered:
         resp = client.get("/v1/api/dashboard", headers=_auth("user-b"))
         assert resp.status_code == 200
         data = resp.json()
-        # user-b owns 2; aggregate total_count reflects filtered set.
-        assert data["aggregate"]["total_count"] == 2
+        # All three workstreams visible regardless of caller identity.
+        assert data["aggregate"]["total_count"] == 3
         owners = {w["user_id"] for w in data["workstreams"]}
-        assert owners == {"user-b"}
+        assert {"user-a", "user-b"}.issubset(owners)
+
+    def test_dashboard_pending_approval_detail_default_none(self, app_client):
+        """No pending approval → field is explicitly null on the wire so
+        consumers can distinguish "not present" from "absent key"."""
+        client, _mgr = app_client
+        client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
+        resp = client.get("/v1/api/dashboard", headers=_auth("user-a"))
+        assert resp.status_code == 200
+        rows = resp.json()["workstreams"]
+        assert len(rows) == 1
+        assert "pending_approval_detail" in rows[0]
+        assert rows[0]["pending_approval_detail"] is None
+
+    def test_dashboard_pending_approval_detail_merges_judge_verdict(self, app_client):
+        """When _pending_approval is set on a ws's UI, /dashboard
+        embeds the merged items + judge_verdict so coord live-bulk
+        callers can render inline approve/deny buttons."""
+        client, mgr = app_client
+        client.post("/v1/api/workstreams/new", json={"name": "a"}, headers=_auth("user-a"))
+        ws_id = next(iter(mgr.list_all())).id
+        ui = mgr.get(ws_id).ui
+        ui._pending_approval = {
+            "type": "approve_request",
+            "items": [
+                {
+                    "call_id": "c-1",
+                    "header": "bash",
+                    "preview": "$ ls",
+                    "func_name": "bash",
+                    "approval_label": "bash",
+                    "needs_approval": True,
+                }
+            ],
+            "judge_pending": False,
+        }
+        ui._llm_verdicts["c-1"] = {
+            "recommendation": "deny",
+            "risk_level": "crit",
+            "confidence": 0.93,
+            "tier": "llm",
+        }
+        resp = client.get("/v1/api/dashboard", headers=_auth("user-a"))
+        assert resp.status_code == 200
+        row = next(w for w in resp.json()["workstreams"] if w["ws_id"] == ws_id)
+        detail = row["pending_approval_detail"]
+        assert detail is not None
+        assert detail["call_id"] == "c-1"
+        assert detail["judge_pending"] is False
+        item = detail["items"][0]
+        assert item["func_name"] == "bash"
+        assert item["judge_verdict"]["recommendation"] == "deny"
+        assert item["judge_verdict"]["risk_level"] == "crit"
 
 
-class TestSavedWorkstreamsTenantScoping:
-    """Regression for Copilot review on #380: /v1/api/workstreams/saved
-    used to call list_workstreams_with_history with no tenant filter,
-    so every authenticated user could see every other user's saved
-    workstream aliases / titles / names.  Fix tightens to
-    ``list_workstreams_with_history(user_id=caller)`` with the
-    service-scope bypass matching _visible_workstreams."""
+class TestSavedWorkstreamsTrustedTeamVisibility:
+    """Listing returns the cluster-wide set across all owners.  Resuming
+    an owned saved workstream goes through the per-workstream ownership
+    gate on /open (see TestCrossTenantOpen); ownerless persisted rows
+    are claimable by any authenticated caller via /open, consistent
+    with the same trusted-team model."""
 
     def _seed(self, client):
         """Create two workstreams per user, each with a message so they
@@ -432,19 +624,16 @@ class TestSavedWorkstreamsTenantScoping:
         storage.save_message("bob-saved", "user", "bob's plan")
         return storage
 
-    def test_non_service_caller_sees_only_own_rows(self, app_client):
+    def test_any_caller_sees_all_rows(self, app_client):
         client, _mgr = app_client
         self._seed(client)
         resp = client.get("/v1/api/workstreams/saved", headers=_auth("alice"))
         assert resp.status_code == 200
-        rows = resp.json()["workstreams"]
-        ids = {r["ws_id"] for r in rows}
-        assert ids == {"alice-saved"}, f"alice must not see bob's saved rows: {ids}"
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
+        assert {"alice-saved", "bob-saved"}.issubset(ids), ids
 
     def test_service_scope_sees_all_rows(self, app_client):
-        """Cluster-wide visibility is preserved for service callers
-        (console collector, cluster tooling) so they can still hydrate
-        cross-tenant state when needed."""
+        """Service-scope still works — same set, different auth path."""
         client, _mgr = app_client
         self._seed(client)
         resp = client.get(
@@ -452,26 +641,26 @@ class TestSavedWorkstreamsTenantScoping:
             headers=_auth("cluster-collector", scopes=frozenset({"read", "service"})),
         )
         assert resp.status_code == 200
-        rows = resp.json()["workstreams"]
-        ids = {r["ws_id"] for r in rows}
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
         assert {"alice-saved", "bob-saved"}.issubset(ids)
 
-    def test_blank_sub_non_service_returns_empty(self, app_client):
-        """Defense-in-depth — a non-service token with an empty ``sub``
-        claim (orphan / migration-artifact auth path) must not match
-        every workstream with empty ``user_id``.  Fail closed."""
+    def test_orphan_rows_visible(self, app_client):
+        """Ownerless rows (empty user_id from migrations / startup
+        ``name="default"``) appear in the cluster-wide listing alongside
+        owned rows.  /open lets any authenticated caller claim them —
+        intentional under the trusted-team model — so the listing isn't
+        leaking anything the resume path wouldn't already grant."""
         client, _mgr = app_client
         storage = self._seed(client)
-        # Also seed an orphan row so the test would fail loudly if the
-        # handler leaked it.
         _register_ws(storage, "orphan-saved", "")
         storage.save_message("orphan-saved", "user", "orphan content")
         resp = client.get(
             "/v1/api/workstreams/saved",
-            headers=_auth("", scopes=frozenset({"read"})),
+            headers=_auth("alice", scopes=frozenset({"read"})),
         )
         assert resp.status_code == 200
-        assert resp.json()["workstreams"] == []
+        ids = {r["ws_id"] for r in resp.json()["workstreams"]}
+        assert "orphan-saved" in ids
 
     def test_coordinator_rows_excluded_even_for_service(self, app_client):
         """kind filter is orthogonal to the user_id filter — even a
@@ -555,7 +744,7 @@ class TestPerWsSseGate:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.get(
-            "/v1/api/events?ws_id=ws-victim",
+            "/v1/api/workstreams/ws-victim/events",
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
@@ -585,3 +774,180 @@ class TestAuditEventsOnMutations:
         assert matching, "audit row absent for newly created workstream"
         detail = json.loads(matching[0]["detail"])
         assert detail["kind"] == "interactive"
+
+
+class TestInteractiveCancelLifted:
+    """HTTP-level coverage for the post-lift interactive ``cancel``
+    handler at ``POST /v1/api/workstreams/{ws_id}/cancel``. The lifted
+    ``make_cancel_handler`` body is shared with coord. Pre-lift
+    ``cancel_generation`` was untested at the HTTP layer; coord
+    exercised the lifted body via ``test_coordinator_endpoints.py``.
+    This class adds the missing interactive-side parity."""
+
+    def _create_ws(self, client) -> str:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "cancel-target"},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        return resp.json()["ws_id"]
+
+    def test_cancel_returns_dropped_shape(self, app_client):
+        """Always-include shape: response carries ``dropped`` (the
+        forensic snapshot) regardless of whether anything was running."""
+        client, _mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert "dropped" in body
+        assert body["dropped"]["was_running"] is False
+
+    def test_cancel_force_clears_worker_thread_and_running_flag(self, app_client):
+        """Force-cancel parity with coord: clears ``worker_thread`` AND
+        ``_worker_running`` so a follow-up send doesn't route through
+        ``enqueue()`` to the abandoned worker's queue (bug-2 from the
+        cancel-lift /review). Mirrors
+        ``test_cancel_force_flag_abandons_worker_thread_and_emits_stream_end``
+        on the coord side."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        # Simulate an in-flight worker the lifted cancel needs to
+        # abandon. The fake session's cancel() is a no-op, so the
+        # cancel flag side-effect doesn't matter — what matters is
+        # the (worker_thread, _worker_running) pair after force-cancel.
+        ws._worker_running = True
+        ws.worker_thread = threading.Thread(target=lambda: None, daemon=True)
+
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={"force": True},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        # Both fields cleared together — invariant from session_worker
+        # ("readers gating on either flag see a coherent
+        # (worker_thread, _worker_running) pair").
+        assert ws.worker_thread is None
+        assert ws._worker_running is False
+
+    def test_cancel_returns_400_when_session_missing(self, app_client):
+        """Parity with coord: a placeholder workstream (session=None)
+        gets a 400 ``"No session"`` rather than a silent no-op 200.
+        Pre-lift interactive already returned 400 here; the lift
+        preserves the behaviour and propagates it to coord."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session = None  # force the build-failed shape
+
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "No session"
+
+
+from tests._replay_helpers import make_replay_mocks as _make_interactive_replay_mocks  # noqa: E402
+
+
+class TestInteractiveEventsLifted:
+    """Unit + HTTP coverage for the lifted ``events`` SSE handler.
+
+    Substantive coverage targets the ``_interactive_events_replay``
+    callback (the kind-specific initial-replay generator the lifted
+    body iterates before the live loop) and the legacy URL shim.
+    The live SSE loop itself (``ws_closed`` exit + ``is_disconnected``
+    check) is hard to assert against ``TestClient`` because each
+    event arrives as a separate ``data:`` line and the stream runs
+    forever; the loop is the same shape used by every other lifted
+    SSE-shaped path (cancel / close / open / send), so a regression
+    in the loop body would surface across many test files. Live-loop
+    smoke coverage is a deferred follow-up tracked in
+    ``1.5.0-stable-handoff.md``'s "Risk flags for the next session"
+    section.
+    """
+
+    def test_events_replay_yields_connected_first(self):
+        """Pre-lift ``events_sse`` yielded a ``connected`` event
+        first (model + skip_permissions). The lifted callback
+        preserves the order so client SSE handlers that key on
+        the connected event for state setup keep working."""
+        from turnstone.server import _interactive_events_replay
+
+        ws, ui, request = _make_interactive_replay_mocks()
+        out = list(_interactive_events_replay(ws, ui, request))
+        assert out[0]["type"] == "connected"
+        assert out[0]["model"] == "gpt-5"
+        assert out[0]["model_alias"] == "default"
+        assert out[0]["skip_permissions"] is False
+
+    def test_events_replay_includes_status_only_when_last_usage_present(self):
+        """The ``status`` event populates the per-tab token-usage
+        bar on resume. Skipped when ``session._last_usage`` is None
+        (a freshly-created workstream that hasn't completed a turn)."""
+        from turnstone.server import _interactive_events_replay
+
+        ws, ui, request = _make_interactive_replay_mocks()
+        out = list(_interactive_events_replay(ws, ui, request))
+        assert "status" not in {ev["type"] for ev in out}
+
+    def test_events_replay_yields_pending_approval_then_verdicts_then_plan(self):
+        """When both prompts are pending, the order is approval +
+        cached verdicts (so the client renders the prompt and then
+        the LLM-judge intent verdicts that fired during it), then
+        plan-review. Pre-lift ordering preserved."""
+        from turnstone.server import _interactive_events_replay
+
+        ws, ui, request = _make_interactive_replay_mocks(
+            _pending_approval={"type": "approve_request", "items": []},
+            _pending_plan_review={"type": "plan_review", "content": "..."},
+            _llm_verdicts={"v1": {"verdict_id": "v1", "tier": "judge"}},
+        )
+
+        out = list(_interactive_events_replay(ws, ui, request))
+        types = [ev["type"] for ev in out]
+        # The approve_request, then the intent_verdict, then the plan_review.
+        approve_idx = types.index("approve_request")
+        verdict_idx = types.index("intent_verdict")
+        plan_idx = types.index("plan_review")
+        assert approve_idx < verdict_idx < plan_idx
+
+    def test_events_replay_skips_when_session_missing(self):
+        """Defensive: a placeholder workstream whose session is
+        ``None`` (close-then-reopen race) yields an empty replay
+        rather than NPE'ing on ``session.model``. The lifted body
+        already 409s for missing UI; this guards the rare case
+        where UI exists but session was detached."""
+        from turnstone.server import _interactive_events_replay
+
+        ws = MagicMock()
+        ws.session = None
+        ui = MagicMock()
+        request = MagicMock()
+        out = list(_interactive_events_replay(ws, ui, request))
+        assert out == []
+
+    def test_events_path_keyed_url_resolves_to_404_for_unknown_ws(self, app_client):
+        """``GET /v1/api/workstreams/{ws_id}/events`` returns 404 for an
+        unknown ws_id. Pre-1.5 the same intent was tested against
+        ``GET /api/events?ws_id=...`` via the legacy query-keyed
+        adapter; that URL family was removed in 1.5 along with the
+        adapter."""
+        client, _mgr = app_client
+        resp = client.get(
+            "/v1/api/workstreams/does-not-exist/events",
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 404

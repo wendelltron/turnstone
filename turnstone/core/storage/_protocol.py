@@ -237,6 +237,7 @@ class StorageBackend(Protocol):
         *,
         kind: WorkstreamKind | str | None = None,
         user_id: str | None = None,
+        state: str | None = None,
     ) -> list[Any]:
         """List workstreams that have messages, ordered by updated DESC.
 
@@ -251,6 +252,12 @@ class StorageBackend(Protocol):
         uid from any tenant-visible endpoint; pass ``None`` for
         service-scoped callers that legitimately need cluster-wide
         visibility.  Mirrors the same contract on ``list_workstreams``.
+
+        ``state`` filters by lifecycle state — pass ``"closed"`` from the
+        coordinator "saved" surface so the list excludes deleted /
+        currently-active rows.  Default ``None`` preserves all-states
+        behaviour.  Accepts a string (rather than the WorkstreamState
+        enum) to match the on-disk column type.
         """
         ...
 
@@ -280,6 +287,16 @@ class StorageBackend(Protocol):
 
     def get_workstream_display_name(self, ws_id: str) -> str | None:
         """Return the alias (or title) for a workstream, or None if unset."""
+        ...
+
+    def get_workstream_display_names(self, ws_ids: list[str]) -> dict[str, str | None]:
+        """Bulk variant of :meth:`get_workstream_display_name`.
+
+        Returns a dict keyed on every requested ws_id. Missing rows
+        map to ``None``; the caller falls back to ``ws.name`` per-row.
+        Used by the lifted ``list`` verb to avoid the per-row
+        N+1 storage round-trip pre-lift had.
+        """
         ...
 
     def get_workstream_metadata(self, ws_id: str) -> dict[str, Any] | None:
@@ -1192,8 +1209,17 @@ class StorageBackend(Protocol):
         until: str = "",
         limit: int = 100,
         offset: int = 0,
+        resource_id: str = "",
     ) -> list[dict[str, Any]]:
-        """List audit events with optional filters, ordered by timestamp DESC."""
+        """List audit events with optional filters, ordered by timestamp DESC.
+
+        ``resource_id`` filters to events scoped to a single
+        workstream (or other resource id) — added so per-ws
+        consumers like
+        ``SessionUIBase.replay_recent_auto_approvals_from_audit``
+        can pull a workstream's bypass history without scanning
+        the full table.
+        """
         ...
 
     def count_audit_events(
@@ -1230,6 +1256,20 @@ class StorageBackend(Protocol):
         latency_ms: int,
     ) -> None:
         """Record an intent validation verdict."""
+        ...
+
+    def create_intent_verdicts_bulk(self, verdicts: list[dict[str, Any]]) -> None:
+        """Insert many intent_verdict rows in one transaction.
+
+        Each dict mirrors :meth:`create_intent_verdict`'s keyword args
+        (``verdict_id`` / ``ws_id`` / ``call_id`` / ``func_name`` /
+        ``func_args`` / ``intent_summary`` / ``risk_level`` /
+        ``confidence`` / ``recommendation`` / ``reasoning`` / ``evidence`` /
+        ``tier`` / ``judge_model`` / ``latency_ms``). Used by the
+        synchronous heuristic-verdict persistence loop in
+        ``approve_tools`` so a tool-heavy turn doesn't pay N×commit
+        latency before the approval prompt renders.
+        """
         ...
 
     def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:

@@ -145,9 +145,9 @@
     var opts = this._opts;
 
     var root = document.createElement("div");
-    root.className = "ts-composer";
+    root.className = "composer";
     var layout = opts.layout === "stacked" ? "stacked" : "inline";
-    if (layout === "stacked") root.classList.add("ts-composer--stacked");
+    if (layout === "stacked") root.classList.add("composer--stacked");
     this.el = root;
 
     // Attachment chips row — always present in the DOM when attachments
@@ -155,7 +155,7 @@
     // by CSS until populated.
     if (opts.attachments) {
       this.chipsEl = document.createElement("div");
-      this.chipsEl.className = "ts-composer-chips";
+      this.chipsEl.className = "composer-chips";
       this.chipsEl.setAttribute("role", "list");
       this.chipsEl.setAttribute("aria-label", "Pending attachments");
       root.appendChild(this.chipsEl);
@@ -169,14 +169,14 @@
     var actionRow;
     if (layout === "stacked") {
       textRow = document.createElement("div");
-      textRow.className = "ts-composer-text";
+      textRow.className = "composer-text";
       root.appendChild(textRow);
       actionRow = document.createElement("div");
-      actionRow.className = "ts-composer-row";
+      actionRow.className = "composer-row";
       root.appendChild(actionRow);
     } else {
       actionRow = document.createElement("div");
-      actionRow.className = "ts-composer-row";
+      actionRow.className = "composer-row";
       root.appendChild(actionRow);
       textRow = actionRow;
     }
@@ -199,7 +199,7 @@
       return;
     }
     this.attachBtn = makeButton({
-      className: "ts-composer-attach",
+      className: "composer-attach",
       text: "\ud83d\udcce",
       ariaLabel: "Attach files",
       title: "Attach files",
@@ -216,7 +216,7 @@
 
   Composer.prototype._buildInput = function (row, opts) {
     this.inputEl = document.createElement("textarea");
-    this.inputEl.className = "ts-composer-input";
+    this.inputEl.className = "composer-input";
     this.inputEl.rows = opts.rows && opts.rows > 0 ? opts.rows : 1;
     var defaultPlaceholder = this._isTouch
       ? "Type a message\u2026"
@@ -244,7 +244,7 @@
           ? "Queue"
           : this._sendLabel;
     this.sendBtn = makeButton({
-      className: "ts-composer-send",
+      className: "composer-send",
       text: this._sendLabel,
       ariaLabel: this._sendLabel + " message",
     });
@@ -258,7 +258,7 @@
     }
     this._stopLabel = opts.stopLabel || "\u25a0 Stop";
     this.stopBtn = makeButton({
-      className: "ts-composer-stop",
+      className: "composer-stop",
       text: this._stopLabel,
       ariaLabel: "Stop generation",
     });
@@ -275,23 +275,23 @@
     }
     this.optionsBtn = document.createElement("button");
     this.optionsBtn.type = "button";
-    this.optionsBtn.className = "ts-composer-options-btn";
+    this.optionsBtn.className = "composer-options-btn";
     this.optionsBtn.setAttribute("aria-label", "Toggle options");
     this.optionsBtn.setAttribute("title", "Options");
     this.optionsBtn.setAttribute("aria-expanded", "false");
     var labelSpan = document.createElement("span");
-    labelSpan.className = "ts-composer-options-btn-label";
+    labelSpan.className = "composer-options-btn-label";
     labelSpan.textContent = opts.options.toggleLabel || "Options";
     this.optionsBtn.appendChild(labelSpan);
     var caret = document.createElement("span");
-    caret.className = "ts-composer-options-caret";
+    caret.className = "composer-options-caret";
     caret.setAttribute("aria-hidden", "true");
     caret.textContent = "\u25be"; // ▾
     this.optionsBtn.appendChild(caret);
     row.appendChild(this.optionsBtn);
 
     this.optionsSummaryEl = document.createElement("span");
-    this.optionsSummaryEl.className = "ts-composer-options-summary";
+    this.optionsSummaryEl.className = "composer-options-summary";
     this.optionsSummaryEl.setAttribute("aria-live", "polite");
     this.optionsSummaryEl.hidden = true;
     row.appendChild(this.optionsSummaryEl);
@@ -304,10 +304,9 @@
       return;
     }
     this.optionsPanel = document.createElement("div");
-    this.optionsPanel.className = "ts-composer-options-panel";
+    this.optionsPanel.className = "composer-options-panel";
     this.optionsPanel.hidden = true;
-    var panelId =
-      "ts-composer-options-" + Math.random().toString(36).slice(2, 10);
+    var panelId = "composer-options-" + Math.random().toString(36).slice(2, 10);
     this.optionsPanel.id = panelId;
     this.optionsBtn.setAttribute("aria-controls", panelId);
 
@@ -321,7 +320,7 @@
 
   Composer.prototype._buildOptionField = function (field, idx, panelId) {
     var rowEl = document.createElement("div");
-    rowEl.className = "ts-composer-options-field";
+    rowEl.className = "composer-options-field";
 
     var lbl = document.createElement("label");
     lbl.textContent = field.label || field.id || "";
@@ -346,7 +345,7 @@
       if (field.autocomplete) ctrl.autocomplete = field.autocomplete;
     }
     ctrl.id = ctrlId;
-    ctrl.className = "ts-composer-options-control";
+    ctrl.className = "composer-options-control";
     if (field.initial != null) ctrl.value = String(field.initial);
     rowEl.appendChild(ctrl);
 
@@ -567,7 +566,7 @@
     // --queue class is queue-specific (the colour flip signals "this
     // button now queues rather than sends").
     this.sendBtn.classList.toggle(
-      "ts-composer-send--queue",
+      "composer-send--queue",
       !!(b && opts.queueWhileBusy),
     );
     // Placeholder swap applies whenever busy, not only in queue mode —

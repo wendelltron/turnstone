@@ -255,7 +255,7 @@ Pane.prototype._createDOM = function () {
   this.composer = new Composer(this.el, {
     attachments: {
       onAttach: function (file) {
-        self.uploadAttachment(file);
+        self.attachments.upload(file);
       },
     },
     stopBtn: true,
@@ -269,7 +269,6 @@ Pane.prototype._createDOM = function () {
     },
     dragDrop: { targetEl: this.el, dropClass: "pane-drop-target" },
   });
-  this.attachChipsEl = this.composer.chipsEl;
   this.inputEl = this.composer.inputEl;
   this.sendBtn = this.composer.sendBtn;
   this.stopBtn = this.composer.stopBtn;
@@ -571,30 +570,19 @@ Pane.prototype.disconnectSSE = function () {
   this.stopTTSPlayback();
 };
 
+// composer.setBusy runs unconditionally so the Stop button label /
+// dataset.forceCancel / placeholder stay canonical even on a redundant
+// call (Pane.reset() and any future caller relies on that idempotent
+// reset). queue.onIdleEdge runs only on the actual edge — it carries
+// the heavier work (querySelectorAll-driven promote sweep + cancel-
+// timer cleanup wired via the queue's onIdle hook).
 Pane.prototype.setBusy = function (b) {
-  this.busy = b;
-  this.messagesEl.dataset.busy = b ? "true" : "false";
-  // Composer owns send/stop button display, label rotation, and the
-  // stop button's "■ Stop" / aria-label / dataset reset on every
-  // transition (so cancelGeneration's transient "Cancelling…" label
-  // doesn't persist into the next busy cycle).
-  this.composer.setBusy(b);
-  if (!b) this._promoteQueuedMessages();
-};
-
-Pane.prototype._promoteQueuedMessages = function () {
-  var queuedMsgs = this.messagesEl.querySelectorAll(".msg-queued");
-  for (var i = 0; i < queuedMsgs.length; i++) {
-    var el = queuedMsgs[i];
-    el.classList.remove("msg-queued", "msg-queued-important");
-    delete el.dataset.msgId;
-    el.removeAttribute("role");
-    el.removeAttribute("aria-label");
-    var badge = el.querySelector(".queued-badge");
-    if (badge) badge.remove();
-    var dismiss = el.querySelector(".queued-dismiss");
-    if (dismiss) dismiss.remove();
-  }
+  var next = !!b;
+  this.composer.setBusy(next);
+  this.messagesEl.dataset.busy = next ? "true" : "false";
+  var edge = next !== this.busy;
+  this.busy = next;
+  if (edge && !next) this.queue.onIdleEdge();
 };
 
 Pane.prototype.showEmptyState = function () {
@@ -617,12 +605,12 @@ Pane.prototype.connectSSE = function (wsId) {
   var wsChanged = this.wsId !== wsId;
   this.wsId = wsId;
   if (wsChanged) {
-    this.clearAttachmentChips();
-    this.rehydrateAttachments();
+    this.attachments.clearChips();
+    this.attachments.rehydrate();
   }
 
   this.evtSource = new EventSource(
-    "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
+    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events",
   );
 
   this.evtSource.onopen = function () {
@@ -655,7 +643,7 @@ Pane.prototype.connectSSE = function (wsId) {
           return r.json().then(function (data) {
             workstreams = {};
             (data.workstreams || []).forEach(function (ws) {
-              workstreams[ws.id] = { name: ws.name, state: ws.state };
+              workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
             });
             renderTabBar();
             // Reconnect all disconnected panes, reassigning stale ws_ids.
@@ -750,7 +738,7 @@ Pane.prototype.handleEvent = function (evt) {
       this.removeThinkingIndicator();
       if (!this.currentReasoningEl) {
         this.currentReasoningEl = document.createElement("div");
-        this.currentReasoningEl.className = "ts-msg ts-msg--reasoning";
+        this.currentReasoningEl.className = "msg reasoning";
         this.messagesEl.appendChild(this.currentReasoningEl);
       }
       this.currentReasoningEl.textContent += evt.text;
@@ -764,14 +752,9 @@ Pane.prototype.handleEvent = function (evt) {
       }
       if (!this.currentAssistantEl) {
         this.currentAssistantEl = document.createElement("div");
-        this.currentAssistantEl.className = "ts-msg ts-msg--assistant";
-        // streamingRender targets a .ts-msg-body inner wrapper so the
-        // shared markdown rules in chat.css (h1/h2/h3/code/blockquote
-        // scoped to .ts-msg-body *) actually match on this page — the
-        // coordinator page uses the same .ts-msg-body wrapper so the
-        // two chat views stay visually aligned.
+        this.currentAssistantEl.className = "msg assistant";
         this.currentAssistantBodyEl = document.createElement("div");
-        this.currentAssistantBodyEl.className = "ts-msg-body";
+        this.currentAssistantBodyEl.className = "msg-body";
         this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
         this.messagesEl.appendChild(this.currentAssistantEl);
       }
@@ -941,7 +924,7 @@ Pane.prototype.handleEvent = function (evt) {
     case "connected":
       this.model = evt.model || "";
       this.modelAlias = evt.model_alias || evt.model || "";
-      this._sbModel.textContent = this.modelAlias || this.model || "";
+      this._sbModel.textContent = this.modelAlias || this.model || "—";
       this._sbModel.title = this.model || "";
       if (evt.skip_permissions) {
         var existing = document.querySelector(".skip-permissions-warning");
@@ -950,7 +933,7 @@ Pane.prototype.handleEvent = function (evt) {
           warn.className = "skip-permissions-warning";
           warn.textContent =
             "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
-          document.getElementById("header").appendChild(warn);
+          document.getElementById("ui-header").appendChild(warn);
         }
       }
       break;
@@ -963,11 +946,14 @@ Pane.prototype.handleEvent = function (evt) {
         this._pendingEditSend = null;
         this.setBusy(true);
         this.addUserMessage(editText);
-        authFetch("/v1/api/send", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: editText, ws_id: self.wsId }),
-        }).catch(function (err) {
+        authFetch(
+          "/v1/api/workstreams/" + encodeURIComponent(self.wsId) + "/send",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: editText }),
+          },
+        ).catch(function (err) {
           self.addErrorMessage("Connection error: " + err.message);
           self.setBusy(false);
         });
@@ -1788,7 +1774,7 @@ Pane.prototype.playLastAssistantTTS = function () {
 Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--user";
+  el.className = "msg user";
   var textEl = document.createElement("div");
   textEl.className = "msg-user-text";
   textEl.textContent = text;
@@ -1833,83 +1819,15 @@ Pane.prototype.addUserMessage = function (text, attachments) {
   this.scrollToBottom(true);
 };
 
-Pane.prototype.addQueuedMessage = function (text, priority) {
-  this.removeEmptyState();
-  var self = this;
-  var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--user msg-queued";
-  el.setAttribute("role", "status");
-  if (priority === "important") {
-    el.classList.add("msg-queued-important");
-    el.setAttribute("aria-label", "Important message queued: " + text);
-  } else {
-    el.setAttribute("aria-label", "Message queued: " + text);
-  }
-  var badge = document.createElement("span");
-  badge.className = "queued-badge";
-  badge.setAttribute("aria-hidden", "true");
-  badge.textContent = priority === "important" ? "queued (!!!) " : "queued ";
-  el.appendChild(badge);
-  el.appendChild(document.createTextNode(text));
-  // Dismiss button — remove from queue before injection
-  var dismiss = document.createElement("button");
-  dismiss.className = "queued-dismiss";
-  dismiss.title = "Remove from queue";
-  dismiss.setAttribute("aria-label", "Remove queued message");
-  dismiss.textContent = "\u00d7";
-  dismiss.addEventListener("click", function (e) {
-    e.stopPropagation();
-    self._dequeueMessage(el);
-  });
-  el.appendChild(dismiss);
-  this.messagesEl.appendChild(el);
-  this.scrollToBottom(true);
-  return el;
-};
-
-Pane.prototype._dequeueMessage = function (el) {
-  var self = this;
-  var msgId = el.dataset.msgId;
-  if (!msgId) {
-    // ID not yet set — mark for deferred DELETE when send response arrives
-    el.dataset.pendingDismiss = "true";
-    el.remove();
-    return;
-  }
-  authFetch("/v1/api/send", {
-    method: "DELETE",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: this.wsId, msg_id: msgId }),
-  })
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      if (data.status === "removed") {
-        el.remove();
-      }
-      // Either path warrants a chip-strip refresh: a successful remove
-      // unreserves the attachments server-side, and a "not_found" means
-      // dispatch raced us so the actual pending state may differ from
-      // what the UI last saw.  Re-fetch to stay in sync.  (Leave the
-      // message bubble visible on not_found — the promote loop strips
-      // the queued styling on idle.)
-      self.rehydrateAttachments();
-    })
-    .catch(function () {
-      // Network error — don't remove, message may have been injected
-    });
-};
-
 Pane.prototype._addUserMsgActions = function (el, text) {
   var self = this;
   var bar = document.createElement("div");
-  bar.className = "msg-actions ts-msg-actions";
+  bar.className = "msg-actions";
   bar.setAttribute("role", "toolbar");
   bar.setAttribute("aria-label", "Message actions");
   // Edit button
   var editBtn = document.createElement("button");
-  editBtn.className = "msg-action-btn ts-msg-action-btn";
+  editBtn.className = "msg-action-btn";
   editBtn.title = "Edit & resend";
   editBtn.setAttribute("aria-label", "Edit and resend this message");
   var editIcon = document.createElement("span");
@@ -1923,7 +1841,7 @@ Pane.prototype._addUserMsgActions = function (el, text) {
   bar.appendChild(editBtn);
   // Rewind-to-here button
   var rewindBtn = document.createElement("button");
-  rewindBtn.className = "msg-action-btn ts-msg-action-btn";
+  rewindBtn.className = "msg-action-btn";
   rewindBtn.title = "Rewind to before this message";
   rewindBtn.setAttribute(
     "aria-label",
@@ -1946,13 +1864,13 @@ Pane.prototype._addRetryAction = function (el) {
   var bar = el.querySelector(".msg-actions");
   if (!bar) {
     bar = document.createElement("div");
-    bar.className = "msg-actions ts-msg-actions";
+    bar.className = "msg-actions";
     bar.setAttribute("role", "toolbar");
     bar.setAttribute("aria-label", "Message actions");
     el.appendChild(bar);
   }
   var btn = document.createElement("button");
-  btn.className = "msg-action-btn ts-msg-action-btn";
+  btn.className = "msg-action-btn";
   btn.title = "Retry (regenerate response)";
   btn.setAttribute("aria-label", "Retry last response");
   var icon = document.createElement("span");
@@ -1982,7 +1900,7 @@ Pane.prototype._rewindToMessage = function (msgEl) {
   if (this.busy) return;
   var self = this;
   // Count how many user messages come at or after this one
-  var userMsgs = this.messagesEl.querySelectorAll(".ts-msg--user");
+  var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
   var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
   if (idx < 0) return;
   var turnsToRewind = userMsgs.length - idx;
@@ -2066,7 +1984,7 @@ Pane.prototype._editAndResend = function (msgEl, newText) {
   if (this.busy) return;
   var self = this;
   // Count turns to rewind (from this message onward)
-  var userMsgs = this.messagesEl.querySelectorAll(".ts-msg--user");
+  var userMsgs = this.messagesEl.querySelectorAll(".msg.user");
   var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
   if (idx < 0) return;
   var turnsToRewind = userMsgs.length - idx;
@@ -2129,7 +2047,7 @@ Pane.prototype.replayHistory = function (messages) {
           var wasDenied = !!msg.denied;
           var block = document.createElement("div");
           block.className =
-            "ts-msg ts-approval ts-approval--inline " +
+            "msg ts-approval ts-approval--inline " +
             (wasDenied ? "denied" : "approved");
           msg.tool_calls.forEach(function (tc) {
             var div = document.createElement("div");
@@ -2184,9 +2102,9 @@ Pane.prototype.replayHistory = function (messages) {
       }
       if (msg.content) {
         var el = document.createElement("div");
-        el.className = "ts-msg ts-msg--assistant";
+        el.className = "msg assistant";
         var bodyEl = document.createElement("div");
-        bodyEl.className = "ts-msg-body";
+        bodyEl.className = "msg-body";
         var rendered = renderMarkdown(msg.content);
         bodyEl.innerHTML = rendered;
         el.appendChild(bodyEl);
@@ -2221,11 +2139,7 @@ Pane.prototype.replayHistory = function (messages) {
         }
         if (isToolError && !lastToolBlock.classList.contains("denied")) {
           lastToolBlock.classList.add("error");
-          var errorBdg = lastToolBlock.querySelector(".ts-approval-badge");
-          if (errorBdg) {
-            errorBdg.className = "ts-approval-badge ts-approval-badge--error";
-            errorBdg.textContent = "\u2717 error";
-          }
+          appendToolErrorBadge(lastToolBlock);
         }
       }
     }
@@ -2237,13 +2151,12 @@ Pane.prototype.replayHistory = function (messages) {
 
 Pane.prototype._attachRetryToLastAssistant = function () {
   // Remove any previous retry buttons
-  var old = this.messagesEl.querySelectorAll(".ts-msg--assistant .msg-actions");
+  var old = this.messagesEl.querySelectorAll(".msg.assistant .msg-actions");
   for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
   // Find the last assistant message with content and add retry.
-  // Reasoning blocks emit as .ts-msg--reasoning (distinct modifier)
-  // so the .ts-msg--assistant selector already excludes them — no
-  // extra guard needed.
-  var assistants = this.messagesEl.querySelectorAll(".ts-msg--assistant");
+  // Reasoning blocks emit as .msg.reasoning (distinct modifier) so the
+  // .msg.assistant selector already excludes them — no extra guard needed.
+  var assistants = this.messagesEl.querySelectorAll(".msg.assistant");
   if (assistants.length) {
     this._addRetryAction(assistants[assistants.length - 1]);
   }
@@ -2257,8 +2170,7 @@ Pane.prototype.showInlineToolBlock = function (
   var self = this;
   var block = document.createElement("div");
   block.className =
-    "ts-msg ts-approval ts-approval--inline" +
-    (autoApproved ? " approved" : "");
+    "msg ts-approval ts-approval--inline" + (autoApproved ? " approved" : "");
   if (!autoApproved) {
     block.setAttribute("role", "alertdialog");
     block.setAttribute("aria-label", "Tool approval required");
@@ -2269,13 +2181,17 @@ Pane.prototype.showInlineToolBlock = function (
 
   items.forEach(function (item) {
     block.appendChild(buildToolDiv(item));
-    // Render verdict badge if present
-    if (item.verdict) {
+    // Render verdict badge if present.  Server emits the heuristic
+    // verdict under ``heuristic_verdict`` (matches the api/server_schemas
+    // PendingApprovalItem shape).  Falls back to the legacy ``verdict``
+    // key in case a stale SSE payload arrives mid-deploy.
+    var heuristic = item.heuristic_verdict || item.verdict;
+    if (heuristic) {
       block.insertAdjacentHTML(
         "beforeend",
-        renderVerdictBadge(item.verdict, judgePending),
+        renderVerdictBadge(heuristic, judgePending),
       );
-      var rec = item.verdict.recommendation || "review";
+      var rec = heuristic.recommendation || "review";
       if (
         !glowRec ||
         rec === "deny" ||
@@ -2416,19 +2332,21 @@ Pane.prototype.resolveApproval = function (
   this.sendBtn.disabled = this.busy;
   this.inputEl.focus();
 
-  // POST to server with ws_id (skip when server already resolved, e.g. timeout)
+  // POST to server (skip when server already resolved, e.g. timeout)
   if (!skipPost) {
     var self = this;
-    authFetch("/v1/api/approve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        approved: approved,
-        feedback: feedback || null,
-        always: !!always,
-        ws_id: this.wsId,
-      }),
-    }).catch(function (err) {
+    authFetch(
+      "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/approve",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          approved: approved,
+          feedback: feedback || null,
+          always: !!always,
+        }),
+      },
+    ).catch(function (err) {
       self.addErrorMessage("Connection error: " + err.message);
     });
   }
@@ -2545,11 +2463,7 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
     var parentBlock = target.closest(".ts-approval");
     if (parentBlock && !parentBlock.classList.contains("denied")) {
       parentBlock.classList.add("error");
-      var badge = parentBlock.querySelector(".ts-approval-badge");
-      if (badge) {
-        badge.className = "ts-approval-badge ts-approval-badge--error";
-        badge.textContent = "\u2717 error";
-      }
+      appendToolErrorBadge(parentBlock);
     }
   }
 
@@ -2690,7 +2604,7 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
 
 Pane.prototype.addInfoMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--info";
+  el.className = "msg info";
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom();
@@ -2698,7 +2612,7 @@ Pane.prototype.addInfoMessage = function (text) {
 
 Pane.prototype.addErrorMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "ts-msg ts-msg--error";
+  el.className = "msg error";
   el.setAttribute("role", "alert");
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
@@ -2706,31 +2620,17 @@ Pane.prototype.addErrorMessage = function (text) {
 };
 
 Pane.prototype.updateStatus = function (evt) {
-  this._sbModel.textContent = this.modelAlias || this.model || "";
-  this._sbModel.title = this.model || "";
-
-  var tokenText =
-    evt.total_tokens.toLocaleString() +
-    " / " +
-    evt.context_window.toLocaleString() +
-    " (" +
-    evt.pct +
-    "%)";
-  if (evt.effort && evt.effort !== "medium")
-    tokenText += " \u00b7 " + evt.effort;
-  if (evt.pct >= 95) tokenText = "\u26a0 " + tokenText;
-  else if (evt.pct >= 80) tokenText = "\u25b2 " + tokenText;
-  this._sbTokens.textContent = tokenText;
-
-  var tc = evt.tool_calls_this_turn || 0;
-  this._sbTools.textContent = tc + " tool" + (tc !== 1 ? "s" : "");
-
-  var turns = evt.turn_count || 0;
-  this._sbTurns.textContent = "turn " + turns;
-
-  this.statusBarEl.classList.toggle("ws-sb-warn", evt.pct >= 80);
-  this.statusBarEl.classList.toggle("ws-sb-danger", evt.pct >= 95);
-
+  StatusBar.paint(
+    {
+      rootEl: this.statusBarEl,
+      modelEl: this._sbModel,
+      tokensEl: this._sbTokens,
+      toolsEl: this._sbTools,
+      turnsEl: this._sbTurns,
+    },
+    evt,
+    { alias: this.modelAlias, model: this.model },
+  );
   this._lastStatusEvt = evt;
 };
 
@@ -2768,103 +2668,69 @@ Pane.prototype.sendMessage = function () {
   var self = this;
   var isBusy = this.busy;
   var queuedEl = null;
-
-  // Snapshot attachments for this turn (stable-ids only — skip in-flight
-  // placeholders, which may not have server-assigned ids yet).
-  var attachmentList = [];
-  var attachmentIds = [];
-  this.pendingAttachments.forEach(function (info, id) {
-    if (info && !info.uploading) {
-      attachmentList.push(info);
-      attachmentIds.push(id);
-    }
-  });
+  var snap = this.attachments.snapshot();
 
   if (isBusy) {
-    // Queue message for injection at the next tool-result seam.
-    // Strip !!! prefix for display, show priority badge instead.
+    // Server re-parses the !!! prefix to set queue priority — the
+    // optimistic bubble strips it for display.
     var displayText = text;
     var priority = "notice";
     if (text.startsWith("!!!")) {
       displayText = text.slice(3).trimStart();
       priority = "important";
     }
-    queuedEl = this.addQueuedMessage(displayText, priority);
+    this.removeEmptyState();
+    queuedEl = this.queue.addQueuedMessage(displayText, priority);
   } else {
     this.setBusy(true);
-    this.addUserMessage(text, attachmentList);
+    this.addUserMessage(text, snap.attachments);
   }
   this.composer.clear();
   this._syncMediaButtons();
 
-  authFetch("/v1/api/send", {
+  authFetch("/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       message: text,
-      ws_id: this.wsId,
-      attachment_ids: attachmentIds,
+      attachment_ids: snap.attachment_ids,
     }),
   })
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
-      // Clear only the chips that were actually reserved/attached on
-      // the server; leftover (dropped) ones stay in the composer so
-      // the user can see what's still pending.
-      var _consumeChips = function () {
-        var attached = Array.isArray(data.attached_ids)
-          ? data.attached_ids
-          : null;
-        if (attached) {
-          attached.forEach(function (id) {
-            var chip = self.attachChipsEl.querySelector(
-              '[data-attachment-id="' + id + '"]',
-            );
-            if (chip) chip.remove();
-            self.pendingAttachments.delete(id);
-          });
-          if (
-            Array.isArray(data.dropped_attachment_ids) &&
-            data.dropped_attachment_ids.length
-          ) {
-            showToast(
-              "Some attachments couldn't be included (" +
-                data.dropped_attachment_ids.length +
-                ") — they're still in your composer.",
-            );
-          }
-        } else {
-          self.clearAttachmentChips();
-        }
-      };
-
-      if (data.status === "queued" && data.msg_id && queuedEl) {
-        if (queuedEl.dataset.pendingDismiss) {
-          // User dismissed before ID arrived — send deferred DELETE
-          authFetch("/v1/api/send", {
-            method: "DELETE",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ ws_id: self.wsId, msg_id: data.msg_id }),
-          });
-        } else {
-          queuedEl.dataset.msgId = data.msg_id;
-        }
-        _consumeChips();
+      if (data.status === "queued" && data.msg_id) {
+        // queuedEl-present path: bind() handles the three known races
+        // (pre-bind dismiss, promote sweep raced ahead, normal accept).
+        // queuedEl-absent path: client thought it was idle but the
+        // server saw a live worker (SSE state_change hadn't arrived
+        // yet). Flip busy so subsequent sends queue correctly; the
+        // optimistic user bubble is already in the log and the server
+        // still delivers the message on worker drain — accept the
+        // small UX gap (no in-UI dismiss for THIS message).
+        if (queuedEl) self.queue.bind(queuedEl, data.msg_id);
+        else self.setBusy(true);
+        self.attachments.consume(
+          data.attached_ids,
+          data.dropped_attachment_ids,
+        );
       } else if (data.status === "busy") {
-        if (queuedEl) queuedEl.remove();
+        if (queuedEl) self.queue.remove(queuedEl);
         self.addErrorMessage("Server is busy. Please wait.");
         if (!isBusy) self.setBusy(false);
       } else if (data.status === "queue_full") {
-        if (queuedEl) queuedEl.remove();
+        if (queuedEl) self.queue.remove(queuedEl);
         self.addErrorMessage("Message queue full. Please wait.");
       } else {
-        _consumeChips();
+        self.attachments.consume(
+          data.attached_ids,
+          data.dropped_attachment_ids,
+        );
       }
     })
     .catch(function (err) {
-      if (queuedEl) queuedEl.remove();
+      if (queuedEl) self.queue.remove(queuedEl);
       self.addErrorMessage("Connection error: " + err.message);
       if (!isBusy) self.setBusy(false);
     });
@@ -2875,11 +2741,14 @@ Pane.prototype.cancelGeneration = function () {
   var self = this;
   var isForce = this.stopBtn.dataset.forceCancel === "true";
   this.stopBtn.disabled = true;
-  authFetch("/v1/api/cancel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: this.wsId, force: isForce }),
-  })
+  authFetch(
+    "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/cancel",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: isForce }),
+    },
+  )
     .then(function () {
       if (isForce) {
         // Force cancel abandons the worker — transition immediately.
@@ -3941,7 +3810,21 @@ function updateTabIndicator(wsId, state, extra) {
 function switchTab(wsId) {
   closeTabDropdown();
   var pane = getFocusedPane();
-  if (!pane) return;
+  if (!pane) {
+    // Bootstrap the first pane on a fresh-loaded page that had no
+    // workstreams to render at init time. Without this, creating
+    // or opening a workstream from the dashboard left switchTab
+    // with nowhere to attach: it early-returned, no SSE connected,
+    // the chat UI showed nothing, and only a refresh fixed it
+    // (initWorkstreams creates the pane on a now-populated
+    // workstreams list). Mirrors the bootstrap block in
+    // initWorkstreams; renderLayout fires once so the pane DOM is
+    // attached before the rest of switchTab connects SSE.
+    pane = createPane(wsId);
+    splitRoot = { type: "leaf", pane: pane };
+    setFocusedPane(pane.id);
+    renderLayout();
+  }
   if (wsId === pane.wsId && !dashboardVisible) return;
 
   // Track last active for close_tab_action
@@ -4603,10 +4486,10 @@ function closeWorkstream(wsId) {
     return tab.dataset.wsId;
   });
 
-  authFetch("/v1/api/workstreams/close", {
+  authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/close", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: wsId }),
+    body: "{}",
   })
     .then(function (r) {
       return r.json();
@@ -4634,7 +4517,7 @@ function closeWorkstream(wsId) {
 function showDashboard() {
   dashboardVisible = true;
   document.getElementById("dashboard").classList.add("active");
-  document.getElementById("header").inert = true;
+  document.getElementById("ui-header").inert = true;
   document.getElementById("tab-bar").inert = true;
   document.getElementById("split-root").inert = true;
   loadDashboard();
@@ -4650,7 +4533,7 @@ function showDashboard() {
 function hideDashboard() {
   dashboardVisible = false;
   document.getElementById("dashboard").classList.remove("active");
-  document.getElementById("header").inert = false;
+  document.getElementById("ui-header").inert = false;
   document.getElementById("tab-bar").inert = false;
   document.getElementById("split-root").inert = false;
   document.getElementById("dashboard-input").value = "";
@@ -4685,7 +4568,7 @@ function loadDashboard() {
       renderDashboardTable(wsList, agg);
       var activeWsIds = {};
       wsList.forEach(function (ws) {
-        activeWsIds[ws.id] = true;
+        activeWsIds[ws.ws_id] = true;
       });
       var savedList = (res[1].workstreams || []).filter(function (s) {
         return !activeWsIds[s.ws_id];
@@ -4715,14 +4598,18 @@ function renderDashboardTable(wsList, agg) {
   }
   wsList.forEach(function (ws) {
     var liveState =
-      (workstreams[ws.id] && workstreams[ws.id].state) || ws.state || "idle";
+      (workstreams[ws.ws_id] && workstreams[ws.ws_id].state) ||
+      ws.state ||
+      "idle";
     var liveName =
-      (workstreams[ws.id] && workstreams[ws.id].name) || ws.name || ws.id;
+      (workstreams[ws.ws_id] && workstreams[ws.ws_id].name) ||
+      ws.name ||
+      ws.ws_id;
     var sd = STATE_DISPLAY[liveState] || STATE_DISPLAY.idle;
 
     var row = document.createElement("div");
     row.className = "dash-row";
-    row.dataset.wsId = ws.id;
+    row.dataset.wsId = ws.ws_id;
     row.dataset.state = liveState;
     row.setAttribute("role", "button");
     row.setAttribute("tabindex", "0");
@@ -4795,12 +4682,12 @@ function renderDashboardTable(wsList, agg) {
     row.appendChild(sub);
 
     row.onclick = function () {
-      dashboardSwitchWorkstream(ws.id);
+      dashboardSwitchWorkstream(ws.ws_id);
     };
     row.onkeydown = function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        dashboardSwitchWorkstream(ws.id);
+        dashboardSwitchWorkstream(ws.ws_id);
       }
     };
 
@@ -4843,27 +4730,41 @@ var _wsSavedItems = [];
 function renderSavedWorkstreams(items) {
   _wsSavedItems = items;
   var c = document.getElementById("dashboard-saved-cards");
-  c.innerHTML = "";
+  c.replaceChildren();
   if (!items.length) {
-    c.innerHTML = '<div class="dashboard-empty">No saved workstreams</div>';
+    var empty = document.createElement("div");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No saved workstreams";
+    c.appendChild(empty);
     return;
   }
   items.forEach(function (sess) {
-    var card = document.createElement("div");
-    card.className =
-      "dashboard-card" + (_wsDeleteMode ? " ws-delete-mode" : "");
-    card.dataset.wsId = sess.ws_id;
-    var label = sess.alias || sess.title || sess.ws_id;
-    card.setAttribute(
-      "aria-label",
-      _wsDeleteMode ? "Select: " + label : "Resume: " + label,
-    );
+    // Default card shape (title + meta + wsid + Resume click) comes from
+    // the shared /shared/cards.js helper so console (Saved Coordinators)
+    // and ui/static (Saved Workstreams) stay in lock-step.  Delete mode
+    // is interactive-only; we layer the checkbox + selection wiring on
+    // top of the shared card after construction.
+    var card = renderSessionCard(sess, {
+      ariaLabel: function (s) {
+        var label = s.alias || s.title || s.ws_id;
+        return _wsDeleteMode ? "Select: " + label : "Resume: " + label;
+      },
+      onActivate: function (s) {
+        // Suppressed in delete mode \u2014 the layered checkbox handler below
+        // owns clicks while delete-mode is active.
+        if (_wsDeleteMode) return;
+        dashboardResumeSession(s.ws_id);
+      },
+    });
 
     if (_wsDeleteMode) {
+      card.classList.add("ws-delete-mode");
+      card.removeAttribute("role"); // becomes a checkbox host, not a button
       var chk = document.createElement("input");
       chk.type = "checkbox";
       chk.className = "ws-card-check";
       chk.checked = !!_wsDeleteSelected[sess.ws_id];
+      var label = sess.alias || sess.title || sess.ws_id;
       chk.setAttribute("aria-label", "Select " + label + " for deletion");
       chk.onclick = function (e) {
         e.stopPropagation();
@@ -4872,8 +4773,9 @@ function renderSavedWorkstreams(items) {
         card.classList.toggle("ws-selected", chk.checked);
         updateWsDeleteBar();
       };
-      card.appendChild(chk);
-      card.setAttribute("tabindex", "0");
+      card.insertBefore(chk, card.firstChild);
+      // Override the shared helper's onclick/onkeydown \u2014 in delete mode
+      // a card click toggles the checkbox instead of activating Resume.
       card.onclick = function (e) {
         if (e.target === chk) return;
         chk.checked = !chk.checked;
@@ -4886,40 +4788,9 @@ function renderSavedWorkstreams(items) {
           chk.onclick(e);
         }
       };
-    } else {
-      card.setAttribute("role", "button");
-      card.setAttribute("tabindex", "0");
-      card.onclick = function () {
-        dashboardResumeSession(sess.ws_id);
-      };
-      card.onkeydown = function (e) {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          dashboardResumeSession(sess.ws_id);
-        }
-      };
+      if (_wsDeleteSelected[sess.ws_id]) card.classList.add("ws-selected");
     }
 
-    var title =
-      sess.alias || sess.title || sess.name || sess.ws_id.substring(0, 12);
-    var meta = sess.message_count + " msgs";
-    if (sess.updated) meta += " \u00b7 " + formatRelativeTime(sess.updated);
-    var inner = document.createElement("div");
-    inner.innerHTML =
-      '<div class="card-title">' +
-      escapeHtml(title) +
-      "</div>" +
-      '<div class="card-meta">' +
-      escapeHtml(meta) +
-      ' <span class="card-wsid">' +
-      escapeHtml(sess.ws_id.substring(0, 7)) +
-      "</span>" +
-      "</div>";
-    while (inner.firstChild) card.appendChild(inner.firstChild);
-
-    if (_wsDeleteMode && _wsDeleteSelected[sess.ws_id]) {
-      card.classList.add("ws-selected");
-    }
     c.appendChild(card);
   });
 }
@@ -5381,23 +5252,7 @@ function forkWorkstream(optWsId) {
   showNewWsModal(wsId);
 }
 
-function formatRelativeTime(iso) {
-  if (!iso) return "";
-  var s = iso.replace(" ", "T");
-  if (!s.endsWith("Z") && !s.includes("+")) s += "Z";
-  var d = new Date(s);
-  if (isNaN(d)) return "";
-  var now = new Date();
-  var ms = now - d;
-  var min = Math.floor(ms / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return min + "m ago";
-  var hr = Math.floor(min / 60);
-  if (hr < 24) return hr + "h ago";
-  var day = Math.floor(hr / 24);
-  if (day < 30) return day + "d ago";
-  return d.toLocaleDateString();
-}
+// formatRelativeTime moved to /shared/utils.js so both surfaces share it.
 
 function dashboardSwitchWorkstream(wsId) {
   if (workstreams[wsId]) {
@@ -5863,9 +5718,22 @@ function buildToolDiv(item) {
   div.dataset.callId = item.call_id || "";
 
   var name = document.createElement("div");
-  name.className = "tool-name";
+  name.className = "tool-name" + (item.error ? " tool-name--error" : "");
   name.textContent = item.func_name || "";
-  if (item.error) name.style.color = "var(--red)";
+  // Inline auto-approve indicator — surfaces tools that bypassed the
+  // operator approval gate (skill allowlist / blanket / admin policy /
+  // explicit "Approve + Always") right next to the tool name.  The
+  // coord-tree pill is bounded to the coord page; this small badge
+  // gives the operator the same signal on the per-ws page they
+  // navigated into.
+  if (item.auto_approved) {
+    var badge = document.createElement("span");
+    badge.className = "tool-auto-approved";
+    var reason = item.auto_approve_reason || "auto_approve_tools";
+    badge.textContent = " auto: " + reason;
+    badge.title = "Tool auto-approved (no operator prompt) — reason: " + reason;
+    name.appendChild(badge);
+  }
   div.appendChild(name);
 
   var cmd = document.createElement("div");
@@ -5967,6 +5835,20 @@ function toggleVerdictDetail(btn) {
     detail.style.display = isHidden ? "block" : "none";
     btn.textContent = isHidden ? "hide" : "details";
   }
+}
+
+// Append an "✗ error" pill to an approval block as a sibling of the
+// existing approved/denied/auto-approved pill, so the approval verdict
+// stays visible alongside the execution outcome. Idempotent — re-fires
+// (live + history rerender) do not stack badges.
+function appendToolErrorBadge(blockEl) {
+  if (!blockEl) return;
+  if (blockEl.querySelector(".ts-approval-badge--error")) return;
+  var errBadge = document.createElement("div");
+  errBadge.setAttribute("role", "status");
+  errBadge.className = "ts-approval-badge ts-approval-badge--error";
+  errBadge.textContent = "✗ error";
+  blockEl.appendChild(errBadge);
 }
 
 function makeCollapsible(el) {
@@ -6892,7 +6774,7 @@ function initWorkstreams() {
     })
     .then(function (data) {
       data.workstreams.forEach(function (ws) {
-        workstreams[ws.id] = { name: ws.name, state: ws.state };
+        workstreams[ws.ws_id] = { name: ws.name, state: ws.state };
       });
       connectGlobalSSE();
       var wsIds = Object.keys(workstreams);

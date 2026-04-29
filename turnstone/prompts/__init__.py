@@ -59,13 +59,14 @@ _ENV_MAP: dict[ClientType, str] = {
 }
 
 
-def _build_context(ctx: SessionContext) -> str:
+def _build_context(ctx: SessionContext, kind: WorkstreamKind) -> str:
     """Build the CONTEXT module from session variables."""
     return (
         "## Session Context\n"
         "\n"
         f"- **Current date/time:** {ctx.current_datetime} ({ctx.timezone})\n"
-        f"- **User:** {ctx.username}"
+        f"- **User:** {ctx.username}\n"
+        f"- **Session kind:** {kind.value}"
     )
 
 
@@ -111,7 +112,7 @@ def compose_system_message(
         IC-focused ``tools.md`` with read_file / bash / write_file
         patterns; ``"coordinator"`` loads ``tools_coordinator.md``
         which documents spawn_workstream / send_to_workstream /
-        inspect_workstream / list_nodes / list_skills / task_list etc.
+        inspect_workstream / list_nodes / list_skills / tasks etc.
         A coordinator session has a disjoint tool schema (see
         COORDINATOR_TOOLS), so composing it with the IC tools block
         would instruct the model to hallucinate tool calls that fail.
@@ -123,6 +124,11 @@ def compose_system_message(
     """
     parts: list[str] = []
 
+    # Coerce kind: callers (and tests) sometimes pass the raw string from a
+    # DB row or HTTP payload. WorkstreamKind is a StrEnum so equality works
+    # either way, but ``.value`` access does not — normalise once here.
+    kind = WorkstreamKind.from_raw(kind)
+
     # 1. BASE — kind-specific persona.  The default base.md frames the
     #    model as an IC engineer ("you read before you edit, commits
     #    you make..."); coordinators need an orchestrator framing
@@ -130,14 +136,21 @@ def compose_system_message(
     base_module = "base_coordinator.md" if kind == WorkstreamKind.COORDINATOR else "base.md"
     parts.append(_load(base_module))
 
-    # 2. ENV — exactly one, selected by client type
+    # 2. ENV — exactly one, selected by client type.  Coordinators
+    #    skip ENV: they orchestrate rather than render rich output to
+    #    the user, so the rendering capability matrix (Mermaid, KaTeX,
+    #    terminal width, chat-platform table quirks) is not actionable
+    #    for them.  Synthesis output rides on the child's response or
+    #    the operator's renderer.  ``client_type`` still validates so
+    #    a malformed call fails loud.
     if client_type not in _ENV_MAP:
         raise ValueError(f"Unknown client_type: {client_type!r}")
-    parts.append(_load(_ENV_MAP[client_type]))
+    if kind != WorkstreamKind.COORDINATOR:
+        parts.append(_load(_ENV_MAP[client_type]))
 
     # 3. CONTEXT — built programmatically (no template engine)
     _validate_context(context)
-    parts.append(_build_context(context))
+    parts.append(_build_context(context, kind))
 
     # 4. TOOLS — kind-specific patterns.  Coordinators get the
     #    orchestrator block; interactive sessions get the IC block.

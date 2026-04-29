@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "1.5.0a1",
+    "version": "1.5.0a4",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -4497,14 +4497,14 @@
         }
       }
     },
-    "/v1/api/coordinator/new": {
+    "/v1/api/workstreams/new": {
       "post": {
         "summary": "Create a new coordinator workstream",
-        "operationId": "v1_api_coordinator_new_post",
+        "operationId": "v1_api_workstreams_new_post",
         "tags": [
           "Coordinator"
         ],
-        "description": "Allocates a console-hosted ``kind=\"coordinator\"`` ChatSession.  201 on create; 429 when the ``coordinator.max_active`` cap is reached and no idle coordinator can be evicted.",
+        "description": "Allocates a console-hosted ``kind=\"coordinator\"`` ChatSession.  200 on create; 429 when the ``coordinator.max_active`` cap is reached and no idle coordinator can be evicted.  Pre-1.5.0 this returned 201; the lifted ``create`` factory (Stage 2 verb lift) converges on 200 across both kinds.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4516,7 +4516,7 @@
           }
         },
         "responses": {
-          "201": {
+          "200": {
             "description": "Success",
             "content": {
               "application/json": {
@@ -4589,10 +4589,10 @@
         }
       }
     },
-    "/v1/api/coordinator": {
+    "/v1/api/workstreams": {
       "get": {
         "summary": "List coordinator workstreams visible to the caller",
-        "operationId": "v1_api_coordinator_get",
+        "operationId": "v1_api_workstreams_get",
         "tags": [
           "Coordinator"
         ],
@@ -4603,7 +4603,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinatorListResponse"
+                  "$ref": "#/components/schemas/ListWorkstreamsResponse"
                 }
               }
             }
@@ -4631,10 +4631,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}": {
+    "/v1/api/workstreams/{ws_id}": {
       "get": {
         "summary": "Get coordinator detail (rehydrates lazily on miss)",
-        "operationId": "v1_api_coordinator_{ws_id}_get",
+        "operationId": "v1_api_workstreams_{ws_id}_get",
         "tags": [
           "Coordinator"
         ],
@@ -4655,7 +4655,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinatorDetailResponse"
+                  "$ref": "#/components/schemas/WorkstreamDetailResponse"
                 }
               }
             }
@@ -4713,10 +4713,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/open": {
+    "/v1/api/workstreams/{ws_id}/open": {
       "post": {
         "summary": "Open (rehydrate) a coordinator workstream by ws_id",
-        "operationId": "v1_api_coordinator_{ws_id}_open_post",
+        "operationId": "v1_api_workstreams_{ws_id}_open_post",
         "tags": [
           "Coordinator"
         ],
@@ -4795,14 +4795,14 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/send": {
+    "/v1/api/workstreams/{ws_id}/send": {
       "post": {
         "summary": "Queue a user message onto the coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_send_post",
+        "operationId": "v1_api_workstreams_{ws_id}_send_post",
         "tags": [
           "Coordinator"
         ],
-        "description": "Worker thread picks up the message via the session's queue.  ``429`` when the worker queue is full \u2014 caller should back off.",
+        "description": "Worker thread picks up the message via the session's queue. Optional ``attachment_ids`` reserve attachments under the message's send_id token (parity with the interactive surface). Response carries ``attached_ids`` / ``dropped_attachment_ids`` so callers can detect partial reservations and ``priority`` / ``msg_id`` on the queued path. ``status: queue_full`` when the worker queue is full \u2014 caller should back off.",
         "parameters": [
           {
             "name": "ws_id",
@@ -4829,7 +4829,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/CoordinatorSendResponse"
                 }
               }
             }
@@ -4864,8 +4864,8 @@
               }
             }
           },
-          "429": {
-            "description": "Error 429",
+          "409": {
+            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -4897,10 +4897,294 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/approve": {
+    "/v1/api/workstreams/{ws_id}/attachments": {
+      "post": {
+        "summary": "Upload a file attachment to a coordinator workstream",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Multipart upload (field ``file``). Same validation rules as the interactive surface: magic-byte image sniff, UTF-8 text decode, per-kind size cap, per-(ws,user) pending cap. Attachments stay pending until a subsequent ``/send`` reserves them under its ``send_id`` token.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadAttachmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List the caller's pending coordinator attachments",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListAttachmentsResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content": {
+      "get": {
+        "summary": "Return raw bytes of a coordinator attachment",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_content_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Same byte-stream + headers as the interactive surface. Text kinds are forced to ``text/plain`` so an HTML-shaped text upload can't render same-origin.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}": {
+      "delete": {
+        "summary": "Remove a pending coordinator attachment",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_delete",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Consumed attachments return 404.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/approve": {
       "post": {
         "summary": "Resolve a pending tool approval on the coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_approve_post",
+        "operationId": "v1_api_workstreams_{ws_id}_approve_post",
         "tags": [
           "Coordinator"
         ],
@@ -4989,10 +5273,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/cancel": {
+    "/v1/api/workstreams/{ws_id}/cancel": {
       "post": {
         "summary": "Cancel in-flight generation on the coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_cancel_post",
+        "operationId": "v1_api_workstreams_{ws_id}_cancel_post",
         "tags": [
           "Coordinator"
         ],
@@ -5051,10 +5335,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/close": {
+    "/v1/api/workstreams/{ws_id}/close": {
       "post": {
         "summary": "Soft-close the coordinator (unload from memory; storage preserved)",
-        "operationId": "v1_api_coordinator_{ws_id}_close_post",
+        "operationId": "v1_api_workstreams_{ws_id}_close_post",
         "tags": [
           "Coordinator"
         ],
@@ -5123,10 +5407,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/events": {
+    "/v1/api/workstreams/{ws_id}/events": {
       "get": {
         "summary": "Subscribe to the coordinator's SSE event stream",
-        "operationId": "v1_api_coordinator_{ws_id}_events_get",
+        "operationId": "v1_api_workstreams_{ws_id}_events_get",
         "tags": [
           "Coordinator"
         ],
@@ -5188,10 +5472,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/history": {
+    "/v1/api/workstreams/{ws_id}/history": {
       "get": {
         "summary": "Read the coordinator's reconstructed message history",
-        "operationId": "v1_api_coordinator_{ws_id}_history_get",
+        "operationId": "v1_api_workstreams_{ws_id}_history_get",
         "tags": [
           "Coordinator"
         ],
@@ -5222,7 +5506,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CoordinatorHistoryResponse"
+                  "$ref": "#/components/schemas/WorkstreamHistoryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -5247,6 +5541,16 @@
               }
             }
           },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "503": {
             "description": "Error 503",
             "content": {
@@ -5260,10 +5564,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/children": {
+    "/v1/api/workstreams/{ws_id}/children": {
       "get": {
         "summary": "List the coordinator's spawned child workstreams",
-        "operationId": "v1_api_coordinator_{ws_id}_children_get",
+        "operationId": "v1_api_workstreams_{ws_id}_children_get",
         "tags": [
           "Coordinator"
         ],
@@ -5342,14 +5646,14 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/tasks": {
+    "/v1/api/workstreams/{ws_id}/tasks": {
       "get": {
         "summary": "Read the coordinator's task list envelope",
-        "operationId": "v1_api_coordinator_{ws_id}_tasks_get",
+        "operationId": "v1_api_workstreams_{ws_id}_tasks_get",
         "tags": [
           "Coordinator"
         ],
-        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``task_list`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation).",
+        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``tasks`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation).",
         "parameters": [
           {
             "name": "ws_id",
@@ -5414,10 +5718,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/trust": {
+    "/v1/api/workstreams/{ws_id}/trust": {
       "post": {
         "summary": "Toggle trusted-session mode for send_to_workstream",
-        "operationId": "v1_api_coordinator_{ws_id}_trust_post",
+        "operationId": "v1_api_workstreams_{ws_id}_trust_post",
         "tags": [
           "Coordinator"
         ],
@@ -5496,10 +5800,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/restrict": {
+    "/v1/api/workstreams/{ws_id}/restrict": {
       "post": {
         "summary": "Revoke tool access on a live coordinator session",
-        "operationId": "v1_api_coordinator_{ws_id}_restrict_post",
+        "operationId": "v1_api_workstreams_{ws_id}_restrict_post",
         "tags": [
           "Coordinator"
         ],
@@ -5578,10 +5882,10 @@
         }
       }
     },
-    "/v1/api/coordinator/{ws_id}/stop_cascade": {
+    "/v1/api/workstreams/{ws_id}/stop_cascade": {
       "post": {
         "summary": "Cancel the coordinator and every direct child",
-        "operationId": "v1_api_coordinator_{ws_id}_stop_cascade_post",
+        "operationId": "v1_api_workstreams_{ws_id}_stop_cascade_post",
         "tags": [
           "Coordinator"
         ],
@@ -5603,6 +5907,88 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CoordinatorStopCascadeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/close_all_children": {
+      "post": {
+        "summary": "Soft-close every direct child of the coordinator",
+        "operationId": "v1_api_workstreams_{ws_id}_close_all_children_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Reads the in-memory child registry and dispatches ``close_workstream`` via the routing proxy for every direct child under a bounded (16-concurrency) semaphore.  Unlike ``stop_cascade`` this does not touch grandchildren \u2014 the model-facing tool asks for a bounded teardown of its own fan-out.  Returns ``{closed, failed, skipped}`` where ``skipped`` distinguishes already-gone (404) from dispatch-broken (``failed``).  The optional ``reason`` propagates to every closed child's audit + workstream_config.  Writes ``coordinator.closed_all_children`` at the coord level.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorCloseAllChildrenRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorCloseAllChildrenResponse"
                 }
               }
             }
@@ -6834,7 +7220,7 @@
         "type": "object"
       },
       "CoordinatorApproveRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/approve.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/approve.",
         "properties": {
           "approved": {
             "description": "True approves the pending tool call(s); False denies.",
@@ -6990,7 +7376,7 @@
         "type": "object"
       },
       "CoordinatorChildrenResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}/children.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}/children.",
         "properties": {
           "items": {
             "items": {
@@ -7009,8 +7395,58 @@
         "title": "CoordinatorChildrenResponse",
         "type": "object"
       },
+      "CoordinatorCloseAllChildrenRequest": {
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/close_all_children.",
+        "properties": {
+          "reason": {
+            "default": "",
+            "description": "Optional human-readable reason \u2014 propagated to every closed child's audit + workstream_config for postmortem.  Capped at 512 chars; the handler returns 400 on overflow.",
+            "maxLength": 512,
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "CoordinatorCloseAllChildrenRequest",
+        "type": "object"
+      },
+      "CoordinatorCloseAllChildrenResponse": {
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/close_all_children.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "closed": {
+            "description": "Child ws_ids that accepted the close dispatch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Closed",
+            "type": "array"
+          },
+          "failed": {
+            "description": "Child ws_ids whose close dispatch returned an error other than an already-gone 404 \u2014 the cascade continues on per-child failure so a single unreachable node doesn't abort the whole batch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Failed",
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Child ws_ids that returned 404 on close (already gone).  Reported separately from ``failed`` so operators can distinguish already-done from dispatch-broken.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Skipped",
+            "type": "array"
+          }
+        },
+        "title": "CoordinatorCloseAllChildrenResponse",
+        "type": "object"
+      },
       "CoordinatorCreateRequest": {
-        "description": "Body for POST /v1/api/coordinator/new.",
+        "description": "Body for POST /v1/api/workstreams/new.",
         "properties": {
           "name": {
             "default": "",
@@ -7042,7 +7478,7 @@
         "type": "object"
       },
       "CoordinatorCreateResponse": {
-        "description": "Response body for POST /v1/api/coordinator/new (201).",
+        "description": "Response body for POST /v1/api/workstreams/new (200).",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
@@ -7051,6 +7487,23 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "resumed": {
+            "default": false,
+            "title": "Resumed",
+            "type": "boolean"
+          },
+          "message_count": {
+            "default": 0,
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "attachment_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Attachment Ids",
+            "type": "array"
           }
         },
         "required": [
@@ -7060,108 +7513,8 @@
         "title": "CoordinatorCreateResponse",
         "type": "object"
       },
-      "CoordinatorDetailResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}.",
-        "properties": {
-          "ws_id": {
-            "title": "Ws Id",
-            "type": "string"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "state": {
-            "title": "State",
-            "type": "string"
-          },
-          "user_id": {
-            "title": "User Id",
-            "type": "string"
-          },
-          "kind": {
-            "default": "coordinator",
-            "title": "Kind",
-            "type": "string"
-          }
-        },
-        "required": [
-          "ws_id",
-          "name",
-          "state",
-          "user_id"
-        ],
-        "title": "CoordinatorDetailResponse",
-        "type": "object"
-      },
-      "CoordinatorHistoryResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}/history.",
-        "properties": {
-          "ws_id": {
-            "title": "Ws Id",
-            "type": "string"
-          },
-          "messages": {
-            "description": "Tail of the coordinator's reconstructed message history (provider-fidelity OpenAI-like shape).  Bounded by the ``limit`` query parameter (default 100, max 500).",
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Messages",
-            "type": "array"
-          }
-        },
-        "required": [
-          "ws_id"
-        ],
-        "title": "CoordinatorHistoryResponse",
-        "type": "object"
-      },
-      "CoordinatorInfo": {
-        "description": "Per-coordinator row in the list response.",
-        "properties": {
-          "ws_id": {
-            "title": "Ws Id",
-            "type": "string"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "state": {
-            "title": "State",
-            "type": "string"
-          },
-          "user_id": {
-            "title": "User Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "ws_id",
-          "name",
-          "state",
-          "user_id"
-        ],
-        "title": "CoordinatorInfo",
-        "type": "object"
-      },
-      "CoordinatorListResponse": {
-        "description": "Response body for GET /v1/api/coordinator.",
-        "properties": {
-          "coordinators": {
-            "items": {
-              "$ref": "#/components/schemas/CoordinatorInfo"
-            },
-            "title": "Coordinators",
-            "type": "array"
-          }
-        },
-        "title": "CoordinatorListResponse",
-        "type": "object"
-      },
       "CoordinatorOpenResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/open.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/open.",
         "properties": {
           "ws_id": {
             "title": "Ws Id",
@@ -7193,7 +7546,7 @@
         "type": "object"
       },
       "CoordinatorRestrictRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/restrict.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/restrict.",
         "properties": {
           "revoke": {
             "description": "Tool names to add to the session's revoked set.  Once revoked the coordinator cannot invoke the named tools on subsequent turns without closing and re-opening the session.",
@@ -7211,7 +7564,7 @@
         "type": "object"
       },
       "CoordinatorRestrictResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/restrict.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/restrict.",
         "properties": {
           "status": {
             "default": "ok",
@@ -7234,12 +7587,28 @@
         "type": "object"
       },
       "CoordinatorSendRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/send.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/send.",
         "properties": {
           "message": {
             "description": "User message to queue onto the coordinator's worker.",
             "title": "Message",
             "type": "string"
+          },
+          "attachment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Explicit list of attachment ids to inject into this turn. When omitted, any pending attachments for the caller on this coordinator are auto-consumed. An empty list disables auto-consumption for this send.",
+            "title": "Attachment Ids"
           }
         },
         "required": [
@@ -7248,8 +7617,70 @@
         "title": "CoordinatorSendRequest",
         "type": "object"
       },
+      "CoordinatorSendResponse": {
+        "description": "Response shape for POST /v1/api/workstreams/{ws_id}/send (coord).",
+        "properties": {
+          "status": {
+            "description": "'ok' (fresh worker spawned), 'queued' (live worker reuse), or 'queue_full'.",
+            "examples": [
+              "ok",
+              "queued",
+              "queue_full"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "attached_ids": {
+            "description": "Attachment ids actually reserved onto this turn. Subset of the request's `attachment_ids` (or the auto-consumed pending set). Empty when the send carries no attachments.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attached Ids",
+            "type": "array"
+          },
+          "dropped_attachment_ids": {
+            "description": "Attachment ids the caller requested that the server could not reserve (lost a race, already consumed, or cross-scope). The request still proceeds with whatever was reserved.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Dropped Attachment Ids",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: relative priority of the queued message.",
+            "title": "Priority"
+          },
+          "msg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: id used to dequeue the message.",
+            "title": "Msg Id"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "CoordinatorSendResponse",
+        "type": "object"
+      },
       "CoordinatorStopCascadeResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/stop_cascade.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/stop_cascade.",
         "properties": {
           "status": {
             "default": "ok",
@@ -7325,7 +7756,7 @@
         "type": "object"
       },
       "CoordinatorTasksResponse": {
-        "description": "Response body for GET /v1/api/coordinator/{ws_id}/tasks.\n\nMirrors the envelope the ``task_list(action='list')`` model tool returns.",
+        "description": "Response body for GET /v1/api/workstreams/{ws_id}/tasks.\n\nMirrors the envelope the ``tasks(action='list')`` model tool returns.",
         "properties": {
           "version": {
             "default": 1,
@@ -7344,7 +7775,7 @@
         "type": "object"
       },
       "CoordinatorTrustRequest": {
-        "description": "Body for POST /v1/api/coordinator/{ws_id}/trust.",
+        "description": "Body for POST /v1/api/workstreams/{ws_id}/trust.",
         "properties": {
           "send": {
             "description": "When true, ``send_to_workstream`` calls that target a ws_id in the coordinator's own subtree skip the approval prompt.  Foreign ws_ids continue to require approval \u2014 trust only relaxes the guard for work the orchestrator itself spawned.",
@@ -7359,7 +7790,7 @@
         "type": "object"
       },
       "CoordinatorTrustResponse": {
-        "description": "Response body for POST /v1/api/coordinator/{ws_id}/trust.",
+        "description": "Response body for POST /v1/api/workstreams/{ws_id}/trust.",
         "properties": {
           "status": {
             "default": "ok",
@@ -11224,6 +11655,71 @@
           "skills"
         ],
         "title": "ListSkillSummaryResponse",
+        "type": "object"
+      },
+      "WorkstreamDetailResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}``.\n\nRenamed and relocated from ``CoordinatorDetailResponse`` in the\nStage 2 history/detail verb lift. Both kinds populate every field;\nSDK consumers don't branch on kind to read them. The lift adds the\nendpoint to interactive as a feature gain (pre-lift only coord\nexposed it).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name",
+          "state",
+          "user_id"
+        ],
+        "title": "WorkstreamDetailResponse",
+        "type": "object"
+      },
+      "WorkstreamKind": {
+        "description": "Classifier for which manager hosts a workstream.\n\nStrEnum so members are drop-in ``str`` replacements for the DB column,\nJSON payloads, and existing ``==`` comparisons against raw strings.\nNarrow internal annotations to this type; wide boundaries (HTTP body,\nDB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``\nat the edge.",
+        "enum": [
+          "interactive",
+          "coordinator"
+        ],
+        "title": "WorkstreamKind",
+        "type": "string"
+      },
+      "WorkstreamHistoryResponse": {
+        "description": "Response body for ``GET /v1/api/workstreams/{ws_id}/history``.\n\nRenamed and relocated from ``CoordinatorHistoryResponse`` in the\nStage 2 history/detail verb lift. Same OpenAI-like message-row\nshape on both kinds; the lift adds the endpoint to interactive as\na feature gain (pre-lift interactive only exposed history through\nthe SSE replay on ``/events``).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "messages": {
+            "description": "Tail of the workstream's reconstructed message history (provider-fidelity OpenAI-like shape). Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "WorkstreamHistoryResponse",
         "type": "object"
       }
     }

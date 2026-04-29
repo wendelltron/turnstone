@@ -1,7 +1,7 @@
 """HTTP endpoint tests for workstream attachments.
 
 Uses Starlette's TestClient against an in-process app with a mocked
-WorkstreamManager.  Exercises: upload happy path, size/mime rejection,
+SessionManager.  Exercises: upload happy path, size/mime rejection,
 pending-list, GET /content, DELETE, auth isolation, and the extended
 /api/send handler with both explicit and auto-consumed attachment ids.
 """
@@ -41,7 +41,7 @@ def _make_jwt(user_id: str) -> str:
 
 @pytest.fixture
 def app_client(tmp_path):
-    """Spin up an in-process Starlette app with a mocked WorkstreamManager
+    """Spin up an in-process Starlette app with a mocked SessionManager
     and a fresh SQLite storage."""
     import sqlalchemy as sa
 
@@ -69,13 +69,13 @@ def app_client(tmp_path):
         conn.execute(sa.update(ws_tbl).where(ws_tbl.c.ws_id == "ws-B").values(user_id="userB"))
         conn.commit()
 
-    # WorkstreamManager mock returns None for get(); send endpoint handles that,
+    # SessionManager mock returns None for get(); send endpoint handles that,
     # but we bypass send to focus on attachments.  get() returning a mock is
     # only needed for /api/send; upload/list/content/delete don't use mgr.
     mock_mgr = MagicMock()
     mock_mgr.get.return_value = None
     mock_mgr.list_all.return_value = []
-    mock_mgr.max_workstreams = 10
+    mock_mgr.max_active = 10
 
     app = srv_mod.create_app(
         workstreams=mock_mgr,
@@ -263,16 +263,17 @@ class TestUploadRejections:
         )
         assert resp.status_code == 404
 
-    def test_foreign_workstream_is_not_found(self, app_client):
+    def test_any_caller_can_attach_to_workstream(self, app_client):
+        # Trusted-team model: attaching to any workstream is gated on
+        # scope auth, not ownership.  The attachment is filed under
+        # the ws's persisted owner so existing storage shape holds.
         client, _ = app_client
-        # userA tries to attach to ws-B (owned by userB) — we mask this as
-        # 404 to avoid leaking workstream existence to non-owners.
         resp = client.post(
             "/v1/api/workstreams/ws-B/attachments",
             files={"file": ("x.md", b"x", "text/markdown")},
             headers=_auth("userA"),
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 class TestPendingCap:
@@ -351,13 +352,17 @@ class TestListAttachments:
         assert all("content" not in a for a in atts)
         assert {a["filename"] for a in atts} == {"a.md", "b.md"}
 
-    def test_list_isolated_per_user(self, app_client):
+    def test_list_visible_cluster_wide(self, app_client):
+        # Trusted-team visibility: any authenticated caller can list
+        # the attachments on any workstream.  Attachments are filed
+        # under the ws's owner uid so a cross-caller lister still sees
+        # the owner's pending uploads.
         client, _ = app_client
         _upload(client, "ws-A", "userA", "mine.md", b"mine", "text/markdown")
-        # userB can't even GET listing on ws-A (not their workstream);
-        # masked as 404 to avoid existence-leak.
         resp = client.get("/v1/api/workstreams/ws-A/attachments", headers=_auth("userB"))
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        atts = resp.json()["attachments"]
+        assert {a["filename"] for a in atts} == {"mine.md"}
 
 
 class TestGetContent:
@@ -396,15 +401,19 @@ class TestGetContent:
         assert resp.headers["content-type"].startswith("text/plain")
         assert resp.headers.get("x-content-type-options") == "nosniff"
 
-    def test_get_content_wrong_user_is_not_found(self, app_client):
+    def test_get_content_visible_cluster_wide(self, app_client):
+        # Trusted-team visibility: any authenticated caller can fetch
+        # the content of an attachment on any workstream.  Attachments
+        # are keyed by the ws's persisted owner uid so userB still
+        # resolves userA's blob via _require_ws_access's owner return.
         client, _ = app_client
         aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
         resp = client.get(
             f"/v1/api/workstreams/ws-A/attachments/{aid}/content",
             headers=_auth("userB"),
         )
-        # 404 rather than 403 — caller can't distinguish from "ws doesn't exist".
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert resp.content == b"x"
 
     def test_get_content_cross_workstream_id_404(self, app_client):
         client, _ = app_client
@@ -453,12 +462,14 @@ class TestDelete:
         resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userA"))
         assert resp.status_code == 404
 
-    def test_delete_wrong_user_is_not_found(self, app_client):
+    def test_delete_cluster_wide(self, app_client):
+        # Trusted-team model: any authenticated caller can delete an
+        # attachment on any workstream.  The filed ``user_id`` stays
+        # for audit even after a cross-caller delete.
         client, _ = app_client
         aid = _upload(client, "ws-A", "userA", "t.md", b"x", "text/markdown")
         resp = client.delete(f"/v1/api/workstreams/ws-A/attachments/{aid}", headers=_auth("userB"))
-        # userB doesn't own ws-A — masked as 404 to avoid existence-leak.
-        assert resp.status_code == 404
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +505,7 @@ class TestSendMessageAttachments:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = None
+        ws._worker_running = False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured, session
@@ -504,8 +516,8 @@ class TestSendMessageAttachments:
         aid = _upload(client, "ws-A", "userA", "n.md", b"hi", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "review", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "review", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -530,8 +542,8 @@ class TestSendMessageAttachments:
         _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "do", "ws_id": "ws-A"},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "do"},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -551,8 +563,8 @@ class TestSendMessageAttachments:
         _upload(client, "ws-A", "userA", "a.md", b"A", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "plain", "ws_id": "ws-A", "attachment_ids": []},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "plain", "attachment_ids": []},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -574,10 +586,9 @@ class TestSendMessageAttachments:
 
         # Request order: c, a, b — must be preserved through resolution
         resp = client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/ws-A/send",
             json={
                 "message": "ordered",
-                "ws_id": "ws-A",
                 "attachment_ids": [c, a, b],
             },
             headers=_auth("userA"),
@@ -602,8 +613,8 @@ class TestSendMessageAttachments:
 
         too_many = [f"id-{i}" for i in range(MAX_PENDING_ATTACHMENTS_PER_USER_WS + 1)]
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "x", "ws_id": "ws-A", "attachment_ids": too_many},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "x", "attachment_ids": too_many},
             headers=_auth("userA"),
         )
         assert resp.status_code == 400
@@ -621,10 +632,9 @@ class TestSendMessageAttachments:
 
         captured, _ = self._wire_ws(mgr, "ws-A", "userA")
         resp = client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/ws-A/send",
             json={
                 "message": "sneaky",
-                "ws_id": "ws-A",
                 "attachment_ids": [stolen_id],
             },
             headers=_auth("userA"),
@@ -670,7 +680,7 @@ class TestQueuedSendWithAttachments:
         ui._ws_messages = 0
         ui._ws_turn_tool_calls = 0
 
-        # worker_thread needs .is_alive() → True to hit the queue branch
+        # _worker_running=True forces session_worker.send onto the queue path
         worker = MagicMock()
         worker.is_alive = MagicMock(return_value=True)
 
@@ -680,6 +690,7 @@ class TestQueuedSendWithAttachments:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = worker
+        ws._worker_running = True
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
         return captured
@@ -691,10 +702,9 @@ class TestQueuedSendWithAttachments:
         b = _upload(client, "ws-A", "userA", "b.md", b"B", "text/markdown")
 
         resp = client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/ws-A/send",
             json={
                 "message": "ping",
-                "ws_id": "ws-A",
                 "attachment_ids": [b, a],  # intentionally reversed
             },
             headers=_auth("userA"),
@@ -754,8 +764,8 @@ class TestQueuedAttachmentReservation:
         aid = _upload(client, ws_id, "userA", filename, b"Q", "text/markdown")
         ws, session = self._wire_busy_ws(mgr, ws_id)
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "queued", "ws_id": ws_id, "attachment_ids": [aid]},
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "queued", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -802,12 +812,13 @@ class TestQueuedAttachmentReservation:
         session.send = fake_send  # type: ignore[method-assign]
         ws = mgr.get.return_value
         ws.worker_thread = None  # idle → non-queue path
+        ws._worker_running = False
 
         # Auto-consume on a follow-up send: reserved attachment must not
         # be picked up (another turn isn't entitled to it).
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "follow up", "ws_id": "ws-A"},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "follow up"},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -833,12 +844,13 @@ class TestQueuedAttachmentReservation:
         session.send = fake_send  # type: ignore[method-assign]
         ws = mgr.get.return_value
         ws.worker_thread = None
+        ws._worker_running = False
 
         # A second send explicitly naming the reserved id: scope check
         # rejects it, so the attachment list is empty.
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "take mine", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "take mine", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -861,8 +873,8 @@ class TestQueuedAttachmentReservation:
         # Cancel the queued message — DELETE /api/send with msg_id
         resp = client.request(
             "DELETE",
-            "/v1/api/send",
-            json={"ws_id": "ws-A", "msg_id": mid},
+            "/v1/api/workstreams/ws-A/send",
+            json={"msg_id": mid},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -927,13 +939,14 @@ class TestReserveThenDispatchRace:
         ws.ui = ui
         ws.session = session
         ws.worker_thread = None
+        ws._worker_running = False
         ws._lock = threading.RLock()
         mgr.get.return_value = ws
 
         # First send — reserves A under its send_id, worker blocks
         resp1 = client.post(
-            "/v1/api/send",
-            json={"message": "one", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "one", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp1.status_code == 200
@@ -961,8 +974,8 @@ class TestReserveThenDispatchRace:
         session.send = second_send  # type: ignore[method-assign]
 
         resp2 = client.post(
-            "/v1/api/send",
-            json={"message": "two", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "two", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp2.status_code == 200
@@ -998,8 +1011,8 @@ class TestReserveThenDispatchRace:
         session.send = exploding_send  # type: ignore[method-assign]
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "boom", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "boom", "attachment_ids": [aid]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -1042,8 +1055,8 @@ class TestReserveThenDispatchRace:
         ws_tuple[1].send = fake_send  # type: ignore[method-assign]
 
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "both", "ws_id": "ws-A", "attachment_ids": [a, b]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "both", "attachment_ids": [a, b]},
             headers=_auth("userA"),
         )
         assert resp.status_code == 200
@@ -1105,8 +1118,8 @@ class TestServiceScopedActorFlow:
             "userA",
         )
         resp = client.post(
-            "/v1/api/send",
-            json={"message": "svc send", "ws_id": "ws-A", "attachment_ids": [aid]},
+            "/v1/api/workstreams/ws-A/send",
+            json={"message": "svc send", "attachment_ids": [aid]},
             headers=svc_headers,
         )
         assert resp.status_code == 200

@@ -25,6 +25,7 @@ from tests._coord_test_helpers import (
     _build_mgr,
     _fake_registry,
     _FakeConfigStore,
+    _seed_children,
 )
 from turnstone.console.server import (
     coordinator_restrict,
@@ -45,17 +46,17 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
     app = Starlette(
         routes=[
             Route(
-                "/v1/api/coordinator/{ws_id}/trust",
+                "/v1/api/workstreams/{ws_id}/trust",
                 coordinator_trust,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/restrict",
+                "/v1/api/workstreams/{ws_id}/restrict",
                 coordinator_restrict,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/stop_cascade",
+                "/v1/api/workstreams/{ws_id}/stop_cascade",
                 coordinator_stop_cascade,
                 methods=["POST"],
             ),
@@ -63,6 +64,7 @@ def _make_client(storage, *, coord_mgr, alias="my-model", registry=None) -> Test
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
     app.state.coord_registry = registry
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
@@ -119,7 +121,7 @@ def test_trust_toggle_requires_trust_send_permission(storage):
     coord = mgr.create(user_id="user-1", name="coord-a")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": True},
         headers=_COORD_HEADERS,
     )
@@ -134,7 +136,7 @@ def test_trust_toggle_flips_session_flag_and_audits(storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": True},
         headers=_TRUST_HEADERS,
     )
@@ -166,23 +168,24 @@ def _service_token_client(
     app = Starlette(
         routes=[
             Route(
-                "/v1/api/coordinator/{ws_id}/trust",
+                "/v1/api/workstreams/{ws_id}/trust",
                 coordinator_trust,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/restrict",
+                "/v1/api/workstreams/{ws_id}/restrict",
                 coordinator_restrict,
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}/stop_cascade",
+                "/v1/api/workstreams/{ws_id}/stop_cascade",
                 coordinator_stop_cascade,
                 methods=["POST"],
             ),
         ],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": "my-model"})
     app.state.coord_registry = _fake_registry()
     app.state.coord_registry_error = ""
@@ -220,7 +223,7 @@ def test_trust_toggle_service_token_cannot_bypass_permission(storage):
         permissions=frozenset({"admin.coordinator"}),
     )
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": True},
     )
     assert resp.status_code == 403
@@ -243,7 +246,7 @@ def test_trust_toggle_service_token_with_permission_succeeds(storage):
         permissions=frozenset({"admin.coordinator", "coordinator.trust.send"}),
     )
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": True},
     )
     assert resp.status_code == 200
@@ -266,7 +269,7 @@ def test_restrict_service_token_cannot_bypass_admin_coordinator(storage):
         permissions=frozenset(),  # no admin.coordinator
     )
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["bash"]},
     )
     assert resp.status_code == 403
@@ -285,7 +288,7 @@ def test_stop_cascade_service_token_cannot_bypass_admin_coordinator(storage):
         permissions=frozenset(),
     )
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/stop_cascade",
+        f"/v1/api/workstreams/{coord.id}/stop_cascade",
         json={},
     )
     assert resp.status_code == 403
@@ -297,7 +300,7 @@ def test_trust_toggle_rejects_non_bool(storage):
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": "yes"},
         headers=_TRUST_HEADERS,
     )
@@ -317,7 +320,7 @@ def test_trust_toggle_rejects_non_object_body(storage):
     # only care that none 500.
     for body in ([], 42, "string"):
         resp = client.post(
-            f"/v1/api/coordinator/{coord.id}/trust",
+            f"/v1/api/workstreams/{coord.id}/trust",
             json=body,
             headers=_TRUST_HEADERS,
         )
@@ -331,27 +334,30 @@ def test_restrict_rejects_non_object_body(storage):
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json=[],
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 400
 
 
-def test_trust_toggle_tenant_404_on_foreign_coord(storage):
+def test_trust_toggle_cluster_wide_access(storage):
+    # Trusted-team model: the trust toggle is gated on the scope
+    # permission, not on row-level ownership.  A caller holding
+    # ``coordinator.trust.send`` may toggle any coord's trust state.
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-owner", name="coord-a")
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": True},
         headers={
             "X-Test-User": "user-other",
             "X-Test-Perms": "admin.coordinator,coordinator.trust.send",
         },
     )
-    assert resp.status_code == 404
+    assert resp.status_code == 200
 
 
 def test_trust_toggle_404_when_session_not_loaded(storage):
@@ -363,7 +369,7 @@ def test_trust_toggle_404_when_session_not_loaded(storage):
     coord.session = None  # simulate a closed / lazy-rehydrate coord
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/trust",
+        f"/v1/api/workstreams/{coord.id}/trust",
         json={"send": True},
         headers=_TRUST_HEADERS,
     )
@@ -466,7 +472,7 @@ def test_restrict_adds_to_revoked_tools_and_audits(storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["spawn_workstream", "delete_workstream"]},
         headers=_COORD_HEADERS,
     )
@@ -488,12 +494,12 @@ def test_restrict_is_additive_across_calls(storage):
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["spawn_workstream"]},
         headers=_COORD_HEADERS,
     )
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["delete_workstream"]},
         headers=_COORD_HEADERS,
     )
@@ -513,7 +519,7 @@ def test_restrict_empty_revoke_is_noop_but_audits(storage):
     coord.session, _state = _make_session_mock(revoked=frozenset({"spawn_workstream"}))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": []},
         headers=_COORD_HEADERS,
     )
@@ -532,7 +538,7 @@ def test_restrict_rejects_non_list_body(storage):
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": "spawn_workstream"},
         headers=_COORD_HEADERS,
     )
@@ -547,7 +553,7 @@ def test_restrict_rejects_oversize_list(storage):
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": [f"tool_{i}" for i in range(500)]},
         headers=_COORD_HEADERS,
     )
@@ -560,7 +566,7 @@ def test_restrict_rejects_oversize_name(storage):
     coord.session, _ = _make_session_mock()
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["x" * 1000]},
         headers=_COORD_HEADERS,
     )
@@ -573,7 +579,7 @@ def test_restrict_404_when_session_not_loaded(storage):
     coord.session = None
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/restrict",
+        f"/v1/api/workstreams/{coord.id}/restrict",
         json={"revoke": ["bash"]},
         headers=_COORD_HEADERS,
     )
@@ -634,7 +640,7 @@ def test_prepare_tool_allows_non_revoked_tool():
 def test_stop_cascade_cancels_coord_and_each_child(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["child-1", "child-2", "child-3"])
+    _seed_children(mgr._adapter, coord.id, ["child-1", "child-2", "child-3"])
 
     def _cancel(wid: str) -> dict:
         if wid == "child-2":
@@ -648,7 +654,7 @@ def test_stop_cascade_cancels_coord_and_each_child(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/stop_cascade",
+        f"/v1/api/workstreams/{coord.id}/stop_cascade",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -683,7 +689,7 @@ def test_stop_cascade_routes_404_to_skipped_bucket(storage):
     them apart."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["stale-child"])
+    _seed_children(mgr._adapter, coord.id, ["stale-child"])
 
     coord_client = MagicMock()
     coord_client.cancel.return_value = {
@@ -695,7 +701,7 @@ def test_stop_cascade_routes_404_to_skipped_bucket(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/stop_cascade",
+        f"/v1/api/workstreams/{coord.id}/stop_cascade",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -714,7 +720,7 @@ def test_stop_cascade_empty_children_still_audits(storage):
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/stop_cascade",
+        f"/v1/api/workstreams/{coord.id}/stop_cascade",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -730,13 +736,13 @@ def test_stop_cascade_without_coord_client_marks_all_failed(storage):
     the operator can investigate."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["child-a", "child-b"])
+    _seed_children(mgr._adapter, coord.id, ["child-a", "child-b"])
     coord.session = MagicMock()
     coord.session._coord_client = None
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/stop_cascade",
+        f"/v1/api/workstreams/{coord.id}/stop_cascade",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -753,7 +759,7 @@ def test_stop_cascade_404_when_session_not_loaded(storage):
     coord.session = None
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
-        f"/v1/api/coordinator/{coord.id}/stop_cascade",
+        f"/v1/api/workstreams/{coord.id}/stop_cascade",
         json={},
         headers=_COORD_HEADERS,
     )
@@ -763,10 +769,10 @@ def test_stop_cascade_404_when_session_not_loaded(storage):
 def test_children_snapshot_returns_copy_not_live_set(storage):
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    mgr.register_children(coord.id, ["a", "b", "c"])
-    snap = mgr.children_snapshot(coord.id)
+    _seed_children(mgr._adapter, coord.id, ["a", "b", "c"])
+    snap = mgr._adapter.children_snapshot(coord.id)
     assert set(snap) == {"a", "b", "c"}
-    mgr.register_children(coord.id, ["d"])
+    _seed_children(mgr._adapter, coord.id, ["d"])
     assert set(snap) == {"a", "b", "c"}
 
 

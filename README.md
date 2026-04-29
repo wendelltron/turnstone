@@ -8,7 +8,7 @@
 Multi-node AI orchestration platform. Deploy tool-using AI agents across a cluster of servers with direct HTTP routing, interactive interfaces, and enterprise governance.
 
 <p align="center">
-  <img src="docs/assets/hero.png" alt="Turnstone console — multi-workstream AI orchestration with mermaid diagrams" width="960"/>
+  <img src="docs/assets/hero.png" alt="Turnstone coordinator — parallel tool batches with judge-graded approval and child workstream tracking" width="960"/>
 </p>
 
 Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone) (*Arenaria interpres*) — a shorebird that flips stones to discover what's hiding underneath.

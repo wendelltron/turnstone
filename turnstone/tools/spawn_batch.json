@@ -1,0 +1,44 @@
+{
+  "name": "spawn_batch",
+  "description": "Create up to 10 child workstreams in one call. Serialised in input order so sibling ordering (by `created_at`) is deterministic. Returns `{results: {idx: {ws_id, name, node_id}}, denied: [{idx, reason}]}` — `results` keyed by stringified input-array index, `denied` collects per-item validation / spawn failures. For >10 children make multiple calls (the batch hard-errors rather than truncating). Pair with `wait_for_workstream(ws_ids=[...], mode='all')` to synthesise the N outputs once every child has finished. Lifecycle state at spawn isn't returned — call inspect_workstream if you need it.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "children": {
+        "type": "array",
+        "description": "Up to 10 child specs. Each spec mirrors spawn_workstream args. An empty `initial_message` creates an idle child that waits for send_to_workstream.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "initial_message": {
+              "type": "string",
+              "description": "First user message to dispatch. Empty → idle child."
+            },
+            "skill": {
+              "type": "string",
+              "description": "Optional skill name."
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional display name. Auto-generated when empty."
+            },
+            "model": {
+              "type": "string",
+              "description": "Optional model alias."
+            },
+            "target_node": {
+              "type": "string",
+              "description": "Optional node_id hint. Pinning is hard — if the named node has dropped the 120s registry heartbeat between list_nodes and this spawn, the item lands in denied[] with a `No available node for routing` reason. Omit unless the workload truly requires that node."
+            }
+          },
+          "required": []
+        },
+        "minItems": 1,
+        "maxItems": 10
+      }
+    },
+    "required": ["children"]
+  },
+  "coordinator": true,
+  "primary_key": "children"
+}

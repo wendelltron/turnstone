@@ -1,12 +1,12 @@
 /* coordinator.js — one-pane UI for console-hosted coordinator sessions.
  *
  * Connects to:
- *   GET  /v1/api/coordinator/{ws_id}/events  (SSE)
- *   GET  /v1/api/coordinator/{ws_id}/history (initial history)
- *   POST /v1/api/coordinator/{ws_id}/send
- *   POST /v1/api/coordinator/{ws_id}/approve
- *   POST /v1/api/coordinator/{ws_id}/cancel
- *   POST /v1/api/coordinator/{ws_id}/close
+ *   GET  /v1/api/workstreams/{ws_id}/events  (SSE)
+ *   GET  /v1/api/workstreams/{ws_id}/history (initial history)
+ *   POST /v1/api/workstreams/{ws_id}/send
+ *   POST /v1/api/workstreams/{ws_id}/approve
+ *   POST /v1/api/workstreams/{ws_id}/cancel
+ *   POST /v1/api/workstreams/{ws_id}/close
  *
  * Depends on shared/auth.js (authFetch, fetchWithCreds), shared/theme.js
  * (toggleTheme), shared/toast.js (toast.info / toast.error),
@@ -24,46 +24,144 @@
 
   const wsId = document.documentElement.dataset.wsId || "";
   if (!wsId) {
-    document.getElementById("coord-messages").innerHTML =
-      '<div class="ts-msg ts-msg--error">Missing ws_id on &lt;html&gt; tag.</div>';
+    // Static literal — class-name migration only; no XSS surface.
+    const missing = document.createElement("div");
+    missing.className = "msg error";
+    missing.textContent = "Missing ws_id on <html> tag.";
+    const host = document.getElementById("coord-messages");
+    if (host) host.replaceChildren(missing);
     return;
   }
 
   const messagesEl = document.getElementById("coord-messages");
+  const coordMain = document.getElementById("coord-main");
   const composerMount = document.getElementById("coord-composer-mount");
   const composer = new Composer(composerMount, {
     placeholder: "Message the coordinator\u2026",
     ariaLabel: "Coordinator input",
-    onSend: function (text) {
-      coordSend(text);
+    attachments: {
+      onAttach: function (file) {
+        attachments.upload(file);
+      },
     },
-    // Preserve the coordinator's pre-refactor Enter-on-touch behaviour
-    // — coordinator sessions are short and tap-to-send via the
-    // on-screen Return key is a quicker workflow than tapping a Send
-    // button.
+    stopBtn: true,
+    queueWhileBusy: true,
+    busyPlaceholder: "Queue a message\u2026 (!!! for urgent)",
+    onSend: function () {
+      coordSend();
+    },
+    onStop: function () {
+      cancelGeneration();
+    },
+    // Coord sessions are short — tap-to-send via the on-screen Return
+    // key is faster than tapping a Send button on touch.
     touchEnterSends: true,
-    // No attachments yet — coordinator-side attach mid-conversation
-    // requires a backend ingest path that doesn't exist; defer.
-    // No stopBtn — coordinator already has a header-mounted cancel
-    // button (#coord-cancel-btn) that fires coordCancel().
+    dragDrop: { targetEl: coordMain, dropClass: "coord-drop-target" },
   });
+  const stopBtn = composer.stopBtn;
+  const attachments = createAttachmentController({
+    chipsEl: composer.chipsEl,
+    getWsId: function () {
+      return wsId;
+    },
+  });
+  const queue = createQueueController({
+    messagesEl: messagesEl,
+    getWsId: function () {
+      return wsId;
+    },
+    // Coord chat bubbles wrap content in a .msg-body div (appendMsg
+    // below); the queue bubble matches so its border + padding align.
+    wrapInBody: true,
+    // Re-fetch attachments after a dequeue so the user can see (and
+    // reuse) any reservations the server-side dequeue released. Trades
+    // a small in-flight-placeholder clobbering window for the strictly
+    // worse alternative of attachments lingering invisibly until the
+    // next page load.
+    onAfterDequeue: function () {
+      attachments.rehydrate();
+    },
+    // Idle-edge cleanup of the cancel/force-stop timers — without
+    // this they fire on the *next* busy turn, relabel Stop to "Force
+    // Stop", and surface a misleading "Cancel didn't complete in
+    // time" toast unrelated to the new turn.
+    onIdle: function () {
+      if (cancelTimeoutId) {
+        clearTimeout(cancelTimeoutId);
+        cancelTimeoutId = null;
+      }
+      if (forceTimeoutId) {
+        clearTimeout(forceTimeoutId);
+        forceTimeoutId = null;
+      }
+    },
+  });
+  let busy = false;
+  let cancelTimeoutId = null;
+  let forceTimeoutId = null;
   const statusEl = document.getElementById("coord-status");
   const sseEl = document.getElementById("coord-sse-status");
   const nameEl = document.getElementById("coord-name");
-  const approvalBar = document.getElementById("coord-approval-bar");
-  const approvalTools = document.getElementById("coord-approval-tools");
-  const cancelBtn = document.getElementById("coord-cancel-btn");
   const childrenTreeEl = document.getElementById("coord-children-tree");
   const childrenCountEl = document.getElementById("coord-children-count");
   const childrenRefreshBtn = document.getElementById("coord-children-refresh");
   const tasksEl = document.getElementById("coord-tasks");
   const tasksCountEl = document.getElementById("coord-tasks-count");
   const tasksRefreshBtn = document.getElementById("coord-tasks-refresh");
+  // Off-screen aria-live="assertive" region — pending tool-batches
+  // append into the polite messages log, which gets flipped to
+  // aria-live="off" during streaming.  Routing the action-required
+  // announcement through this dedicated region ensures SR users hear
+  // the gate land regardless of streaming state.
+  const srAnnouncerEl = document.getElementById("coord-sr-announcer");
+  function _announceAssertive(text) {
+    if (!srAnnouncerEl) return;
+    // Briefly clearing then setting forces SR reading even if the
+    // text is identical to the previous announcement (some SRs only
+    // read on textContent change).
+    srAnnouncerEl.textContent = "";
+    requestAnimationFrame(() => {
+      srAnnouncerEl.textContent = text;
+    });
+  }
 
-  let pendingApprovalCallId = null;
+  // Status bar — model alias, token / context-window usage, tool calls
+  // this turn, conversation turn.  Driven by the connected + status
+  // SSE events; mirrors the interactive pane (ui/static/app.js).
+  const statusBarEl = document.getElementById("coord-status-bar");
+  const sbModelEl = document.getElementById("coord-sb-model");
+  const sbTokensEl = document.getElementById("coord-sb-tokens");
+  const sbToolsEl = document.getElementById("coord-sb-tools");
+  const sbTurnsEl = document.getElementById("coord-sb-turns");
+  let coordModel = "";
+  let coordModelAlias = "";
+  let lastStatusEvt = null;
+
   let evtSource = null;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
+
+  // Cache of judge verdicts keyed by call_id.  intent_verdict and
+  // approve_request are async and may arrive in either order; the
+  // cache lets each handler apply data to the other without assuming
+  // ordering.  Soft-capped at JUDGE_VERDICTS_CAP entries — Maps
+  // preserve insertion order, so the oldest entry is the one yielded
+  // by .keys().next() and is evicted when the cap is exceeded.  Cap
+  // is generous because verdicts are small (~few hundred bytes each)
+  // and the only consumer is the rare race where SSE re-fires
+  // approve_request after the originally-cached entry has been
+  // applied.
+  const JUDGE_VERDICTS_CAP = 500;
+  const judgeVerdicts = new Map();
+  function _cacheJudgeVerdict(callId, verdict) {
+    if (!callId) return;
+    judgeVerdicts.set(callId, verdict);
+    while (judgeVerdicts.size > JUDGE_VERDICTS_CAP) {
+      const oldest = judgeVerdicts.keys().next().value;
+      if (oldest === undefined) break;
+      judgeVerdicts.delete(oldest);
+    }
+  }
 
   // ------------------------------------------------------------------
   // HTML escaping and safe ws_id linkification
@@ -81,11 +179,48 @@
       .replace(/'/g, "&#39;");
   }
 
+  // ANSI-escape stripper — mirrors ui/static/app.js so a tool that
+  // emits CSI sequences (rare on the coord tool surface, but bash
+  // through MCP / the underlying child node still can) lands as
+  // readable text inside the tool-batch result block.
+  function stripAnsi(s) {
+    return String(s == null ? "" : s).replace(
+      // eslint-disable-next-line no-control-regex
+      /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
+      "",
+    );
+  }
+
   // Post-process tool-output JSON: wrap known ws_id + node_id pairs in a
   // link pointing at /node/{node_id}/?ws_id={child_ws_id}.  Only applies
   // when BOTH keys are present and look like valid hex ids.
   const WS_ID_RE = /^[a-f0-9]{8,64}$/i;
   const NODE_ID_RE = /^[A-Za-z0-9._-]{1,256}$/;
+
+  // Auto-approve reason vocabulary — kept in lockstep with the
+  // ``AutoApproveReason`` constants in turnstone/core/session_ui_base.py.
+  // The pill renderer validates incoming reason strings against this
+  // set so a server-side typo (or a future reason this build doesn't
+  // know about) renders as "unknown" with a console.warn instead of
+  // silently surfacing the typo verbatim in the operator-facing label.
+  const KNOWN_AUTO_APPROVE_REASONS = new Set([
+    "skill",
+    "always",
+    "policy",
+    "blanket",
+    "auto_approve_tools",
+  ]);
+  const UNKNOWN_AUTO_APPROVE_REASON = "unknown";
+
+  function _normaliseAutoApproveReason(raw) {
+    const r = raw || "auto_approve_tools";
+    if (KNOWN_AUTO_APPROVE_REASONS.has(r)) return r;
+    console.warn(
+      "coord_ui: unknown auto_approve_reason from server:",
+      JSON.stringify(raw),
+    );
+    return UNKNOWN_AUTO_APPROVE_REASON;
+  }
 
   function renderToolOutput(rawText) {
     // Try parse JSON first — coordinator tool output is JSON-shaped.
@@ -139,23 +274,40 @@
   // Message append helpers
   // ------------------------------------------------------------------
 
-  // Map raw role → ts-msg modifier.  "error" overloads the role slot
-  // for styling; opts.label still carries the tool name so SR text
-  // like "error · bash" stays meaningful on the data-ts-role /
-  // aria-label attributes when labels stop rendering as DOM text.
-  const _TS_ROLE_VARIANTS = {
-    user: "ts-msg--user",
-    assistant: "ts-msg--assistant",
-    reasoning: "ts-msg--reasoning",
-    tool: "ts-msg--tool",
-    error: "ts-msg--error",
+  // Coalesce scrollTop writes through requestAnimationFrame so the
+  // bulk history-replay loop doesn't fire one synchronous reflow per
+  // appended message — for histories with hundreds of turns the
+  // un-coalesced version visibly stalls the page.  Live SSE streaming
+  // also benefits: token-rate scrolls collapse into one paint.
+  let _scrollPending = false;
+  function _scheduleScroll() {
+    if (_scrollPending) return;
+    _scrollPending = true;
+    requestAnimationFrame(() => {
+      _scrollPending = false;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
+
+  // Map raw role → .msg variant (DS primitives/message.css).  "error"
+  // overloads the role slot for styling; opts.label still carries the
+  // tool name so SR text like "error · bash" stays meaningful on the
+  // data-ts-role / aria-label attributes when labels stop rendering
+  // as DOM text.
+  const _MSG_VARIANTS = {
+    user: "user",
+    assistant: "assistant",
+    reasoning: "reasoning",
+    tool: "tool",
+    error: "error",
+    info: "info",
   };
 
   function appendMsg(role, html, opts) {
     opts = opts || {};
     const el = document.createElement("div");
-    const variant = _TS_ROLE_VARIANTS[role] || "ts-msg--assistant";
-    el.className = "ts-msg " + variant;
+    const variant = _MSG_VARIANTS[role] || "assistant";
+    el.className = "msg " + variant;
     // role="article" makes aria-label reliably announced by screen
     // readers — a generic <div> with no implicit role doesn't expose
     // aria-label on its own.  "article" fits: each message is a
@@ -171,11 +323,11 @@
       el.setAttribute("aria-label", opts.label);
     }
     const body = document.createElement("div");
-    body.className = "ts-msg-body";
+    body.className = "msg-body";
     body.innerHTML = html;
     el.appendChild(body);
     messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    _scheduleScroll();
     return el;
   }
 
@@ -183,23 +335,880 @@
     return appendMsg(role, esc(text), opts);
   }
 
-  function appendToolCall(item) {
-    const label = item.func_name || "tool";
-    const html =
-      "<strong>" +
-      esc(item.header || label) +
-      "</strong>" +
-      (item.preview ? "<pre>" + esc(item.preview) + "</pre>" : "");
-    return appendMsg("tool", html, { label: label, callId: item.call_id });
+  // Build a tool-batch item from a persisted assistant
+  // tool_call.  Live calls land here with header / preview already
+  // computed by ChatSession._prepare_tool; history replay never sees
+  // those (only `function.name` + `function.arguments`), so synthesise
+  // the same fields so the rendered row reads the same on reload.
+  //
+  // Header rules mirror what _prepare_tool produces for the common
+  // tools — bash gets a "$ <command>" header so the operator sees the
+  // shell line at a glance; everything else gets "<name>: <key=val …>"
+  // with values truncated.  The full pretty-printed args drop into the
+  // preview block underneath, capped at a few hundred chars to match
+  // the live preview's footprint.
+  function synthesizeHistoricalToolCall(name, callId, parsedArgs, argsRaw) {
+    let header = name;
+    let preview = "";
+    const argEntries =
+      parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)
+        ? Object.entries(parsedArgs)
+        : null;
+    if (name === "bash" && argEntries && argEntries.length) {
+      const cmd = String(
+        parsedArgs.command || Object.values(parsedArgs)[0] || "",
+      );
+      header = "$ " + (cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd);
+      preview = cmd.length > 80 ? cmd : "";
+    } else if (argEntries && argEntries.length) {
+      const summary = argEntries
+        .slice(0, 3)
+        .map(([k, v]) => {
+          let valStr =
+            v == null ? "null" : typeof v === "string" ? v : JSON.stringify(v);
+          if (valStr.length > 60) valStr = valStr.slice(0, 57) + "…";
+          return k + "=" + valStr;
+        })
+        .join(" ");
+      header = name + ": " + summary;
+      try {
+        preview = JSON.stringify(parsedArgs, null, 2);
+      } catch (_) {
+        preview = argsRaw || "";
+      }
+      if (preview.length > 600) preview = preview.slice(0, 600) + "…";
+    } else if (argsRaw) {
+      // Malformed JSON or non-object args — show the raw payload
+      // truncated.  Matches the interactive replay's substring(0, 100)
+      // fallback at ui/static/app.js Pane.prototype.replayHistory.
+      header = name;
+      preview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
+    }
+    return {
+      call_id: callId,
+      func_name: name,
+      header: header,
+      preview: preview,
+    };
   }
 
   function appendToolResult(name, callId, output, isError) {
+    if (callId && toolRows.has(callId)) {
+      const entry = toolRows.get(callId);
+      _appendResultToRow(entry.row, output, isError);
+      // Result blocks grow scrollHeight; without this the user pinned
+      // at the bottom loses their pin when the row inflates.  appendMsg
+      // already routes through _scheduleScroll on the legacy path; this
+      // branch was the gap.
+      _scheduleScroll();
+      return entry.row;
+    }
     const html = renderToolOutput(output);
     const el = appendMsg(isError ? "error" : "tool", html, {
       label: (isError ? "error · " : "") + (name || "tool"),
       callId: callId,
     });
     return el;
+  }
+
+  // ------------------------------------------------------------------
+  // Tool batch construct — paired tool calls + approval + results
+  //
+  // Replaces the prior pinned approval dock + duplicate .msg.tool
+  // bubble pattern.  One construct per dispatch turn:
+  //   - solo (1 call, serial):  .coord-tool-batch--solo
+  //   - parallel (≥2 calls):    .coord-tool-batch--parallel
+  // The approval gate, judge verdicts, and tool results all render
+  // inside the construct so the operator reads call → verdict → result
+  // as one cohesive unit.
+  // ------------------------------------------------------------------
+
+  // call_id → { batch, row }.  Routes intent_verdict + tool_result
+  // events to the correct row.  Holds DOM refs only; the originating
+  // item payload is intentionally not retained (long sessions would
+  // pin per-call preview / parsed-args memory for the page lifetime).
+  const toolRows = new Map();
+
+  // Most-recently-rendered batch with an open approval gate.  Used for
+  // keyboard focus claiming and approval_resolved fallbacks.
+  let activeBatch = null;
+
+  function _formatBatchArgs(item) {
+    let s = item.header || item.approval_label || item.preview || "";
+    if (item.func_name && s.startsWith(item.func_name + ":")) {
+      s = s.slice(item.func_name.length + 1).trim();
+    } else if (item.func_name === "bash" && s.startsWith("$ ")) {
+      s = s.slice(2);
+    }
+    return s;
+  }
+
+  // Single source of truth for the batch tier badge text.  Both the
+  // initial-render path (_pickBatchTier reading from items[]) and the
+  // live-refresh path (_refreshBatchTier reading from row dataset)
+  // route through here so the literal label can't drift between
+  // surfaces.
+  function _formatTierLabel(llmModel, hasHeuristic) {
+    if (llmModel !== null) {
+      return "⚖ llm" + (llmModel ? ":" + llmModel : "");
+    }
+    if (hasHeuristic) {
+      return "⚙ heuristic";
+    }
+    return "";
+  }
+
+  // Pick the highest-tier verdict across items for the initial batch
+  // tier badge.  LLM beats heuristic; first LLM verdict's judge_model
+  // wins (heterogeneous models within a single envelope is unusual but
+  // we default to the leading one for stability).
+  function _pickBatchTier(items) {
+    let llmModel = null;
+    let hasHeuristic = false;
+    for (const it of items) {
+      const v = it.judge_verdict || it.heuristic_verdict;
+      if (!v) continue;
+      const tier = v.tier || (it.judge_verdict ? "llm" : "heuristic");
+      if (tier === "llm" && llmModel === null) {
+        llmModel = v.judge_model || "";
+      } else if (tier === "heuristic") {
+        hasHeuristic = true;
+      }
+    }
+    return _formatTierLabel(llmModel, hasHeuristic);
+  }
+
+  // Coalesce _refreshBatchTier scans across a microtask so a burst of
+  // verdict updates on the same batch (e.g. 10 intent_verdict SSE
+  // events for a 10-row fan-out arriving in the same tick) collapse
+  // into ONE querySelectorAll + DOM compare.  Without this each
+  // verdict triggered an O(N-rows) scan, yielding O(N²) DOM walks
+  // per batch render or burst.
+  const _tierDirtyBatches = new Set();
+  let _tierFlushScheduled = false;
+  function _refreshBatchTier(batch) {
+    if (!batch) return;
+    _tierDirtyBatches.add(batch);
+    if (_tierFlushScheduled) return;
+    _tierFlushScheduled = true;
+    queueMicrotask(() => {
+      _tierFlushScheduled = false;
+      const dirty = Array.from(_tierDirtyBatches);
+      _tierDirtyBatches.clear();
+      dirty.forEach(_refreshBatchTierImmediate);
+    });
+  }
+
+  // Synchronous tier-badge recompute.  Called from the microtask
+  // flush; do not invoke directly from render-hot paths — go through
+  // _refreshBatchTier for the burst-coalescing benefit.
+  function _refreshBatchTierImmediate(batch) {
+    if (!batch || !batch.isConnected) return;
+    let llmModel = null;
+    let hasHeuristic = false;
+    batch.querySelectorAll(".coord-tool-row").forEach((r) => {
+      const t = r.dataset.verdictTier;
+      if (t === "llm" && llmModel === null) {
+        llmModel = r.dataset.verdictModel || "";
+      } else if (t === "heuristic") {
+        hasHeuristic = true;
+      }
+    });
+    const head = batch.querySelector(".coord-tool-batch-head");
+    if (!head) return;
+    let tierEl = head.querySelector(".coord-tool-batch-tier");
+    const label = _formatTierLabel(llmModel, hasHeuristic);
+    if (label) {
+      if (!tierEl) {
+        tierEl = document.createElement("span");
+        tierEl.className = "coord-tool-batch-tier";
+        head.appendChild(tierEl);
+      }
+      if (tierEl.textContent !== label) tierEl.textContent = label;
+    } else if (tierEl) {
+      tierEl.remove();
+    }
+  }
+
+  // Apply / refresh per-row status state from an item payload:
+  //  - data-needs-approval="1" when item.needs_approval && !item.error
+  //  - .coord-tool-row-status--auto pill when item.auto_approved
+  //  - .coord-tool-row-status--error pill + .error class when policy-
+  //    blocked (item.error && !needs_approval)
+  // Idempotent: clears any prior status pills + the data attribute
+  // before re-applying so an upgrade-in-place (e.g. SSE folding tool
+  // _info / approve_request items into a previously rendered
+  // --running batch) doesn't leave stale markers.  Runtime errors
+  // arriving via tool_result are tracked via row.classList.add("error")
+  // in _appendResultToRow and intentionally not cleared here — they
+  // reflect execution outcome, not the static item payload.
+  function _refreshRowStatus(row, item) {
+    if (!row || !item) return;
+    const callLine = row.querySelector(".coord-tool-row-call");
+    if (callLine) {
+      callLine
+        .querySelectorAll(".coord-tool-row-status")
+        .forEach((p) => p.remove());
+    }
+    delete row.dataset.needsApproval;
+    // Don't clear .error here when it came from a result (no
+    // matching item.error); only clear the static-policy marker.
+    // Approximate by re-deriving solely from item below.
+    row.classList.remove("error");
+    if (item.needs_approval && !item.error) {
+      row.dataset.needsApproval = "1";
+    }
+    if (callLine && item.auto_approved && !item.needs_approval) {
+      const pill = document.createElement("span");
+      pill.className = "coord-tool-row-status coord-tool-row-status--auto";
+      const reason = _normaliseAutoApproveReason(item.auto_approve_reason);
+      pill.textContent = "✓ " + reason;
+      pill.title = "auto-approved (no operator prompt) — reason: " + reason;
+      callLine.appendChild(pill);
+    }
+    if (callLine && item.error && !item.needs_approval) {
+      const errPill = document.createElement("span");
+      errPill.className = "coord-tool-row-status coord-tool-row-status--error";
+      errPill.textContent = "✗ " + (item.error || "blocked");
+      callLine.appendChild(errPill);
+      row.classList.add("error");
+    }
+    // If a runtime tool_result already landed an .error on this row,
+    // re-derive it from the result block's presence so we don't
+    // accidentally drop the cue when refreshing from a non-error
+    // item shape.
+    if (
+      row.querySelector(".coord-tool-row-result.coord-tool-row-result--error")
+    ) {
+      row.classList.add("error");
+    }
+  }
+
+  function _renderBatchRow(item, indexLabel) {
+    const row = document.createElement("div");
+    row.className = "coord-tool-row";
+    if (item.call_id) row.dataset.callId = item.call_id;
+
+    const callLine = document.createElement("div");
+    callLine.className = "coord-tool-row-call";
+
+    if (indexLabel) {
+      const idx = document.createElement("span");
+      idx.className = "coord-tool-row-idx";
+      idx.textContent = indexLabel;
+      callLine.appendChild(idx);
+    }
+
+    const name = document.createElement("span");
+    name.className = "coord-tool-row-name";
+    name.textContent = item.func_name || "(unknown tool)";
+    callLine.appendChild(name);
+
+    const args = document.createElement("span");
+    args.className = "coord-tool-row-args";
+    args.textContent = _formatBatchArgs(item);
+    callLine.appendChild(args);
+
+    row.appendChild(callLine);
+    // Apply status pills + data-needs-approval through the shared
+    // helper so initial render and upgrade-in-place can't drift.
+    _refreshRowStatus(row, item);
+    return row;
+  }
+
+  // Stable signature for a verdict — used to skip the DOM rebuild when
+  // an SSE replay (or duplicate intent_verdict event) carries the same
+  // verdict body we already painted.  Any field change (rec/risk/conf
+  // /reasoning) flips the signature and re-renders.
+  function _verdictSig(verdict) {
+    if (!verdict) return "";
+    // ``tier`` + ``judge_model`` are part of the signature because a
+    // heuristic→llm transition can otherwise share the four core
+    // fields (rec / risk / conf / reasoning).  ``dataset.verdictTier``
+    // is only updated when the rebuild runs, so dropping the tier from
+    // the signature would lock the header on ``⚙ heuristic`` even
+    // after the LLM verdict lands.
+    return [
+      verdict.recommendation || "",
+      verdict.risk_level || "",
+      verdict.confidence != null ? String(verdict.confidence) : "",
+      verdict.reasoning || "",
+      verdict.tier || "",
+      verdict.judge_model || "",
+    ].join("");
+  }
+
+  function _appendVerdictLineTo(row, verdict) {
+    // Dedupe by signature so reconnect storms don't tear down + rebuild
+    // an unchanged verdict line.  _appendVerdictLineTo(row, null) is
+    // used by _appendJudgePendingLineTo to clear and start fresh — that
+    // path explicitly bypasses the dedupe (sig of null is "").
+    const sig = _verdictSig(verdict);
+    if (verdict && row.dataset.verdictSig === sig) {
+      return row.querySelector(".coord-tool-row-verdict");
+    }
+    row.dataset.verdictSig = sig;
+
+    let line = row.querySelector(".coord-tool-row-verdict");
+    if (!line) {
+      line = document.createElement("div");
+      line.className = "coord-tool-row-verdict";
+      const callEl = row.querySelector(".coord-tool-row-call");
+      if (callEl && callEl.nextSibling) {
+        row.insertBefore(line, callEl.nextSibling);
+      } else {
+        row.appendChild(line);
+      }
+    }
+    line.replaceChildren();
+    if (verdict) {
+      const chip = document.createElement("code");
+      const rec = verdict.recommendation || "?";
+      const risk = verdict.risk_level || "?";
+      chip.textContent = "judge: " + rec + " · risk: " + risk;
+      if (rec === "approve") chip.classList.add("rec-approve");
+      else if (rec === "review") chip.classList.add("rec-review");
+      else if (rec === "deny") chip.classList.add("rec-deny");
+      line.appendChild(chip);
+      if (verdict.confidence != null) {
+        const conf = document.createElement("code");
+        const v = verdict.confidence;
+        conf.textContent = typeof v === "number" ? v.toFixed(2) : String(v);
+        line.appendChild(conf);
+      }
+    }
+    const oldRationale = row.querySelector(".coord-tool-row-rationale");
+    if (oldRationale) oldRationale.remove();
+    if (verdict && verdict.reasoning) {
+      const det = document.createElement("details");
+      det.className = "coord-tool-row-rationale";
+      const sum = document.createElement("summary");
+      sum.textContent = "rationale";
+      det.appendChild(sum);
+      const body = document.createElement("div");
+      body.className = "coord-tool-row-rationale-body";
+      body.textContent = verdict.reasoning;
+      det.appendChild(body);
+      // Insert immediately after the verdict line so the rationale
+      // stays adjacent to the chip even when a result block has
+      // already landed below — DOM order otherwise reads as
+      // [call, verdict, result, rationale], which visually disconnects
+      // the rationale from the chip it explains.
+      line.insertAdjacentElement("afterend", det);
+    }
+    // Persist the verdict's tier on the row so the batch's header
+    // tier badge can escalate from ⚙ heuristic → ⚖ llm when a later
+    // intent_verdict lands an LLM verdict.  Default to "heuristic"
+    // when tier is absent — heuristic verdicts ship without an
+    // explicit tier marker on every server emitter.
+    if (verdict) {
+      row.dataset.verdictTier = verdict.tier || "heuristic";
+      if (verdict.judge_model) {
+        row.dataset.verdictModel = verdict.judge_model;
+      } else {
+        delete row.dataset.verdictModel;
+      }
+    } else {
+      delete row.dataset.verdictTier;
+      delete row.dataset.verdictModel;
+    }
+    _refreshBatchTier(row.closest(".coord-tool-batch"));
+    return line;
+  }
+
+  function _appendJudgePendingLineTo(row) {
+    const line = _appendVerdictLineTo(row, null);
+    const chip = document.createElement("code");
+    chip.className = "judging";
+    const spin = document.createElement("span");
+    spin.className = "spin";
+    spin.setAttribute("aria-hidden", "true");
+    chip.appendChild(spin);
+    chip.appendChild(document.createTextNode("judge evaluating…"));
+    line.appendChild(chip);
+  }
+
+  function _appendResultToRow(row, output, isError) {
+    if (!row) return;
+    const existing = row.querySelector(".coord-tool-row-result");
+    if (existing) existing.remove();
+    if (isError) {
+      row.classList.add("error");
+      // Lift the row's error onto the enclosing batch so the left
+      // stripe + status pill (--error) cue the operator at the batch
+      // level too.  Idempotent — re-fires don't stack.
+      const batch = row.closest(".coord-tool-batch");
+      if (batch) batch.classList.add("coord-tool-batch--error");
+    }
+    const block = document.createElement("div");
+    block.className = "coord-tool-row-result";
+    // Marker class so _refreshRowStatus can preserve the row's
+    // .error state across upgrade-in-place when the error came from
+    // a tool_result (not a static item.error).
+    if (isError) block.classList.add("coord-tool-row-result--error");
+    const lead = document.createElement("span");
+    lead.className = "coord-tool-row-result-lead";
+    lead.textContent = isError ? "✗ error: " : "↳ result: ";
+    block.appendChild(lead);
+    // Pretty-print JSON when the output parses; coord tool surfaces
+    // (list_nodes, tasks, spawn_workstream, ...) emit JSON by default,
+    // and a single-line dump is unreadable for a multi-key result.
+    // The parent .coord-tool-row-result has white-space: pre-wrap, so
+    // a textContent assignment with embedded \n preserves the
+    // formatting without needing a nested <pre>.
+    const cleaned = stripAnsi(output || "");
+    const body = document.createElement("span");
+    let pretty = cleaned;
+    // Pretty-print JSON only when:
+    //  - the payload looks like JSON (first non-space char is { or [),
+    //    so we don't waste a parse on plain text or HTML, AND
+    //  - it's small enough that the parse + restringify is cheap
+    //    (cap at 32 KiB).  A 100 KiB tool output can deepen into a
+    //    multi-MB object graph and stall the main thread for hundreds
+    //    of ms; the parent CSS is white-space: pre-wrap so raw text
+    //    still wraps and stays readable past the cap.
+    const PRETTY_PRINT_CAP = 32 * 1024;
+    if (cleaned && cleaned.length <= PRETTY_PRINT_CAP) {
+      const head = cleaned.charCodeAt(0);
+      // 0x7B = '{', 0x5B = '['  — leading whitespace would also fail
+      // the cheap heuristic; that's intentional, the pretty-print is
+      // a UX nice-to-have not a contract.
+      if (head === 0x7b || head === 0x5b) {
+        try {
+          const parsed = JSON.parse(cleaned);
+          if (parsed && typeof parsed === "object") {
+            pretty = JSON.stringify(parsed, null, 2);
+          }
+        } catch (_) {
+          /* not JSON — fall through to raw text */
+        }
+      }
+    }
+    body.textContent = pretty;
+    block.appendChild(body);
+    row.appendChild(block);
+  }
+
+  function _makeActionButton(label, role, kbdHint, ariaLabel) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "act";
+    btn.dataset.role = role;
+    btn.appendChild(document.createTextNode(label));
+    if (kbdHint) {
+      const kbd = document.createElement("span");
+      kbd.className = "kbd";
+      kbd.setAttribute("aria-hidden", "true");
+      kbd.textContent = kbdHint;
+      btn.appendChild(kbd);
+    }
+    if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
+    return btn;
+  }
+
+  // Concise, screen-reader friendly summary of a pending batch — used
+  // both as the .coord-tool-batch[role=region] aria-label and as the
+  // text fed to the off-screen assertive announcer when the gate
+  // appears.  "Approval required: spawn_workstream + 9 more" reads
+  // cleanly through a SR without revealing every nested arg.
+  function _approvalAriaLabel(items) {
+    const first =
+      (items && items[0] && (items[0].func_name || items[0].approval_label)) ||
+      "tool";
+    const rest = items.length > 1 ? " + " + (items.length - 1) + " more" : "";
+    return "Approval required: " + first + rest;
+  }
+
+  // Header kicker text for a pending batch.  Both the upgrade-in-place
+  // and fresh-build paths in appendToolBatch render this; pulling the
+  // string into one place keeps the two paths from drifting on a
+  // future label tweak.
+  function _pendingKickerText(items) {
+    return items.length >= 2
+      ? "⚠ Approval · Parallel " + items.length
+      : "⚠ Approval";
+  }
+
+  function _buildBatchActions(batch, items) {
+    const actions = document.createElement("div");
+    actions.className = "coord-tool-actions";
+    const spacer = document.createElement("div");
+    spacer.className = "spacer";
+    actions.appendChild(spacer);
+
+    const denyBtn = _makeActionButton("Deny", "deny", "D", "Deny (D)");
+    denyBtn.classList.add("danger");
+    denyBtn.addEventListener("click", () =>
+      _resolveBatchAction(batch, false, false),
+    );
+    actions.appendChild(denyBtn);
+
+    const alwaysNames = items
+      .filter(
+        (it) =>
+          it.needs_approval &&
+          it.func_name &&
+          it.func_name !== "__budget_override__" &&
+          !it.error,
+      )
+      .map((it) => it.approval_label || it.func_name);
+    if (alwaysNames.length > 0) {
+      const ariaAlways = "Always approve " + alwaysNames.join(", ");
+      const alwaysBtn = _makeActionButton("Always", "always", "⇧A", ariaAlways);
+      alwaysBtn.classList.add("always");
+      alwaysBtn.title = ariaAlways;
+      alwaysBtn.addEventListener("click", () =>
+        _resolveBatchAction(batch, true, true),
+      );
+      actions.appendChild(alwaysBtn);
+    }
+
+    const approveBtn = _makeActionButton(
+      "Approve",
+      "approve",
+      "⏎",
+      "Approve (Enter)",
+    );
+    approveBtn.classList.add("primary");
+    approveBtn.addEventListener("click", () =>
+      _resolveBatchAction(batch, true, false),
+    );
+    actions.appendChild(approveBtn);
+
+    return actions;
+  }
+
+  async function _resolveBatchAction(batch, approved, always) {
+    // Pick a call_id from a row that's actually in the server's
+    // pending_items (data-needs-approval="1").  approve_request
+    // envelopes carry the FULL items list including auto-approved /
+    // policy-blocked siblings; resolving against one of those would
+    // 409 since the server's pending_items wouldn't recognise it.
+    const pendingRow = batch.querySelector(
+      '.coord-tool-row[data-needs-approval="1"][data-call-id]',
+    );
+    const callId = pendingRow && pendingRow.dataset.callId;
+    if (!callId) return;
+    _setBatchActionsDisabled(batch, true);
+    // Stash the "always" intent on the batch as a backward-compat
+    // fallback for the approval_resolved SSE handler.  Server now
+    // echoes `always` on the resolved event (post-PR-447) so peer
+    // tabs render the right status pill in cross-tab scenarios; the
+    // dataset is only consulted during a hot-deploy window where the
+    // SSE event might briefly omit the field.  Also echoes back to
+    // the operator that the click landed.
+    batch.dataset.requestedAlways = always ? "1" : "";
+    try {
+      const resp = await approveWorkstream(wsId, {
+        approved: !!approved,
+        always: !!always,
+        call_id: callId,
+      });
+      if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
+    } catch (e) {
+      _setBatchActionsDisabled(batch, false);
+      delete batch.dataset.requestedAlways;
+      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
+      else console.error(e);
+      return;
+    }
+    // approval_resolved SSE event will morph the batch authoritatively.
+  }
+
+  function _setBatchActionsDisabled(batch, disabled) {
+    batch.querySelectorAll(".coord-tool-actions button").forEach((b) => {
+      b.disabled = !!disabled;
+    });
+  }
+
+  // Build the resolved-state status pill.  Shared between the live
+  // _morphBatchResolved path (post-approve, post-deny) and the
+  // history-replay path inside appendToolBatch (renders resolved
+  // batches without ever showing actions).
+  function _buildStatusPill(opts) {
+    const status = document.createElement("div");
+    status.className = "coord-tool-status";
+    status.classList.add(
+      opts.approved
+        ? "coord-tool-status--approved"
+        : "coord-tool-status--denied",
+    );
+    const label = document.createElement("span");
+    if (opts.approved) {
+      label.textContent = opts.always ? "✓ approved · always" : "✓ approved";
+    } else {
+      label.textContent = "✗ denied";
+    }
+    status.appendChild(label);
+    if (opts.feedback) {
+      const fb = document.createElement("span");
+      fb.className = "coord-tool-status-feedback";
+      fb.textContent = "— " + opts.feedback;
+      status.appendChild(fb);
+    }
+    return status;
+  }
+
+  function _morphBatchResolved(batch, opts) {
+    if (!batch) return;
+    batch.classList.remove("coord-tool-batch--pending");
+    batch.classList.add(
+      opts.approved ? "coord-tool-batch--approved" : "coord-tool-batch--denied",
+    );
+    // Drop the [role=region] approval landmark so the resolved batch
+    // stops claiming "Approval required" in SR landmark navigation.
+    batch.removeAttribute("role");
+    batch.removeAttribute("aria-label");
+    const actions = batch.querySelector(".coord-tool-actions");
+    if (actions) actions.replaceWith(_buildStatusPill(opts));
+    if (activeBatch === batch) activeBatch = null;
+  }
+
+  function _focusBatchPrimary(batch, prefer) {
+    if (!batch) return;
+    const role = prefer === "deny" ? "deny" : "approve";
+    const btn = batch.querySelector(
+      '.coord-tool-actions button[data-role="' + role + '"]',
+    );
+    if (btn) {
+      try {
+        btn.focus({ preventScroll: false });
+      } catch (_) {
+        /* noop */
+      }
+    }
+  }
+
+  // Build (or update) a batch construct for `items`.  Idempotent on
+  // SSE reconnect: when every item's call_id already has a row in the
+  // DOM, returns the existing batch + folds in any newly-cached
+  // verdicts (and upgrades the batch's state class when SSE arrives
+  // with a more specific state than history replay used).
+  //
+  // opts (mutually exclusive states):
+  //   pending (bool)       — show approval action row, mark --pending
+  //   auto (bool)          — mark --auto (no actions; auto-approved)
+  //   running (bool)       — mark --running (no actions; replay-time
+  //                          orphan with no result yet — could be
+  //                          pending OR auto-approved + in-flight,
+  //                          ambiguous until SSE clarifies)
+  //   resolved ({approved,denied,feedback,always}) — historical
+  //                          resolved batch (status pill prefilled)
+  //   judgePending (bool)  — show "judge evaluating…" placeholders
+  //                          on rows with needs_approval=true (only
+  //                          meaningful with pending)
+  function appendToolBatch(items, opts) {
+    items = (items || []).filter(Boolean);
+    if (items.length === 0) return null;
+    opts = opts || {};
+
+    const allMapped = items.every(
+      (it) => it.call_id && toolRows.has(it.call_id),
+    );
+    // Partial-overlap guard.  If only SOME of the incoming call_ids
+    // are mapped (i.e. they belong to a different prior batch),
+    // overwriting toolRows in the create-new path below would orphan
+    // those prior rows — they'd stay in their old batch's DOM but
+    // tool_result / intent_verdict events for them would route into
+    // the new batch.  This shape doesn't occur in normal operation
+    // (the server never sends overlapping envelopes), so we log it +
+    // unmap the stale entries before the new batch claims them.
+    if (!allMapped) {
+      const partial = items.filter(
+        (it) => it.call_id && toolRows.has(it.call_id),
+      );
+      if (partial.length > 0) {
+        console.warn(
+          "coord_ui: partial-overlap envelope — unmapping",
+          partial.length,
+          "stale call_ids before new batch claims them",
+        );
+        partial.forEach((it) => toolRows.delete(it.call_id));
+      }
+    }
+    if (allMapped) {
+      const existing = toolRows.get(items[0].call_id).batch;
+      // Upgrade-in-place: when SSE arrives with a more specific state
+      // than the placeholder history replay rendered, morph the
+      // existing shell instead of leaving stale chrome.  The two real
+      // upgrade transitions:
+      //   --running → --pending  (SSE approve_request fires for an
+      //                            orphan turn that was actually
+      //                            awaiting approval at reload)
+      //   --running → --auto     (SSE tool_info fires for an orphan
+      //                            turn that was actually auto-
+      //                            approved + in-flight at reload)
+      if (
+        opts.pending &&
+        !existing.classList.contains("coord-tool-batch--pending")
+      ) {
+        existing.classList.remove(
+          "coord-tool-batch--approved",
+          "coord-tool-batch--denied",
+          "coord-tool-batch--auto",
+          "coord-tool-batch--running",
+          "coord-tool-batch--error",
+        );
+        existing.classList.add("coord-tool-batch--pending");
+        existing.setAttribute("role", "region");
+        existing.setAttribute("aria-label", _approvalAriaLabel(items));
+        const kicker = existing.querySelector(".coord-tool-batch-kicker");
+        if (kicker) {
+          kicker.textContent = _pendingKickerText(items);
+        }
+        const statusEl = existing.querySelector(".coord-tool-status");
+        const actionsEl = existing.querySelector(".coord-tool-actions");
+        const newActions = _buildBatchActions(existing, items);
+        if (statusEl) statusEl.replaceWith(newActions);
+        else if (actionsEl) actionsEl.replaceWith(newActions);
+        else existing.appendChild(newActions);
+        activeBatch = existing;
+        _announceAssertive(_approvalAriaLabel(items));
+      } else if (
+        opts.auto &&
+        existing.classList.contains("coord-tool-batch--running")
+      ) {
+        existing.classList.remove("coord-tool-batch--running");
+        existing.classList.add("coord-tool-batch--auto");
+      } else if (opts.pending) {
+        // Already pending — keep the action row, just refresh
+        // activeBatch so kb shortcut + approval_resolved routing
+        // target the right construct.  Don't re-announce; SR already
+        // heard about this gate.
+        activeBatch = existing;
+      }
+      items.forEach((it) => {
+        const entry = toolRows.get(it.call_id);
+        if (!entry) return;
+        // Refresh per-row status from the authoritative SSE item:
+        // clears any stale data-needs-approval / status pills the
+        // earlier shell rendered (e.g. replay-time orphan rows had
+        // no auto/error info; SSE tool_info / approve_request items
+        // do).  Preserves runtime tool_result errors via the
+        // .coord-tool-row-result--error marker.
+        _refreshRowStatus(entry.row, it);
+        const cached = judgeVerdicts.get(it.call_id);
+        const v = it.judge_verdict || it.heuristic_verdict || cached;
+        if (v) {
+          _appendVerdictLineTo(entry.row, v);
+        } else if (
+          it.needs_approval &&
+          opts.judgePending &&
+          !entry.row.querySelector(".coord-tool-row-verdict")
+        ) {
+          _appendJudgePendingLineTo(entry.row);
+        }
+      });
+      return existing;
+    }
+
+    const batch = document.createElement("div");
+    batch.className = "coord-tool-batch";
+    batch.classList.add(
+      items.length >= 2
+        ? "coord-tool-batch--parallel"
+        : "coord-tool-batch--solo",
+    );
+    if (opts.pending) batch.classList.add("coord-tool-batch--pending");
+    else if (opts.auto) batch.classList.add("coord-tool-batch--auto");
+    else if (opts.running) batch.classList.add("coord-tool-batch--running");
+    else if (opts.resolved) {
+      batch.classList.add(
+        opts.resolved.approved
+          ? "coord-tool-batch--approved"
+          : "coord-tool-batch--denied",
+      );
+    }
+
+    const head = document.createElement("div");
+    head.className = "coord-tool-batch-head";
+    const kicker = document.createElement("span");
+    kicker.className = "coord-tool-batch-kicker";
+    if (opts.pending) {
+      kicker.textContent = _pendingKickerText(items);
+    } else if (opts.running) {
+      kicker.textContent =
+        items.length >= 2 ? "Running · Parallel " + items.length : "Running";
+    } else if (items.length >= 2) {
+      kicker.textContent = "Parallel · " + items.length + " tools";
+    } else {
+      kicker.textContent = "Tool";
+    }
+    head.appendChild(kicker);
+
+    const summary = document.createElement("span");
+    summary.className = "coord-tool-batch-summary";
+    const firstName =
+      items[0] && (items[0].func_name || items[0].approval_label)
+        ? items[0].func_name || items[0].approval_label
+        : "tool";
+    summary.textContent =
+      items.length >= 2
+        ? firstName + " + " + (items.length - 1) + " more"
+        : firstName;
+    head.appendChild(summary);
+
+    const tier = _pickBatchTier(items);
+    if (tier) {
+      const tierEl = document.createElement("span");
+      tierEl.className = "coord-tool-batch-tier";
+      tierEl.textContent = tier;
+      head.appendChild(tierEl);
+    }
+    batch.appendChild(head);
+
+    let anyRowError = false;
+    const renderedRows = [];
+    items.forEach((it, idx) => {
+      const indexLabel = items.length >= 2 ? idx + 1 + "/" + items.length : "";
+      const row = _renderBatchRow(it, indexLabel);
+      batch.appendChild(row);
+      renderedRows.push(row);
+      if (it.call_id) {
+        toolRows.set(it.call_id, { batch, row });
+      }
+      if (row.classList.contains("error")) anyRowError = true;
+      const cached = it.call_id ? judgeVerdicts.get(it.call_id) : null;
+      const verdict = it.judge_verdict || it.heuristic_verdict || cached;
+      if (verdict) {
+        _appendVerdictLineTo(row, verdict);
+      } else if (it.needs_approval && opts.judgePending) {
+        _appendJudgePendingLineTo(row);
+      }
+    });
+    // Tuck the parallel rail 4px in from the first / last row's
+    // top + bottom edges via class markers (CSS :first-of-type would
+    // miss because the batch has other div siblings — head + actions
+    // — coming before/after the row group).
+    if (renderedRows.length > 0) {
+      renderedRows[0].classList.add("coord-tool-row--first");
+      renderedRows[renderedRows.length - 1].classList.add(
+        "coord-tool-row--last",
+      );
+    }
+    // Lift any policy-blocked row's error onto the enclosing batch so
+    // the left stripe + status pill cue the operator at the batch
+    // level too.  _appendResultToRow does the same for runtime errors
+    // arriving via tool_result.
+    if (anyRowError) batch.classList.add("coord-tool-batch--error");
+
+    if (opts.pending) {
+      batch.appendChild(_buildBatchActions(batch, items));
+      // Mark the construct as a navigable landmark for SR users +
+      // route the action-required announcement through the dedicated
+      // assertive live region (the chat log itself is polite and
+      // gets muted during streaming).
+      batch.setAttribute("role", "region");
+      batch.setAttribute("aria-label", _approvalAriaLabel(items));
+      activeBatch = batch;
+      _announceAssertive(_approvalAriaLabel(items));
+    } else if (opts.resolved) {
+      batch.appendChild(_buildStatusPill(opts.resolved));
+    }
+
+    messagesEl.appendChild(batch);
+    _scheduleScroll();
+    return batch;
   }
 
   // ------------------------------------------------------------------
@@ -225,7 +1234,7 @@
     // token so the user sees live-formatted markdown instead of a final
     // "pop" on stream_end.  Heavy post-processing (syntax highlighting,
     // mermaid, KaTeX) stays deferred to streamingRenderFinalize below.
-    const body = currentAssistantEl.querySelector(".ts-msg-body");
+    const body = currentAssistantEl.querySelector(".msg-body");
     if (body && typeof streamingRender === "function") {
       try {
         streamingRender(body, currentAssistantBuf);
@@ -236,7 +1245,7 @@
     } else if (body) {
       body.textContent = currentAssistantBuf;
     }
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    _scheduleScroll();
   }
 
   function appendReasoningToken(text) {
@@ -251,9 +1260,9 @@
       messagesEl.setAttribute("aria-live", "off");
     }
     currentReasoningBuf += text;
-    const body = currentReasoningEl.querySelector(".ts-msg-body");
+    const body = currentReasoningEl.querySelector(".msg-body");
     if (body) body.textContent = currentReasoningBuf;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    _scheduleScroll();
   }
 
   function finishAssistantStream() {
@@ -263,7 +1272,7 @@
     // the innerHTML assignment inside the helper is XSS-safe as long as
     // renderer.js is trusted — same contract as ui/static/app.js.
     if (currentAssistantEl && currentAssistantBuf) {
-      const body = currentAssistantEl.querySelector(".ts-msg-body");
+      const body = currentAssistantEl.querySelector(".msg-body");
       if (body && typeof streamingRenderFinalize === "function") {
         try {
           streamingRenderFinalize(body, currentAssistantBuf);
@@ -280,139 +1289,206 @@
   }
 
   // ------------------------------------------------------------------
-  // Approval UI
+  // Approval UI — entry point used by the approve_request SSE handler.
+  // The legacy dock + its public surface (hideApproval / coordApprove)
+  // were removed when approvals moved into the inline batch construct.
+  // The SSE approval_resolved handler now drives _morphBatchResolved
+  // directly, and inline action buttons drive _resolveBatchAction.
   // ------------------------------------------------------------------
 
-  function showApproval(items) {
-    approvalTools.replaceChildren();
-    const pending = (items || []).filter((it) => it.needs_approval);
-    // Header row — "Approve N tool calls" clarifies that the batch
-    // approval applies to every row, not just the focused one.
-    if (pending.length > 0) {
-      const header = document.createElement("div");
-      header.className = "ts-approval-header";
-      header.textContent =
-        pending.length === 1
-          ? "Approve 1 tool call:"
-          : "Approve " + pending.length + " tool calls (batch):";
-      approvalTools.appendChild(header);
-    }
-    let firstCallId = null;
-    pending.forEach((it, idx) => {
-      if (!firstCallId) firstCallId = it.call_id;
-      const row = document.createElement("div");
-      row.className = "ts-approval-tool";
-      const label =
-        it.header || it.approval_label || it.func_name || "(unknown tool)";
-      row.textContent = pending.length > 1 ? idx + 1 + ". " + label : label;
-      approvalTools.appendChild(row);
+  function showApproval(items, judgePending) {
+    const list = (items || []).filter(Boolean);
+    if (list.length === 0) return;
+    const batch = appendToolBatch(list, {
+      pending: true,
+      judgePending: !!judgePending,
     });
-    pendingApprovalCallId = firstCallId;
-    approvalBar.classList.add("visible");
-    // Move focus to the approve button — non-modal region, so keyboard
-    // users don't have to Shift+Tab back from the composer.  One-time
-    // focus shift; subsequent Tab/Shift+Tab navigates normally.
-    const approveBtn = document.getElementById("coord-approve-btn");
-    if (approveBtn) {
-      try {
-        approveBtn.focus({ preventScroll: false });
-      } catch (_) {
-        /* noop */
-      }
+    const firstPending = list.find((it) => it.needs_approval);
+    if (batch && firstPending && firstPending.call_id) {
+      const cached = judgeVerdicts.get(firstPending.call_id);
+      if (cached) _focusBatchPrimary(batch, cached.recommendation);
     }
   }
 
-  function hideApproval() {
-    approvalBar.classList.remove("visible");
-    approvalTools.replaceChildren();
-    pendingApprovalCallId = null;
-    setApprovalButtonsDisabled(false);
-    // Return focus to the composer for keyboard users.  Only if the
-    // approval bar itself was the focus holder — don't steal focus from
-    // e.g. a user who clicked into the history log.
-    if (
-      document.activeElement &&
-      approvalBar.contains(document.activeElement)
-    ) {
-      try {
-        composer.focus();
-      } catch (_) {
-        /* noop */
-      }
-    }
+  // Generic approve POST — usable for both the coord-self batch and
+  // the per-child inline buttons in the children-tree.  Returns the
+  // response so callers can inspect 409 (stale call_id) bodies and
+  // refresh their local state.
+  //
+  // The path differs by target: the coord workstream is hosted on the
+  // console process itself (lifted verbs at /v1/api/workstreams/
+  // {coord_ws_id}/approve), but child workstreams live on cluster
+  // nodes and need to round-trip through the routing proxy at
+  // /v1/api/route/workstreams/{child_ws_id}/approve which resolves the
+  // ws_id to its owning node and forwards the body verbatim.  Without
+  // the /route/ prefix children always 404 because the console
+  // doesn't host them.
+  async function approveWorkstream(targetWsId, body) {
+    const isSelf = targetWsId === wsId;
+    const path = isSelf
+      ? "/v1/api/workstreams/" + encodeURIComponent(targetWsId) + "/approve"
+      : "/v1/api/route/workstreams/" +
+        encodeURIComponent(targetWsId) +
+        "/approve";
+    return postJSON(path, body);
   }
-
-  function setApprovalButtonsDisabled(disabled) {
-    // Disable all three approval buttons during an in-flight POST to
-    // prevent double-submit via double-click / Enter-hold.  The bar
-    // either dismisses on success or re-enables on error.
-    ["coord-approve-btn", "coord-approve-always-btn", "coord-deny-btn"].forEach(
-      (id) => {
-        const btn = document.getElementById(id);
-        if (btn) btn.disabled = !!disabled;
-      },
-    );
-  }
-
-  window.coordApprove = async function (approved, always) {
-    if (!pendingApprovalCallId) return; // no-op if bar already resolved
-    const body = {
-      approved: !!approved,
-      always: !!always,
-      call_id: pendingApprovalCallId,
-    };
-    setApprovalButtonsDisabled(true);
-    try {
-      const resp = await postJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/approve",
-        body,
-      );
-      if (!resp.ok) throw new Error("approve failed: HTTP " + resp.status);
-    } catch (e) {
-      setApprovalButtonsDisabled(false);
-      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
-      else console.error(e);
-      return;
-    }
-    hideApproval();
-  };
 
   // ------------------------------------------------------------------
   // Send / cancel / close
   // ------------------------------------------------------------------
 
-  window.coordSend = function (text) {
-    const msg = (text || "").trim();
-    if (!msg) return false;
+  // Busy reflects whether the worker is mid-turn. SSE state_change
+  // events drive it (running/thinking/attention → busy; idle/error →
+  // idle) so a server-side transition the user didn't initiate
+  // (another tab, judge reset) still keeps the composer in sync.
+  //
+  // composer.setBusy runs unconditionally so the Stop button label /
+  // dataset.forceCancel / placeholder stay canonical even on a
+  // redundant call — that idempotent reset is the contract any future
+  // caller relies on. queue.onIdleEdge runs only on the actual edge
+  // (it's the heavier work — querySelectorAll-driven promote sweep
+  // plus the cancel-timer cleanup wired via the onIdle hook above).
+  function setBusy(b) {
+    const next = !!b;
+    composer.setBusy(next);
+    const edge = next !== busy;
+    busy = next;
+    if (edge && !next) queue.onIdleEdge();
+  }
+
+  // Update the four-cell status bar from an on_status SSE event.
+  // Delegates formatting to the shared StatusBar.paint helper
+  // (shared_static/status_bar.js) so the interactive pane and this
+  // dashboard render identical thresholds + suffix rules.
+  function updateStatusBar(evt) {
+    if (!evt) return;
+    StatusBar.paint(
+      {
+        rootEl: statusBarEl,
+        modelEl: sbModelEl,
+        tokensEl: sbTokensEl,
+        toolsEl: sbToolsEl,
+        turnsEl: sbTurnsEl,
+      },
+      evt,
+      { alias: coordModelAlias, model: coordModel },
+    );
+    lastStatusEvt = evt;
+  }
+
+  window.coordSend = function () {
+    const text = composer.value;
+    const trimmed = (text || "").trim();
+    if (!trimmed) return false;
+
+    const snap = attachments.snapshot();
+
+    let queuedEl = null;
+    if (busy) {
+      // Server re-parses the !!! prefix to set queue priority — the
+      // optimistic bubble strips it for display.
+      let displayText = trimmed;
+      let priority = "notice";
+      if (trimmed.startsWith("!!!")) {
+        displayText = trimmed.slice(3).trimStart();
+        priority = "important";
+      }
+      queuedEl = queue.addQueuedMessage(displayText, priority);
+    } else {
+      setBusy(true);
+      appendText("user", trimmed, { label: "you" });
+    }
     composer.clear();
-    composer.setBusy(true);
-    postJSON("/v1/api/coordinator/" + encodeURIComponent(wsId) + "/send", {
-      message: msg,
+
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/send", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: trimmed,
+        attachment_ids: snap.attachment_ids,
+      }),
     })
-      .then((resp) => {
-        if (!resp.ok) {
-          return resp.text().then((txt) => {
-            throw new Error("send failed: " + resp.status + " " + txt);
+      .then((r) => r.json())
+      .then((data) => {
+        if (data && data.status === "queued" && data.msg_id) {
+          // Race: server returned queued but the client thought it was
+          // idle (SSE state_change hadn't arrived yet on initial load /
+          // reconnect). The optimistic user bubble is already in the
+          // log; we can't bind msg_id to a queued bubble retroactively
+          // without flipping the visual state mid-stream. Flip the busy
+          // flag so any subsequent send takes the queue path correctly,
+          // and accept the small UX gap (no in-UI dismiss for THIS
+          // message). The server still delivers it on worker drain.
+          if (queuedEl) queue.bind(queuedEl, data.msg_id);
+          else setBusy(true);
+          attachments.consume(data.attached_ids, data.dropped_attachment_ids);
+        } else if (data && data.status === "busy") {
+          if (queuedEl) queue.remove(queuedEl);
+          appendText("error", "Server is busy. Please wait.", {
+            label: "error",
           });
+          if (!queuedEl) setBusy(false);
+        } else if (data && data.status === "queue_full") {
+          if (queuedEl) queue.remove(queuedEl);
+          appendText("error", "Message queue full. Please wait.", {
+            label: "error",
+          });
+        } else {
+          attachments.consume(
+            data && data.attached_ids,
+            data && data.dropped_attachment_ids,
+          );
         }
-        appendText("user", msg, { label: "you" });
       })
       .catch((e) => {
-        if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
-        else console.error(e);
-      })
-      .finally(() => {
-        composer.setBusy(false);
+        if (queuedEl) queue.remove(queuedEl);
+        appendText(
+          "error",
+          "Connection error: " + (e && e.message ? e.message : e),
+          { label: "error" },
+        );
+        if (!queuedEl) setBusy(false);
       });
     return false;
   };
 
-  window.coordCancel = function () {
-    postJSON(
-      "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/cancel",
-      {},
-    ).catch((e) => console.error(e));
-  };
+  function cancelGeneration() {
+    if (!busy || stopBtn.disabled) return;
+    const force = stopBtn.dataset.forceCancel === "true";
+    stopBtn.disabled = true;
+    authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/cancel", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ force: force }),
+    })
+      .then(() => {
+        if (force) {
+          // Force cancel abandons the worker thread server-side; the
+          // SSE state_change → idle may not arrive (the thread may be
+          // stuck past the cancel checkpoint), so transition the UI
+          // directly. setBusy(false) clears cancel/force timers and
+          // composer.setBusy(false) resets the Stop button label,
+          // aria-label, and dataset.forceCancel — so the next turn
+          // starts in graceful-cancel mode without a stale Force Stop
+          // primed for the first click.
+          appendText("info", "Force stopped. Previous generation abandoned.", {
+            label: "info",
+          });
+          setBusy(false);
+        }
+      })
+      .catch((e) => {
+        appendText(
+          "error",
+          "Cancel error: " + (e && e.message ? e.message : e),
+          { label: "error" },
+        );
+        // Re-enable so the user can retry.
+        if (busy) stopBtn.disabled = false;
+      });
+  }
 
   window.coordCloseSession = async function () {
     if (
@@ -421,17 +1497,63 @@
       )
     )
       return;
+    // Suspend SSE reconnect first — the moment the server pops the ws
+    // from coord_mgr the next reconnect would 404 and surface a stream
+    // error toast right before the redirect, which reads as "the end
+    // button broke" even though the close succeeded. On any failure
+    // path we MUST resume SSE before returning so the user isn't left
+    // staring at a stale page disconnected from a still-alive session.
+    const resumeSse = () => {
+      try {
+        connectSSE();
+      } catch (_) {
+        /* connectSSE schedules its own reconnect on failure */
+      }
+    };
     try {
-      const resp = await postJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/close",
+      if (evtSource) evtSource.close();
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+    } catch (_) {
+      /* best-effort suspension */
+    }
+    let resp;
+    try {
+      resp = await postJSON(
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/close",
         {},
       );
-      if (!resp.ok) throw new Error("close failed: HTTP " + resp.status);
-      window.location.href = "/";
     } catch (e) {
-      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
-      else console.error(e);
+      // authFetch throws Error("auth") and shows the login modal on
+      // 401; other network failures land here too. Surface the cause
+      // visibly — silent toast.error wasn't enough for operators
+      // troubleshooting a stuck end-button.
+      const msg =
+        e && e.message === "auth"
+          ? "Sign-in required to end this session."
+          : "Close request failed: " + (e && e.message ? e.message : e);
+      if (typeof toast !== "undefined" && toast.error) toast.error(msg);
+      else window.alert(msg);
+      resumeSse();
+      return;
     }
+    if (!resp.ok) {
+      let detail = "HTTP " + resp.status;
+      try {
+        const body = await resp.json();
+        if (body && body.error) detail += " — " + body.error;
+      } catch (_) {
+        /* non-JSON body — fall back to status code */
+      }
+      const msg = "Could not end session: " + detail;
+      if (typeof toast !== "undefined" && toast.error) toast.error(msg);
+      else window.alert(msg);
+      resumeSse();
+      return;
+    }
+    window.location.href = "/";
   };
 
   // ------------------------------------------------------------------
@@ -465,12 +1587,18 @@
     // alone (WCAG 1.4.1).  ● connected, ○ connecting, ⚠ disconnected.
     const glyph = cls === "ok" ? "● " : cls === "err" ? "⚠ " : "○ ";
     sseEl.textContent = glyph + text;
-    // Preserve the base .ts-header-status class + add the BEM modifier
-    // variant so chat.css's .ts-header-status--ok / --err colour rules
-    // actually win; setting className to just "ok"/"err" drops the
-    // base class and the green / red colour never applies.
-    var base = "ts-header-status";
-    sseEl.className = cls ? base + " " + base + "--" + cls : base;
+    // Keep .appbar-status (DS: mono 11px --ink-3) as the base; layer the
+    // semantic colour via a data-state attribute so the glyph-prefixed
+    // label remains high-contrast while the text colour tracks OK / ERR.
+    sseEl.className = "appbar-status";
+    sseEl.dataset.state = cls || "";
+    if (cls === "ok") {
+      sseEl.style.color = "var(--ok)";
+    } else if (cls === "err") {
+      sseEl.style.color = "var(--err)";
+    } else {
+      sseEl.style.color = "";
+    }
   }
 
   function connectSSE() {
@@ -488,14 +1616,25 @@
     setSseStatus("connecting…", "");
     // Snapshot whether this is a reconnect BEFORE resetting
     // reconnectAttempts in onopen — child_ws_* events dispatched while
-    // we were disconnected aren't replayed by coordinator_events, so
-    // the client has to pull authoritative state after any gap.
+    // we were disconnected aren't replayed by the events SSE handler,
+    // so the client has to pull authoritative state after any gap.
     const wasReconnecting = reconnectAttempts > 0;
-    const url = "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/events";
+    const url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/events";
     evtSource = new EventSource(url, { withCredentials: true });
     evtSource.onopen = function () {
       reconnectAttempts = 0;
       setSseStatus("live", "ok");
+      // Lift the disconnected dim treatment + restore the last known
+      // counters; the replay phase will overwrite with authoritative
+      // server-side values on the next yields.  When no prior status
+      // event has been seen (a fresh coord that disconnected before
+      // its first turn), the onerror branch wrote "Reconnecting…"
+      // into the tokens cell — reset to the placeholder so the dim
+      // copy doesn't persist past a successful reconnect when the
+      // session never produces a status tick.
+      statusBarEl.classList.remove("ws-sb-disconnected");
+      if (lastStatusEvt) updateStatusBar(lastStatusEvt);
+      else StatusBar.resetTokensPlaceholder(sbTokensEl);
       if (wasReconnecting) {
         // Replace-mode refresh: the server is authoritative after a
         // gap; any SSE-only rows the client accumulated before
@@ -512,10 +1651,27 @@
         // they're always reachable by the time onopen fires.
         activeWaits.clear();
         _renderWaitIndicator();
+        // Drop the live-badge cache too — entries within the 5s TTL
+        // can carry stale pending_approval_detail (the child may
+        // have resolved its approval during the SSE gap).  Without
+        // this clear, inline approve/deny buttons could render on
+        // a row whose approval was resolved elsewhere; the next
+        // scheduleLiveFetch from loadChildren's finally branch
+        // (which fires for every visible row) repopulates with
+        // authoritative state. Preserve `permanent: true` entries
+        // (set on 403/404 — denied by permission/identity, not by
+        // state) so a user lacking admin.cluster.inspect doesn't
+        // pay one 403 per denied id on every reconnect.
+        for (const [id, c] of liveBadgeCache) {
+          if (!c || !c.permanent) liveBadgeCache.delete(id);
+        }
       }
     };
     evtSource.onerror = function () {
       setSseStatus("disconnected", "err");
+      // Dim the status bar so a stale reading doesn't read as live.
+      statusBarEl.classList.add("ws-sb-disconnected");
+      sbTokensEl.textContent = "Reconnecting…";
       try {
         evtSource.close();
       } catch (_) {
@@ -528,7 +1684,7 @@
       // On any other outcome, fall through to the normal reconnect
       // schedule.
       var probe = typeof authFetch === "function" ? authFetch : fetch;
-      probe("/v1/api/coordinator/" + encodeURIComponent(wsId))
+      probe("/v1/api/workstreams/" + encodeURIComponent(wsId))
         .then(function (r) {
           if (r.status === 401 && typeof showLogin === "function") {
             showLogin("Session expired. Please sign in to reconnect.");
@@ -580,39 +1736,83 @@
           ev.output || "",
           !!ev.is_error,
         );
-        // task_list mutations change persisted state the sidebar reads
+        // tasks mutations change persisted state the sidebar reads
         // from GET /tasks — re-fetch so the operator sees
         // add/update/remove/reorder without clicking the refresh icon.
         // list is a read-only action; skip to avoid redundant fetches.
         // Debounced so a burst of mutations coalesces into one fetch.
-        if (ev.name === "task_list" && !ev.is_error) {
+        if (ev.name === "tasks" && !ev.is_error) {
           loadTasksDebounced();
         }
         break;
       case "approve_request":
-        showApproval(ev.items);
-        // Surface each tool for context.  Dedupe by call_id: the console
-        // replays _pending_approval into every new SSE subscriber (see
-        // coordinator_events handler), so without this check an SSE
-        // reconnect would render each tool row a second time.
-        (ev.items || []).forEach((it) => {
-          if (!it.needs_approval) return;
-          if (
-            it.call_id &&
-            document.querySelector(
-              '.ts-msg[data-call-id="' + cssEscape(it.call_id) + '"]',
-            )
-          ) {
-            return; // already rendered in this pane — skip
-          }
-          appendToolCall(it);
-        });
+        // appendToolBatch is idempotent on call_ids — the console replays
+        // _pending_approval into every new SSE subscriber, so reconnect
+        // won't double-render the construct.
+        showApproval(ev.items, !!ev.judge_pending);
         break;
-      case "approval_resolved":
-        hideApproval();
+      case "approval_resolved": {
+        // Server-driven resolution.  Morph the active pending batch
+        // (the construct that posted the approve POST).  The server
+        // event carries `approved` + `feedback` only — the "always"
+        // intent.  Server now echoes ``always`` on the SSE payload
+        // (post-PR-447) so cross-tab resolution renders the right
+        // status pill on every subscribed tab — not just the one
+        // that clicked.  Fall back to this tab's stashed dataset
+        // flag for backward compat with a server hot-deploy where
+        // the SSE event might briefly omit the field.
+        // Fall back to a DOM lookup if activeBatch was never set
+        // (e.g. cross-tab resolution where this tab never rendered
+        // the approval gate before the resolved event landed).
+        const target =
+          activeBatch ||
+          messagesEl.querySelector(
+            ".coord-tool-batch.coord-tool-batch--pending",
+          );
+        if (target) {
+          const wasAlways =
+            ev.always === true ||
+            (ev.always === undefined && target.dataset.requestedAlways === "1");
+          _morphBatchResolved(target, {
+            approved: ev.approved !== false,
+            always: wasAlways,
+            feedback: ev.feedback || null,
+          });
+        }
         break;
+      }
       case "intent_verdict":
-        // Minimal surfacing — risk_level + recommendation.
+        // Cache the verdict so a late-arriving approve_request (or a
+        // SSE replay reorder) still surfaces it.  _cacheJudgeVerdict
+        // soft-caps the Map to bound long-session memory growth.
+        // intent_verdict is the LLM judge's signal by definition, so
+        // tag the cache entry as tier="llm" — _refreshBatchTier reads
+        // this off the row dataset to escalate the header badge from
+        // ⚙ heuristic → ⚖ llm when the late verdict lands.
+        if (ev.call_id) {
+          _cacheJudgeVerdict(ev.call_id, {
+            recommendation: ev.recommendation,
+            risk_level: ev.risk_level,
+            confidence: ev.confidence,
+            reasoning: ev.reasoning,
+            tier: ev.tier || "llm",
+            judge_model: ev.judge_model || "",
+          });
+          const entry = toolRows.get(ev.call_id);
+          if (entry) {
+            _appendVerdictLineTo(entry.row, judgeVerdicts.get(ev.call_id));
+            // Focus the construct's primary action once the verdict
+            // gives the reviewer context to act on — judge=deny defaults
+            // focus to Deny, otherwise Approve.
+            if (entry.batch.classList.contains("coord-tool-batch--pending")) {
+              _focusBatchPrimary(entry.batch, ev.recommendation);
+            }
+            break;
+          }
+        }
+        // Fallback — no matching pending row (approval already resolved
+        // or call_id missing).  Surface as a chat message so the verdict
+        // isn't silently dropped.
         appendText(
           "tool",
           "[judge] " +
@@ -639,18 +1839,106 @@
         });
         break;
       case "info":
-        appendText("tool", ev.message || "", { label: "info" });
+        // .msg.info (think-indigo) is the intended variant for info
+        // events; prior routing to "tool" gave them accent-tinted tool
+        // styling which mis-categorised them as tool calls.
+        appendText("info", ev.message || "", { label: "info" });
+        break;
+      case "connected":
+        // First yield from _coord_events_replay — populates the
+        // status bar's model cell before any history arrives.  Also
+        // re-fires on every SSE reconnect because the replay phase
+        // runs unconditionally on subscribe.
+        coordModel = ev.model || "";
+        coordModelAlias = ev.model_alias || ev.model || "";
+        sbModelEl.textContent = coordModelAlias || coordModel || "—";
+        sbModelEl.title = coordModel || "";
+        break;
+      case "status":
+        // Live token / context / tool / turn counters.  Replayed once
+        // on reconnect when last_usage is available, then ticked by
+        // SessionUI.on_status on every turn.
+        updateStatusBar(ev);
         break;
       case "state_change":
         statusEl.textContent = ev.state || "";
-        cancelBtn.style.display =
-          ev.state === "running" || ev.state === "thinking" ? "" : "none";
+        // Drive the composer's busy state from the canonical
+        // server-side workstream state so the Stop button + queue
+        // mode follow whatever the worker is doing — including
+        // transitions we didn't initiate (cross-tab cancel, judge
+        // reset, idle-after-error). Mirrors the interactive pane.
+        if (ev.state === "idle" || ev.state === "error") {
+          setBusy(false);
+        } else if (
+          ev.state === "running" ||
+          ev.state === "thinking" ||
+          ev.state === "attention"
+        ) {
+          setBusy(true);
+        }
         break;
       case "rename":
         nameEl.textContent = ev.name || "";
         break;
-      case "tools_auto_approved":
-        (ev.items || []).forEach((it) => appendToolCall(it));
+      case "message_queued":
+        // Server confirms the queued slot — the optimistic bubble
+        // already showed it; nothing to render here. (Earlier this
+        // surfaced an extra info row, which doubled up with the
+        // queued bubble once the composer started rendering one.)
+        break;
+      case "busy_error":
+        // Worker is still alive after a cancel attempt; re-arm the
+        // Stop button so the user can try again (or escalate to
+        // force-stop after the 2s window).
+        appendText("error", ev.message || "Server is busy.", {
+          label: "error",
+        });
+        if (busy) {
+          stopBtn.disabled = false;
+          stopBtn.textContent = "■ Stop";
+          stopBtn.setAttribute("aria-label", "Stop generation");
+          delete stopBtn.dataset.forceCancel;
+        }
+        break;
+      case "cancelled":
+        // Cancel was accepted; the worker may still be finishing
+        // (tool call in flight). Show "Cancelling…" and offer a
+        // Force Stop after 2s. state_change → idle is what actually
+        // clears busy; the 10s safety timer covers the connection-drop
+        // case.
+        if (!busy) break;
+        clearTimeout(cancelTimeoutId);
+        clearTimeout(forceTimeoutId);
+        stopBtn.disabled = true;
+        stopBtn.textContent = "Cancelling…";
+        stopBtn.setAttribute("aria-label", "Cancelling generation");
+        cancelTimeoutId = setTimeout(() => {
+          if (busy) {
+            stopBtn.disabled = false;
+            stopBtn.textContent = "⚠ Force Stop";
+            stopBtn.setAttribute("aria-label", "Force stop generation");
+            stopBtn.dataset.forceCancel = "true";
+          }
+        }, 2000);
+        forceTimeoutId = setTimeout(() => {
+          if (busy) {
+            appendText(
+              "info",
+              "Cancel didn't complete in time. You may need to resend your last message.",
+              { label: "info" },
+            );
+            setBusy(false);
+          }
+        }, 10000);
+        break;
+      case "tool_info":
+        // Renamed from ``tools_auto_approved`` when ``approve_tools``
+        // unified onto SessionUIBase — the shared body emits ``tool_info``
+        // for both kinds, matching the interactive payload name.  All
+        // items in a single ``tool_info`` envelope share a dispatch
+        // turn, so render them as one batch construct (parallel when
+        // ≥2, solo otherwise) rather than N separate bubbles.
+        appendToolBatch(ev.items || [], { auto: true });
         break;
       // Child-workstream fan-out routed through the coordinator's own
       // SSE stream.  CoordinatorManager filters the cluster event bus
@@ -702,14 +1990,16 @@
     // document.body, which would plant a floating badge at the page
     // root on any template variant where the header hasn't rendered
     // yet (#q-7).  Return null so callers skip rendering; the next
-    // event will retry.
-    const host =
-      document.getElementById("coord-status") ||
-      document.getElementById("coord-header");
+    // event will retry.  Mount into #coord-header (appbar container)
+    // NOT #coord-status — statusEl.textContent = ev.state on every
+    // state_change event clobbers all children of #coord-status, which
+    // would delete the wait indicator on the next state tick.  As a
+    // sibling inside the appbar it stays alive across state updates.
+    const host = document.getElementById("coord-header");
     if (!host) return null;
     el = document.createElement("span");
     el.id = "coord-wait-indicator";
-    el.className = "ts-header-status coord-wait-indicator";
+    el.className = "appbar-status coord-wait-indicator";
     el.setAttribute("role", "status");
     el.setAttribute("aria-live", "polite");
     el.style.display = "none";
@@ -795,7 +2085,7 @@
   const TERMINAL_CHILD_STATES = new Set(["closed", "deleted"]);
   const LIVE_BADGE_TTL_MS = 5000;
   const LIVE_BADGE_DEBOUNCE_MS = 250;
-  // Debounce window for /tasks refreshes triggered by ``task_list``
+  // Debounce window for /tasks refreshes triggered by ``tasks``
   // tool_result SSE events.  Without it, a model that runs
   // ``add → list`` (or any back-to-back mutation pair) double-fetches
   // the same envelope.  150ms is short enough to feel instant to a
@@ -899,7 +2189,566 @@
       }
     }
     row.appendChild(meta);
+    // Inline approve/deny block \u2014 shown only when the live block
+    // carries pending_approval_detail (the rich payload added by the
+    // server-side dashboard projection).  A "\u2691 approval" badge alone
+    // means the child is in attention state but the rich detail hasn't
+    // arrived yet (urgent live-bulk fetch is in flight); the row gets
+    // re-rendered when it lands.
+    if (cached && cached.live && cached.live.pending_approval_detail) {
+      const detail = cached.live.pending_approval_detail;
+      const block = renderApprovalBlock(child, detail);
+      if (block) row.appendChild(block);
+      // Late-arriving LLM judge: see comment above
+      // _maybeStartJudgePoll for the why. Hooks into a single
+      // global poller (not per-row) so off-screen rows still
+      // refresh and one bulk request covers every pending row.
+      _maybeStartJudgePoll();
+    }
+    // Recent auto-approves — tools that bypassed the operator gate
+    // (skill ``allowed_tools`` allowlist / blanket / admin policy /
+    // explicit "Always" click).  Without this pill the operator sees
+    // the child run tools they never approved with no explanation.
+    // The buffer is bounded server-side at 10 entries so this stays
+    // O(1) per render.
+    if (
+      cached &&
+      cached.live &&
+      Array.isArray(cached.live.recent_auto_approvals) &&
+      cached.live.recent_auto_approvals.length > 0
+    ) {
+      const pill = renderAutoApprovedPill(cached.live.recent_auto_approvals);
+      if (pill) row.appendChild(pill);
+    }
     return row;
+  }
+
+  // Build a compact pill summarising the row's recent auto-approves.
+  // Format: "auto-approved (skill): bash, edit_file +2".  Tooltip
+  // expands the full list with reasons.  Returns null when the
+  // server hasn't surfaced any entries — defensive against a missing
+  // field on older node payloads.
+  function renderAutoApprovedPill(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) return null;
+    const pill = document.createElement("div");
+    pill.className = "ch-auto-approved-pill";
+    // Group by reason for the lead label; show the most-common reason
+    // when the buffer mixes (e.g. skill + always after the operator
+    // hit "Approve + Always" on a tool the skill template missed).
+    const reasonCounts = new Map();
+    for (const e of entries) {
+      const r = _normaliseAutoApproveReason(e && e.auto_approve_reason);
+      reasonCounts.set(r, (reasonCounts.get(r) || 0) + 1);
+    }
+    let topReason = "auto_approve_tools";
+    let topCount = 0;
+    for (const [r, n] of reasonCounts) {
+      if (n > topCount) {
+        topReason = r;
+        topCount = n;
+      }
+    }
+    const names = entries
+      .map((e) => (e && (e.approval_label || e.func_name)) || "")
+      .filter(Boolean);
+    const visible = names.slice(0, 3).join(", ");
+    const more = names.length > 3 ? " +" + (names.length - 3) : "";
+    const label = document.createElement("span");
+    label.className = "ch-auto-approved-label";
+    label.textContent =
+      "✓ auto-approved (" + topReason + "): " + visible + more;
+    pill.appendChild(label);
+    // Full breakdown in the tooltip — operator can hover to see
+    // every tool name + its specific reason without expanding any
+    // additional UI.  Includes timestamps so a recent ad-hoc
+    // approval can be told apart from the skill-template baseline.
+    const tooltip = entries
+      .map((e) => {
+        const name = (e && (e.approval_label || e.func_name)) || "(unknown)";
+        const reason = _normaliseAutoApproveReason(e && e.auto_approve_reason);
+        const ts =
+          e && typeof e.ts === "number"
+            ? new Date(e.ts * 1000).toLocaleTimeString()
+            : "";
+        return ts ? `${ts}  ${name}  (${reason})` : `${name}  (${reason})`;
+      })
+      .join("\n");
+    pill.title = tooltip;
+    return pill;
+  }
+
+  // Late-judge polling — single global timer driving a bulk
+  // re-fetch of every row whose `pending_approval_detail.judge_pending`
+  // is true and not every item has a `judge_verdict` yet.  Necessary
+  // because the LLM judge runs async on the child node and never
+  // pushes a signal that reaches the coord; without polling the
+  // operator would stare at a "heuristic"-tier pill forever.
+  //
+  // Why a global poller instead of per-row:
+  //  1. Per-row would invalidate the cache and call scheduleLiveFetch
+  //     for off-screen rows, but scheduleLiveFetch returns early on
+  //     non-visible ids — leaving the cache empty AND no fetch in
+  //     flight.  Result: off-screen rows stuck on stale heuristic.
+  //  2. A single bulk request covers every pending row in one
+  //     round-trip; the per-row design would issue N microtask-
+  //     batched fetches that share the bulk path anyway.
+  const JUDGE_POLL_INTERVAL_MS = 2000;
+  // Cap by total wall-clock time, not attempts. Real LLM judges
+  // (esp. with reasoning effort) can exceed 30s — a 6-attempt /
+  // 12s cap was prematurely giving up.
+  const JUDGE_POLL_MAX_DURATION_MS = 90_000;
+  let judgePollTimer = null;
+  let judgePollStartedAt = 0;
+
+  function _maybeStartJudgePoll() {
+    if (judgePollTimer !== null) return; // already polling
+    judgePollStartedAt = Date.now();
+    judgePollTimer = setTimeout(_judgePollTick, JUDGE_POLL_INTERVAL_MS);
+  }
+
+  function _judgePollTick() {
+    judgePollTimer = null;
+    if (Date.now() - judgePollStartedAt > JUDGE_POLL_MAX_DURATION_MS) {
+      // Failed / timed-out judge — give up so we don't poll forever.
+      // Operator can hit the Refresh button to force a fresh fetch.
+      return;
+    }
+    // Walk the full childrenState — not just visible — so off-screen
+    // rows still get refreshed.  scheduleLiveFetch's visibility gate
+    // exists to keep idle rows from burning round-trips; here we
+    // explicitly want every pending-judge row in the next bulk
+    // regardless of viewport.
+    let stillPending = false;
+    for (const [wsId, entry] of childrenState) {
+      if (TERMINAL_CHILD_STATES.has(entry.state)) continue;
+      const cached = liveBadgeCache.get(wsId);
+      if (!cached || !cached.live) continue;
+      const detail = cached.live.pending_approval_detail;
+      if (!detail || !detail.judge_pending) continue;
+      const items = Array.isArray(detail.items) ? detail.items : [];
+      const allHaveJudge =
+        items.length > 0 && items.every((it) => it.judge_verdict);
+      if (allHaveJudge) continue;
+      // Bypass scheduleLiveFetch entirely (skips visibility + TTL
+      // gates) by adding to pendingLiveIds directly. flushLiveFetches
+      // will batch every pending row into one request.
+      if (WS_ID_RE.test(wsId)) {
+        pendingLiveIds.add(wsId);
+        stillPending = true;
+      }
+    }
+    if (!stillPending) return; // every verdict landed — done
+    // Cancel any debounce that's still pending so our flush runs
+    // now instead of waiting for it. Then flush directly so the
+    // bulk request fires before the next tick re-arms.
+    if (liveBadgeFlushTimer !== null) {
+      clearTimeout(liveBadgeFlushTimer);
+      liveBadgeFlushTimer = null;
+    }
+    flushLiveFetches();
+    judgePollTimer = setTimeout(_judgePollTick, JUDGE_POLL_INTERVAL_MS);
+  }
+
+  // Build the inline approval block: severity pill, intent summary +
+  // judge reasoning, and approve/deny buttons.  Returns a DOM node or
+  // null if the detail is unusable (defensive \u2014 server is supposed to
+  // emit None when no items).  Stays DOM-method-only to match the
+  // zero-innerHTML XSS posture of the rest of the row template.
+  // Risk-level → numeric severity for max-across-items computation.
+  // Values are ordinal: higher integer = higher severity. Both "crit"
+  // and "critical" map to 3 because production emitters disagree:
+  // turnstone/core/judge.py validates against ('low','medium','high',
+  // 'critical') and the heuristic seeds emit the full word, but
+  // earlier dock UI history used the abbreviation. Accept both.
+  // Unknown / malformed risk_level falls back to "high" rank so a
+  // schema drift fails *safe* (over-alert) rather than silently
+  // downgrading to a green pill — fixes the failure mode where
+  // "critical" was treated as unknown and rendered as low.
+  const RISK_SEVERITY = {
+    low: 0,
+    medium: 1,
+    med: 1,
+    high: 2,
+    crit: 3,
+    critical: 3,
+  };
+  const UNKNOWN_RISK_RANK = 2; // fail-safe: treat unknown as "high"
+
+  function _riskRank(verdict) {
+    if (!verdict) return -1;
+    const risk = (verdict.risk_level || "").toLowerCase();
+    return RISK_SEVERITY[risk] != null
+      ? RISK_SEVERITY[risk]
+      : UNKNOWN_RISK_RANK;
+  }
+
+  // Pick the item carrying the highest risk_level — pill colour and
+  // body display follow the worst tool in the envelope so a low-risk
+  // item[0] can't visually mask a crit item[2].
+  function _maxSeverityItem(items) {
+    let best = items[0];
+    let bestRank = _riskRank(best.judge_verdict || best.heuristic_verdict);
+    for (let i = 1; i < items.length; i += 1) {
+      const v = items[i].judge_verdict || items[i].heuristic_verdict;
+      const r = _riskRank(v);
+      if (r > bestRank) {
+        best = items[i];
+        bestRank = r;
+      }
+    }
+    return best;
+  }
+
+  function _evidenceLineText(line) {
+    if (typeof line === "string") return line;
+    try {
+      return JSON.stringify(line);
+    } catch (_) {
+      return String(line);
+    }
+  }
+
+  function _renderSubItem(item) {
+    const sub = document.createElement("div");
+    sub.className = "approval-sub-item";
+    const head = document.createElement("div");
+    head.className = "approval-sub-head";
+    const name = document.createElement("span");
+    name.className = "approval-tool";
+    name.textContent = item.func_name || item.approval_label || "(tool)";
+    head.appendChild(name);
+    const v = item.judge_verdict || item.heuristic_verdict;
+    if (v) {
+      const tier = document.createElement("span");
+      tier.className = "approval-tier";
+      const tierLabel = v.tier || (item.judge_verdict ? "llm" : "heuristic");
+      tier.textContent = (tierLabel === "llm" ? "⚖" : "⚙") + " " + tierLabel;
+      head.appendChild(tier);
+    }
+    sub.appendChild(head);
+    if (v && v.intent_summary) {
+      const p = document.createElement("div");
+      p.className = "approval-summary";
+      p.textContent = v.intent_summary;
+      sub.appendChild(p);
+    }
+    if (item.preview) {
+      const pre = document.createElement("pre");
+      pre.className = "approval-preview";
+      pre.textContent = item.preview;
+      sub.appendChild(pre);
+    }
+    return sub;
+  }
+
+  function renderApprovalBlock(child, detail) {
+    if (!detail || !Array.isArray(detail.items) || detail.items.length === 0) {
+      return null;
+    }
+    const items = detail.items;
+    // Pill + body display follow the highest-risk item; tool-name
+    // summary still leads with item[0] (envelope-level approve resolves
+    // them all so leading with [0] keeps the operator's mental model
+    // anchored on "what the LLM dispatched first").
+    const primary = items[0];
+    const severityItem = _maxSeverityItem(items);
+    const judge = severityItem.judge_verdict || null;
+    const heuristic = severityItem.heuristic_verdict || null;
+    const verdict = judge || heuristic;
+    // Pending pill should only show when there's *no* verdict to
+    // display — if a heuristic verdict is already present, the body
+    // renders intent_summary/reasoning from it and a "judge running"
+    // pill would contradict that. Only the judge-tier upgrade is
+    // genuinely pending; the heuristic itself is already final.
+    const judgePending = !!detail.judge_pending && !verdict;
+    // Tool-policy denial detection — any item with .error set and
+    // !needs_approval is server-blocked. Drives a banner instead of
+    // buttons (clicking either would no-op since the call won't run).
+    const policyBlocked = items.some((it) => it.error && !it.needs_approval);
+    const judgeUnavailable = !verdict && !judgePending && !policyBlocked;
+
+    const block = document.createElement("div");
+    block.className = "approval-block";
+
+    // Header line: pill + tool name(s) + tier:model
+    const header = document.createElement("div");
+    header.className = "approval-header";
+
+    // Pill \u2014 risk-level drives colour (.risk.low/.med/.high/.crit
+    // from shared_static/design/primitives/pills.css), recommendation
+    // lives in the disclosure footer per the plan. Special pills for
+    // policy-blocked, judge-pending, and judge-unavailable matrix
+    // rows so every state has a visible header signal.
+    const pill = document.createElement("span");
+    pill.className = "approval-pill";
+    if (policyBlocked) {
+      pill.classList.add("risk", "crit");
+      pill.textContent = "POLICY-BLOCKED";
+    } else if (judgePending) {
+      pill.classList.add("approval-pill-pending");
+      pill.textContent = "\u23f3 judge running\u2026";
+    } else if (judgeUnavailable) {
+      pill.classList.add("approval-pill-pending");
+      pill.textContent = "(judge unavailable)";
+    } else if (verdict) {
+      const risk = (verdict.risk_level || "").toLowerCase();
+      // Map verdict.risk_level → CSS class. Production emitters use
+      // both "crit" and "critical"; pills.css only defines .risk.crit
+      // so collapse the alias here. Unknown risk falls back to .high
+      // (matching UNKNOWN_RISK_RANK) — fail-safe over-alert.
+      const riskCls =
+        risk === "crit" || risk === "critical"
+          ? "crit"
+          : risk === "high"
+            ? "high"
+            : risk === "medium" || risk === "med"
+              ? "med"
+              : risk === "low"
+                ? "low"
+                : "high";
+      pill.classList.add("risk", riskCls);
+      const conf = verdict.confidence;
+      const confStr = typeof conf === "number" ? " " + conf.toFixed(2) : "";
+      pill.textContent = (verdict.risk_level || "").toUpperCase() + confStr;
+    }
+    header.appendChild(pill);
+
+    // Tool-name summary \u2014 first item, plus "+ N more" for envelopes.
+    const toolName = document.createElement("span");
+    toolName.className = "approval-tool";
+    const baseName = primary.func_name || primary.approval_label || "(tool)";
+    toolName.textContent =
+      items.length > 1
+        ? baseName + " + " + (items.length - 1) + " more"
+        : baseName;
+    header.appendChild(toolName);
+
+    // Tier + judge_model (e.g. "\u2696 llm:gpt-5" or "\u2699 heuristic").
+    if (verdict) {
+      const tier = document.createElement("span");
+      tier.className = "approval-tier";
+      const tierLabel = verdict.tier || (judge ? "llm" : "heuristic");
+      const glyph = tierLabel === "llm" ? "\u2696" : "\u2699";
+      const model = verdict.judge_model ? ":" + verdict.judge_model : "";
+      tier.textContent = glyph + " " + tierLabel + model;
+      header.appendChild(tier);
+    }
+
+    block.appendChild(header);
+
+    // Tool-policy denial: server-side policy already blocked at least
+    // one call in the envelope; render a banner instead of buttons
+    // (clicking either would no-op since the call won't run).
+    if (policyBlocked) {
+      const banner = document.createElement("div");
+      banner.className = "approval-policy-block";
+      const denied = items.find((it) => it.error && !it.needs_approval);
+      banner.textContent =
+        "\u26d4 " + ((denied && denied.error) || "blocked by tool policy");
+      block.appendChild(banner);
+      return block;
+    }
+
+    // Body: intent_summary (if any) + reasoning teaser + \u25b8 more.
+    const summary = verdict && verdict.intent_summary;
+    if (summary) {
+      const p = document.createElement("div");
+      p.className = "approval-summary";
+      p.textContent = summary;
+      block.appendChild(p);
+    }
+    const reasoning = verdict && verdict.reasoning;
+    const evidence =
+      verdict && Array.isArray(verdict.evidence) ? verdict.evidence : [];
+    if (reasoning || evidence.length > 0 || items.length > 1) {
+      // Reasoning teaser line \u2014 only rendered when reasoning is
+      // present. Evidence-only is also possible (heuristic-only path
+      // can carry evidence with no prose); evidence falls into the
+      // disclosure below. Without this guard, an evidence-only
+      // verdict would append an empty <div class="approval-reasoning">.
+      if (reasoning) {
+        const reasonLine = document.createElement("div");
+        reasonLine.className = "approval-reasoning";
+        const lead = document.createElement("span");
+        lead.className = "approval-reasoning-lead";
+        lead.textContent = "\u21b3 judge: ";
+        reasonLine.appendChild(lead);
+        const text = document.createElement("span");
+        text.textContent = reasoning;
+        reasonLine.appendChild(text);
+        block.appendChild(reasonLine);
+      }
+      // Auto-expand for high/crit risk, recommendation=deny, or a
+      // long preview (>4 lines) \u2014 the plan's \u00a7Frontend visual design
+      // auto-expand rule. Operator sees the full context by default
+      // at the moment they most need it.
+      const risk = ((verdict && verdict.risk_level) || "").toLowerCase();
+      const rec = (verdict && verdict.recommendation) || "";
+      const previewLines = primary.preview
+        ? primary.preview.split("\n").length
+        : 0;
+      const longPreview = previewLines > 4;
+      const longReasoning = reasoning && reasoning.length > 240;
+      const autoExpand =
+        risk === "high" ||
+        risk === "crit" ||
+        risk === "critical" ||
+        rec === "deny" ||
+        longPreview;
+      if (evidence.length > 0 || longReasoning || items.length > 1) {
+        const disclosure = document.createElement("details");
+        disclosure.className = "approval-disclosure";
+        if (autoExpand) disclosure.open = true;
+        const sum = document.createElement("summary");
+        sum.textContent = "\u25b8 more";
+        disclosure.appendChild(sum);
+        // Recommendation chip footer \u2014 keeps recommendation surfacing
+        // even though the pill colour is now risk-driven (per plan).
+        if (rec) {
+          const recChip = document.createElement("code");
+          recChip.className =
+            rec === "approve"
+              ? "rec-approve"
+              : rec === "deny"
+                ? "rec-deny"
+                : "rec-review";
+          recChip.textContent = "judge recommends: " + rec;
+          disclosure.appendChild(recChip);
+        }
+        if (evidence.length > 0) {
+          const ul = document.createElement("ul");
+          ul.className = "approval-evidence";
+          evidence.forEach((line) => {
+            const li = document.createElement("li");
+            li.textContent = _evidenceLineText(line);
+            ul.appendChild(li);
+          });
+          disclosure.appendChild(ul);
+        }
+        // Stack items 2..N inside the disclosure with their own
+        // intent_summary + preview + tier badge so the operator can
+        // see what every call in the envelope does (one approve
+        // resolves them all per server semantics).
+        if (items.length > 1) {
+          const moreLabel = document.createElement("div");
+          moreLabel.className = "approval-more-label";
+          moreLabel.textContent =
+            "\u25b8 " + (items.length - 1) + " more tools";
+          disclosure.appendChild(moreLabel);
+          for (let i = 1; i < items.length; i += 1) {
+            disclosure.appendChild(_renderSubItem(items[i]));
+          }
+        }
+        block.appendChild(disclosure);
+      }
+    }
+
+    // Preview \u2014 what's actually being run for the primary item.
+    if (primary.preview) {
+      const pre = document.createElement("pre");
+      pre.className = "approval-preview";
+      pre.textContent = primary.preview;
+      block.appendChild(pre);
+    }
+
+    // Action row: Deny + Approve.  Buttons are addEventListener-bound
+    // (not inline onclick) since the row is dynamically created and
+    // re-rendered. Both declared before listener wiring to avoid the
+    // cross-reference TDZ-shaped read pattern.
+    const actions = document.createElement("div");
+    actions.className = "approval-actions";
+    const denyBtn = document.createElement("button");
+    const approveBtn = document.createElement("button");
+    denyBtn.type = "button";
+    denyBtn.className = "act danger sm";
+    denyBtn.textContent = "Deny";
+    approveBtn.type = "button";
+    approveBtn.className = "act primary sm";
+    approveBtn.textContent = "Approve";
+    denyBtn.addEventListener("click", () =>
+      submitChildApproval(child.ws_id, detail, false, denyBtn, approveBtn),
+    );
+    approveBtn.addEventListener("click", () =>
+      submitChildApproval(child.ws_id, detail, true, denyBtn, approveBtn),
+    );
+    actions.appendChild(denyBtn);
+    actions.appendChild(approveBtn);
+    block.appendChild(actions);
+
+    return block;
+  }
+
+  // Submit the approve POST + handle the result.  On success, locally
+  // clear pending_approval_detail so the row re-renders without
+  // buttons immediately (optimistic update \u2014 the next live-bulk poll
+  // confirms).  On 409 (stale call_id), refresh the live block so the
+  // row re-renders against the new round.
+  async function submitChildApproval(
+    targetWsId,
+    detail,
+    approved,
+    denyBtn,
+    approveBtn,
+  ) {
+    const callId =
+      (detail && detail.call_id) ||
+      (detail &&
+        Array.isArray(detail.items) &&
+        detail.items[0] &&
+        detail.items[0].call_id) ||
+      "";
+    if (!callId) return;
+    denyBtn.disabled = true;
+    approveBtn.disabled = true;
+    try {
+      const resp = await approveWorkstream(targetWsId, {
+        approved: !!approved,
+        always: false,
+        call_id: callId,
+      });
+      if (resp.status === 409) {
+        // Stale call_id \u2014 server has rolled to a new round, or
+        // (more commonly) the approval was already resolved on
+        // another channel and this click raced. Keep both buttons
+        // disabled until the urgent refresh lands and re-renders
+        // the row: the row is about to be replaced wholesale, so
+        // the disabled DOM is dropped along with it. Re-enabling
+        // here was the bug \u2014 it opened a window where rapid clicks
+        // hit the same already-resolved approval, each producing a
+        // fresh 409, looping until the live-bulk eventually cleared
+        // the row. On the rare path where the urgent refresh fails
+        // entirely, the operator can hit the Refresh button on the
+        // children panel to force a full reload.
+        invalidateLiveBadge(targetWsId);
+        scheduleLiveFetch(targetWsId, { urgent: true });
+        // Quiet console-warn for diagnostics; no toast \u2014 the
+        // disappearing buttons / fresh row IS the operator-facing
+        // signal, and a toast on every rapid-click 409 would just
+        // add noise.
+        console.warn("approval state changed for", targetWsId);
+        return;
+      }
+      if (!resp.ok) {
+        throw new Error("approve failed: HTTP " + resp.status);
+      }
+      // Optimistic clear \u2014 the next child_ws_state event will arrive
+      // shortly and trigger a real refresh, but clearing locally
+      // makes the buttons disappear immediately on click.
+      const cached = liveBadgeCache.get(targetWsId);
+      if (cached && cached.live) {
+        cached.live = Object.assign({}, cached.live, {
+          pending_approval: false,
+          pending_approval_detail: null,
+        });
+        liveBadgeCache.set(targetWsId, cached);
+      }
+      renderChildren();
+    } catch (e) {
+      denyBtn.disabled = false;
+      approveBtn.disabled = false;
+      if (typeof toast !== "undefined" && toast.error) toast.error(String(e));
+      else console.error(e);
+    }
   }
 
   // Coalesce repeated renderChildren() calls within a single frame so
@@ -1051,7 +2900,7 @@
     childrenTreeEl.setAttribute("aria-busy", "true");
     try {
       const body = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/children",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/children",
       );
       // Default (initial page load): merge rather than clear.  SSE
       // events may have arrived during the in-flight fetch and
@@ -1083,7 +2932,7 @@
   async function loadTasks() {
     try {
       const body = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/tasks",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/tasks",
       );
       tasksState = body || { version: 1, tasks: [] };
     } catch (e) {
@@ -1094,7 +2943,7 @@
   }
 
   // Debounced wrapper for SSE-triggered refreshes.  A burst of
-  // task_list mutations (the model's typical add → update → list
+  // tasks mutations (the model's typical add → update → list
   // pattern, or a coordinator that re-renders the whole list) lands
   // multiple tool_result events within tens of ms; without this each
   // one would fire its own /tasks fetch.  Coalescing into one fetch
@@ -1123,9 +2972,15 @@
   const LIVE_BADGE_BULK_FLUSH_MS = LIVE_BADGE_DEBOUNCE_MS;
   const pendingLiveIds = new Set();
   let liveBadgeFlushTimer = null;
+  // Urgent-flush coalesce flag — N urgent calls in the same JS tick
+  // would otherwise issue N single-id bulk fetches (bulk endpoint
+  // accepts up to LIVE_BADGE_BULK_CAP ids per request). queueMicrotask
+  // batches them into one request that drains pendingLiveIds.
+  let urgentFlushScheduled = false;
 
-  function scheduleLiveFetch(childWsId) {
+  function scheduleLiveFetch(childWsId, opts) {
     if (!childWsId) return;
+    const urgent = !!(opts && opts.urgent);
     // Skip terminal-state children entirely — their live block will
     // never change again; fetching just burns a round-trip and caches
     // a stale value.  Renderer already styles closed/deleted rows.
@@ -1145,10 +3000,40 @@
       // change on any child triggers a fresh fetch → retry storm for
       // users who'll never have permission mid-session.
       if (cached.permanent) return;
-      if (Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
+      // Urgent fetches bypass the TTL — used when a child enters
+      // approval state and the row needs the rich pending_approval_detail
+      // payload (call_id, items, judge_verdict) to render inline buttons.
+      // Waiting for the next 5s TTL window would leave the operator
+      // staring at "⚑ approval" with no way to act.
+      if (!urgent && Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
     }
     if (!WS_ID_RE.test(childWsId)) return;
     pendingLiveIds.add(childWsId);
+    // Urgent: cancel the pending debounce and schedule a flush on
+    // the next microtask so N urgent calls in the same tick coalesce
+    // into one bulk request. Without the microtask hop, each urgent
+    // caller would drain pendingLiveIds with a single id and fire a
+    // separate fetch — defeating the bulk endpoint that accepts up
+    // to LIVE_BADGE_BULK_CAP ids per request.
+    if (urgent) {
+      if (liveBadgeFlushTimer !== null) {
+        clearTimeout(liveBadgeFlushTimer);
+        liveBadgeFlushTimer = null;
+      }
+      if (!urgentFlushScheduled) {
+        urgentFlushScheduled = true;
+        const flush = () => {
+          urgentFlushScheduled = false;
+          flushLiveFetches();
+        };
+        if (typeof queueMicrotask === "function") {
+          queueMicrotask(flush);
+        } else {
+          setTimeout(flush, 0);
+        }
+      }
+      return;
+    }
     if (liveBadgeFlushTimer !== null) return;
     liveBadgeFlushTimer = setTimeout(() => {
       liveBadgeFlushTimer = null;
@@ -1250,7 +3135,12 @@
       ws_id: childId,
       name: "",
     };
+    const prevActivity = existing.activity_state || "";
     existing.state = ev.state || existing.state;
+    existing.activity_state =
+      typeof ev.activity_state === "string"
+        ? ev.activity_state
+        : existing.activity_state || "";
     if (ev.node_id) existing.node_id = ev.node_id;
     childrenState.set(childId, existing);
     _touchChild(childId);
@@ -1261,7 +3151,25 @@
     // The TTL check in scheduleLiveFetch will refresh the badge on its
     // own schedule; identity-changing events (created/rename/closed)
     // still invalidate below.
-    scheduleLiveFetch(childId);
+    //
+    // Two activity_state transitions warrant an *urgent* (TTL-bypassing)
+    // fetch so the row carries pending_approval_detail in lockstep with
+    // the child's true state:
+    //   - "" / "tool" / "thinking" → "approval"  (need rich payload now
+    //     so the inline approve/deny buttons can render)
+    //   - "approval" → anything else            (need to drop the
+    //     stale payload so the buttons disappear; without this the
+    //     5s TTL leaves stale buttons on a row whose approval was
+    //     resolved elsewhere — e.g. the child's own UI tab)
+    const enteredApproval =
+      existing.activity_state === "approval" && prevActivity !== "approval";
+    const leftApproval =
+      prevActivity === "approval" && existing.activity_state !== "approval";
+    if (enteredApproval || leftApproval) {
+      scheduleLiveFetch(childId, { urgent: true });
+    } else {
+      scheduleLiveFetch(childId);
+    }
   }
 
   function handleChildClosed(ev) {
@@ -1270,6 +3178,11 @@
     const existing = childrenState.get(childId);
     if (!existing) return;
     existing.state = ev.reason === "deleted" ? "deleted" : "closed";
+    // Clearing the live cache eagerly on close prevents a stale
+    // pending_approval_detail from continuing to render approve/deny
+    // buttons on a closed row (its TTL would otherwise survive into
+    // the closed/deleted lifecycle until natural expiry).
+    invalidateLiveBadge(childId);
     childrenState.set(childId, existing);
     _touchChild(childId);
     renderChildren();
@@ -1366,44 +3279,267 @@
   // ------------------------------------------------------------------
 
   async function init() {
+    let wsSnapshot = null;
     try {
-      const data = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId),
+      wsSnapshot = await getJSON(
+        "/v1/api/workstreams/" + encodeURIComponent(wsId),
       );
-      nameEl.textContent = data.name || "";
-      statusEl.textContent = data.state || "";
+      nameEl.textContent = wsSnapshot.name || "";
+      statusEl.textContent = wsSnapshot.state || "";
     } catch (e) {
       appendText("error", "Failed to load coordinator: " + e.message);
       return;
     }
     try {
       const hist = await getJSON(
-        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/history",
+        "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
       );
+      // Map call_id → tool name resolved from the most recent
+      // assistant tool_calls.  Storage's `tool` rows carry only
+      // tool_call_id + content; the function name lives on the
+      // matching assistant entry — without this map every replayed
+      // tool result rendered with the literal label "tool", which
+      // looked like the tool calls had been replaced by raw JSON.
+      const toolNameByCallId = new Map();
+
+      // Pre-scan every tool message's tool_call_id so the
+      // assistant.tool_calls branch below knows whether each call_id
+      // already has a result persisted.  An assistant tool_calls turn
+      // with NO matching tool result for some call_ids = orphan: the
+      // tool was dispatched but didn't complete before the reload
+      // captured this history snapshot.  Orphans are ambiguous — the
+      // tool could have been (a) awaiting approval at reload, (b)
+      // auto-approved + still in flight, or (c) approved + still in
+      // flight.  We render orphans as a neutral --running shell with
+      // no actions; SSE then upgrades to --pending when it replays
+      // approve_request (case a) or to --auto when it replays
+      // tool_info (case b), and tool_result events land in the rows
+      // for case c.  Without this neutral state, painting Approve
+      // buttons on a non-pending orphan was misleading and could
+      // 409-on-submit because the call_id wasn't in pending_items.
+      // Pre-scan classifies each tool message's content as
+      // "denied" (server emits "Denied by user[: feedback]" /
+      // "Blocked by tool policy ..." for any deny path), "error"
+      // (Error: prefix from the standard tool error envelope), or
+      // "ok" (anything else).  Map keys are call_ids; the assistant
+      // tool_calls render below reads these to mark the resulting
+      // batch as resolved-denied (vs the default resolved-approved)
+      // and the tool-result render below propagates the error flag
+      // to appendToolResult so the row gets the .error class /
+      // --error stripe / "✗ error:" lead.  Without this both denied
+      // and errored tools rendered as plain "✓ approved" successes
+      // on every reload.
+      const callOutcomes = new Map();
+      (hist.messages || []).forEach((m) => {
+        if ((m.role || "tool") !== "tool" || !m.tool_call_id) return;
+        // Tool message content is usually a string but the multipart
+        // shape (text + image_url parts) is technically allowed.
+        let txt = "";
+        if (typeof m.content === "string") {
+          txt = m.content;
+        } else if (Array.isArray(m.content)) {
+          for (const part of m.content) {
+            if (part && typeof part === "object" && part.type === "text") {
+              txt += String(part.text || "");
+            }
+          }
+        }
+        // Server signals override prefix detection when present.
+        let outcome = "ok";
+        if (m.is_error) {
+          outcome = "error";
+        } else if (
+          txt.startsWith("Denied by user") ||
+          txt.startsWith("Blocked by tool policy")
+        ) {
+          outcome = "denied";
+        } else if (txt.startsWith("Error:")) {
+          outcome = "error";
+        }
+        callOutcomes.set(m.tool_call_id, outcome);
+      });
+
       (hist.messages || []).forEach((m) => {
         const role = m.role || "tool";
-        const content =
-          typeof m.content === "string"
-            ? m.content
-            : JSON.stringify(m.content || "");
-        if (!content) return;
-        if (role === "tool") {
-          appendToolResult(
-            m.tool_name || "tool",
-            m.tool_call_id || "",
-            content,
-            false,
+
+        // Assistant tool_calls — synthesize one batch construct per
+        // assistant turn so a parallel fan-out (tool_calls.length ≥ 2)
+        // reads as one cohesive dispatch, matching how live SSE
+        // renders the same flow via approve_request / tool_info.
+        // Resolved when every call_id has a matching tool result;
+        // otherwise --running (see the resolvedCallIds rationale
+        // above).  SSE upgrades --running in place when it knows
+        // more.
+        if (
+          role === "assistant" &&
+          Array.isArray(m.tool_calls) &&
+          m.tool_calls.length
+        ) {
+          const items = m.tool_calls.map((tc) => {
+            const fn = (tc && tc.function) || {};
+            const name = String(fn.name || "tool");
+            const callId = String((tc && tc.id) || "");
+            const argsRaw = String(fn.arguments || "");
+            let parsedArgs = null;
+            try {
+              parsedArgs = JSON.parse(argsRaw || "{}");
+            } catch (_) {
+              /* malformed — fall back to raw string in preview */
+            }
+            if (callId) toolNameByCallId.set(callId, name);
+            const item = synthesizeHistoricalToolCall(
+              name,
+              callId,
+              parsedArgs,
+              argsRaw,
+            );
+            // needs_approval is unknown at replay time (the
+            // assistant.tool_calls history payload doesn't persist
+            // the bit).  Leave it unset; the upgrade-in-place path
+            // refreshes per-row state via _refreshRowStatus from the
+            // authoritative SSE item when approve_request /
+            // tool_info actually arrives, so we never tag the wrong
+            // row as needing approval.
+            return item;
+          });
+          // Classify the batch as a whole:
+          //   - any call_id without an outcome at all → orphan,
+          //     render as --running (SSE will upgrade in place)
+          //   - any call_id outcome === "denied" → resolved-denied
+          //   - else → resolved-approved (a runtime error doesn't
+          //     change the approval verdict; the per-row .error class
+          //     comes from the tool_result branch below)
+          const outcomes = items.map((it) =>
+            it.call_id ? callOutcomes.get(it.call_id) : "ok",
           );
+          const allResolved = outcomes.every((o) => o !== undefined);
+          if (!allResolved) {
+            appendToolBatch(items, { running: true });
+          } else if (outcomes.some((o) => o === "denied")) {
+            appendToolBatch(items, { resolved: { approved: false } });
+          } else {
+            appendToolBatch(items, { resolved: { approved: true } });
+          }
+        }
+
+        // User messages with attachments arrive as multipart list
+        // content (text + image_url/document parts) and may carry an
+        // ``_attachments_meta`` side-channel with display metadata.
+        // Extract the text portion + attachment count for a readable
+        // history replay; chip-rendering parity with the interactive
+        // pane is deferred (the coord dashboard is diagnostic-leaning
+        // — primary use is monitoring, not authoring).
+        let content;
+        let attachmentCount = 0;
+        if (typeof m.content === "string") {
+          content = m.content;
+        } else if (Array.isArray(m.content)) {
+          const textParts = [];
+          for (const part of m.content) {
+            if (!part || typeof part !== "object") continue;
+            if (part.type === "text") {
+              textParts.push(String(part.text || ""));
+            } else if (part.type === "image_url" || part.type === "document") {
+              attachmentCount += 1;
+            }
+          }
+          content = textParts.join("\n");
         } else {
+          content = JSON.stringify(m.content || "");
+        }
+        const meta = Array.isArray(m._attachments_meta)
+          ? m._attachments_meta
+          : null;
+        if (meta && meta.length > attachmentCount) {
+          // Prefer the side-channel count when present — it covers
+          // attachments whose multipart parts couldn't be reconstructed.
+          attachmentCount = meta.length;
+        }
+        if (attachmentCount > 0) {
+          const noun = attachmentCount === 1 ? "attachment" : "attachments";
+          content =
+            (content ? content + "\n\n" : "") +
+            "📎 " +
+            attachmentCount +
+            " " +
+            noun;
+        }
+        if (role === "tool") {
+          // Tool result content can legitimately be empty (e.g. a
+          // tool that returned ""); still render it so the call_id
+          // pairing stays visible.  Resolve the tool name from the
+          // matching assistant tool_call so the label reads e.g.
+          // "bash" instead of "tool".  Pass isError when the
+          // pre-scan classified this call_id as an error so the row
+          // gets the .error class / --error stripe / "✗ error:" lead
+          // — without it a failed tool reads on reload as a normal
+          // successful result.  Denials still get the deny-resolved
+          // batch state (no per-row error needed there; the row's
+          // content reads "Denied by user").
+          const callId = m.tool_call_id || "";
+          const toolName =
+            (callId && toolNameByCallId.get(callId)) || m.tool_name || "tool";
+          const isError = callOutcomes.get(callId) === "error";
+          appendToolResult(toolName, callId, content || "", isError);
+        } else if (role === "assistant") {
+          // Empty content with tool_calls only means the assistant
+          // turn was just tool dispatch — the synthesized tool-call
+          // rows above already cover it; skip the empty bubble.
+          if (!content) return;
+          // Run assistant content through the markdown pipeline
+          // (renderMarkdown + post-render hljs / mermaid / KaTeX) so a
+          // reconnect / page-reload renders the same way a live stream
+          // does.  appendText would only escape and dump the raw text —
+          // markdown tables, code fences, math, and links would all
+          // render as literal characters.
+          const el = appendMsg(role, "", { label: role });
+          const body = el.querySelector(".msg-body");
+          if (body && typeof streamingRenderFinalize === "function") {
+            try {
+              streamingRenderFinalize(body, content);
+            } catch (e) {
+              console.warn("coordinator history render failed", e);
+              body.textContent = content;
+            }
+          } else if (body) {
+            body.textContent = content;
+          }
+        } else {
+          if (!content) return;
+          // user / reasoning / system / other roles render as plain
+          // text on history replay — matches the live-streaming paths
+          // (appendReasoningToken uses textContent; user/system are
+          // typed verbatim and don't carry markdown structure).
           appendText(role, content, { label: role });
         }
       });
+      // History alone can't tell whether an orphaned assistant
+      // tool_calls turn is awaiting approval or merely still running.
+      // The live workstream snapshot can: if pending_approval_detail is
+      // present, upgrade the matching batch immediately so a reload
+      // still exposes Approve/Deny even before SSE reconnects.
+      const pendingDetail =
+        wsSnapshot &&
+        wsSnapshot.pending_approval &&
+        wsSnapshot.pending_approval_detail &&
+        Array.isArray(wsSnapshot.pending_approval_detail.items)
+          ? wsSnapshot.pending_approval_detail
+          : null;
+      if (pendingDetail) {
+        appendToolBatch(pendingDetail.items, {
+          pending: true,
+          judgePending: !!pendingDetail.judge_pending,
+        });
+      }
     } catch (e) {
       console.warn("history load failed", e);
     }
     // Load children + tasks in parallel — neither blocks SSE connection.
     loadChildren();
     loadTasks();
+    // Pull any in-flight attachment reservations (page reload / cross-tab
+    // switch) so the chips reappear instead of silently orphaning rows.
+    attachments.rehydrate();
     connectSSE();
   }
 

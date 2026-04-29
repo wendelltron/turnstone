@@ -1,38 +1,22 @@
-"""Workstream manager — concurrent independent conversations.
+"""Workstream types — the kind enum, state enum, and per-workstream dataclass.
 
 A workstream is an independent conversation with its own ChatSession and UI
-adapter.  The WorkstreamManager coordinates multiple workstreams, tracks their
-states, and lets frontends (CLI, Web) multiplex user attention across them.
+adapter. Lifecycle (create/open/close/set_state/eviction/SSE fan-out) lives
+on :class:`turnstone.core.session_manager.SessionManager`; this module only
+defines the data types both interactive and coordinator kinds share.
 """
 
 from __future__ import annotations
 
 import enum
-import inspect
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from typing import Protocol
-
     from turnstone.core.session import ChatSession, SessionUI
-
-    class _SessionFactory(Protocol):
-        def __call__(
-            self,
-            ui: SessionUI | None,
-            model_alias: str | None = ...,
-            ws_id: str | None = ...,
-            *,
-            skill: str | None = ...,
-            client_type: str = ...,
-            kind: WorkstreamKind = ...,
-            parent_ws_id: str | None = ...,
-        ) -> ChatSession: ...
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +34,8 @@ class WorkstreamKind(enum.StrEnum):
     at the edge.
     """
 
-    INTERACTIVE = "interactive"  # hosted by turnstone-server.WorkstreamManager
-    COORDINATOR = "coordinator"  # hosted by turnstone-console.CoordinatorManager
+    INTERACTIVE = "interactive"  # hosted by the node's interactive SessionManager
+    COORDINATOR = "coordinator"  # hosted by the console's coordinator SessionManager
 
     @classmethod
     def from_raw(
@@ -69,7 +53,7 @@ class WorkstreamKind(enum.StrEnum):
         default, forcing every caller to reach for ``.value``) collapses
         into a single predictable call.
 
-        ``default`` defaults to ``INTERACTIVE`` when omitted.  Raises
+        ``default`` defaults to ``INTERACTIVE`` when omitted. Raises
         ``ValueError`` for a non-empty string that doesn't match any
         known kind — callers that want to coerce unknowns to the default
         should catch and fall back explicitly.
@@ -109,14 +93,40 @@ class Workstream:
     error_message: str = ""
     last_active: float = field(default_factory=time.monotonic, repr=False)
     notify_targets: str = "[]"
-    # Owning user_id.  Populated by the console's CoordinatorManager so
-    # attribution survives across restarts / lazy rehydration.
+    # Owning user_id. Populated by the SessionManager so attribution
+    # survives across restarts / lazy rehydration.
     user_id: str = ""
-    # Classifier reused by both WorkstreamManager and CoordinatorManager —
+    # Classifier reused by both interactive and coordinator managers —
     # no parallel type hierarchy.
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
     # Non-None for children spawned by a coordinator.
     parent_ws_id: str | None = None
+    # Tombstone: set by ``SessionManager.close`` under ``_lock`` so a
+    # racing ``set_state`` can detect the close before it overwrites
+    # the persisted ``state='closed'`` row. Guarded by ``_lock``.
+    _closed: bool = field(default=False, repr=False)
+    # True while a worker thread is actively running ``ChatSession.send``.
+    # Toggled under ``_lock`` by ``turnstone.core.session_worker.send``
+    # (and the few sites that spawn workers directly — see
+    # ``server.py``'s init-message + retry-after-rewind paths) so
+    # concurrent dispatches can safely decide queue-vs-spawn without
+    # racing ``Thread.is_alive()``. Used by both interactive and
+    # coordinator paths since Stage 2 P1.
+    _worker_running: bool = field(default=False, repr=False)
+    # True once ``SessionManager.commit_create`` (or the non-deferred
+    # path through ``SessionManager.create``) has fired the lifecycle
+    # ``emit_created`` event for this workstream. Used by
+    # :meth:`SessionManager.discard` (warns when set — abandoning an
+    # already-advertised ws leaves a stale ``ws_created`` on the wire
+    # with no matching ``ws_closed``) and by
+    # :meth:`SessionManager.commit_create` itself (no-ops when set,
+    # to make the idempotent-second-call and the
+    # commit-after-discard caller-bug paths safe). The non-deferred
+    # ``create`` sets this immediately before calling
+    # ``emit_created``; ``commit_create`` sets it under the manager
+    # lock alongside the tracked-ws check so a racing ``discard`` can
+    # never see it without also seeing the slot already popped.
+    _emit_created_fired: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:

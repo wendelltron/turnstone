@@ -31,16 +31,7 @@ _TEST_AUTH_HEADERS = {"Authorization": f"Bearer {_test_jwt()}"}
 # Mock storage for collector tests
 # ---------------------------------------------------------------------------
 
-
-class MockStorage:
-    """Minimal storage mock that implements list_services for collector tests."""
-
-    def __init__(self):
-        self.services: list[dict[str, str]] = []
-
-    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
-        return list(self.services)
-
+from tests._coord_test_helpers import MockStorage  # noqa: E402, F401
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -834,16 +825,18 @@ class TestConsoleHTTPEndpoints:
         resp = client.get("/nonexistent")
         assert resp.status_code == 404
 
-    def test_index_has_new_ws_button(self, client):
+    def test_index_landing_surfaces(self, client):
         status, body, ct = self._get_raw(client, "/")
         assert status == 200
-        assert 'id="new-ws-btn"' in body
-        assert "showNewWsModal" in body
-
-    def test_index_has_new_ws_modal(self, client):
-        status, body, ct = self._get_raw(client, "/")
-        assert 'id="new-ws-overlay"' in body
-        assert 'id="new-ws-node"' in body
+        # Coordinator-first landing keeps the node list always-visible.
+        assert 'id="view-overview"' in body
+        assert 'id="node-table"' in body
+        # Removed in the 1.5.0 landing-page cleanup — guard against
+        # accidental reintroduction.
+        assert 'id="new-ws-overlay"' not in body
+        assert 'id="new-ws-btn"' not in body
+        assert 'id="cluster-summary-compact"' not in body
+        assert 'id="view-node"' not in body
 
 
 # ---------------------------------------------------------------------------
@@ -1221,6 +1214,98 @@ class TestConsoleProxy:
             json={"message": "hello", "ws_id": "ws1"},
         )
         assert resp.status_code == 404
+
+    def test_proxy_api_per_ws_events_routes_to_sse_handler(self, client, mock_collector):
+        """``/node/{node_id}/v1/api/workstreams/{ws_id}/events`` is the
+        per-workstream SSE stream the interactive WebUI subscribes to.
+        Without explicit detection, the path falls through to the
+        regular GET branch and the EventSource API can't consume the
+        one-shot response — Firefox surfaces it as "can't establish a
+        connection". Regression guard for the legacy URL surface
+        removal (#422) that moved per-ws SSE under
+        ``/workstreams/{ws_id}/events`` without updating the proxy."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        ws_id = "a" * 32
+        with (
+            patch(
+                "turnstone.console.server._proxy_sse",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as sse_mock,
+            patch(
+                "turnstone.console.server._proxy_get",
+                new_callable=AsyncMock,
+                return_value=Response("ok", status_code=200),
+            ) as get_mock,
+        ):
+            client.get(f"/node/node-a/v1/api/workstreams/{ws_id}/events")
+            assert sse_mock.await_count == 1, (
+                "per-ws events path must route to _proxy_sse, not _proxy_get"
+            )
+            assert get_mock.await_count == 0
+            # Path passed to _proxy_sse must be the workstreams-prefixed
+            # form so the upstream URL is reconstructed correctly.
+            sse_args = sse_mock.await_args
+            assert sse_args.args[2] == f"workstreams/{ws_id}/events"
+
+    def test_proxy_api_global_events_still_routes_to_sse(self, client, mock_collector):
+        """The bare ``events/global`` path was the only SSE path the
+        proxy recognized before the per-ws fix. Verify it still routes
+        correctly so the new branch didn't regress the existing case."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        with patch(
+            "turnstone.console.server._proxy_sse",
+            new_callable=AsyncMock,
+            return_value=Response("ok", status_code=200),
+        ) as sse_mock:
+            client.get("/node/node-a/v1/api/events/global")
+            assert sse_mock.await_count == 1
+            # events/global must use the console's service token —
+            # the upstream gates this path on `service` scope and
+            # end-user JWTs don't carry it. Without this, the
+            # browser's interactive UI 403-loops on every retry.
+            assert sse_mock.await_args.kwargs.get("use_service_auth") is True
+
+    def test_proxy_api_per_ws_events_uses_user_auth_not_service(self, client, mock_collector):
+        """Per-ws events route uses the user's re-minted JWT, not the
+        service token — the upstream per-ws SSE handler scopes by
+        user identity for tenant filtering, and a service-scoped
+        call would bypass that gate. Only ``events/global``
+        (cross-tenant inventory by design) opts into service auth."""
+        from unittest.mock import AsyncMock, patch
+
+        from starlette.responses import Response
+
+        mock_collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "reachable": True,
+        }
+        ws_id = "b" * 32
+        with patch(
+            "turnstone.console.server._proxy_sse",
+            new_callable=AsyncMock,
+            return_value=Response("ok", status_code=200),
+        ) as sse_mock:
+            client.get(f"/node/node-a/v1/api/workstreams/{ws_id}/events")
+            assert sse_mock.await_count == 1
+            assert sse_mock.await_args.kwargs.get("use_service_auth") is False
 
 
 # ---------------------------------------------------------------------------

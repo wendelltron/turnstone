@@ -53,8 +53,8 @@ class TestIsPublicPath:
     def test_api_workstreams_not_public(self):
         assert is_public_path("/api/workstreams") is False
 
-    def test_api_send_not_public(self):
-        assert is_public_path("/api/send") is False
+    def test_api_workstreams_send_not_public(self):
+        assert is_public_path("/api/workstreams/abc/send") is False
 
     def test_api_cluster_overview_not_public(self):
         assert is_public_path("/api/cluster/overview") is False
@@ -71,8 +71,8 @@ class TestIsPublicPath:
     def test_v1_api_workstreams_not_public(self):
         assert is_public_path("/v1/api/workstreams") is False
 
-    def test_v1_api_send_not_public(self):
-        assert is_public_path("/v1/api/send") is False
+    def test_v1_api_workstreams_send_not_public(self):
+        assert is_public_path("/v1/api/workstreams/abc/send") is False
 
     def test_openapi_json_public(self):
         assert is_public_path("/openapi.json") is True
@@ -97,10 +97,22 @@ class TestRequiredScope:
         assert required_scope("GET", "/api/events") == "read"
 
     def test_post_send_needs_write(self):
-        assert required_scope("POST", "/api/send") == "write"
+        assert required_scope("POST", "/api/workstreams/abc/send") == "write"
+
+    def test_delete_send_needs_write(self):
+        assert required_scope("DELETE", "/api/workstreams/abc/send") == "write"
 
     def test_post_approve_needs_approve(self):
-        assert required_scope("POST", "/api/approve") == "approve"
+        assert required_scope("POST", "/api/workstreams/abc/approve") == "approve"
+
+    def test_post_cancel_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc/cancel") == "write"
+
+    def test_post_close_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc/close") == "write"
+
+    def test_get_events_per_ws_needs_read(self):
+        assert required_scope("GET", "/api/workstreams/abc/events") == "read"
 
     def test_post_plan_needs_write(self):
         assert required_scope("POST", "/api/plan") == "write"
@@ -111,9 +123,6 @@ class TestRequiredScope:
     def test_post_workstreams_new_needs_write(self):
         assert required_scope("POST", "/api/workstreams/new") == "write"
 
-    def test_post_workstreams_close_needs_write(self):
-        assert required_scope("POST", "/api/workstreams/close") == "write"
-
     def test_all_write_paths_need_write(self):
         for path in WRITE_PATHS:
             scope = required_scope("POST", path)
@@ -123,10 +132,10 @@ class TestRequiredScope:
         assert required_scope("POST", "/api/unknown") == "read"
 
     def test_v1_post_send_needs_write(self):
-        assert required_scope("POST", "/v1/api/send") == "write"
+        assert required_scope("POST", "/v1/api/workstreams/abc/send") == "write"
 
     def test_v1_post_approve_needs_approve(self):
-        assert required_scope("POST", "/v1/api/approve") == "approve"
+        assert required_scope("POST", "/v1/api/workstreams/abc/approve") == "approve"
 
     def test_v1_get_workstreams_needs_read(self):
         assert required_scope("GET", "/v1/api/workstreams") == "read"
@@ -135,10 +144,10 @@ class TestRequiredScope:
         assert required_scope("POST", "/v1/api/cluster/workstreams/new") == "write"
 
     def test_proxy_v1_send_needs_write(self):
-        assert required_scope("POST", "/node/node-a/v1/api/send") == "write"
+        assert required_scope("POST", "/node/node-a/v1/api/workstreams/abc/send") == "write"
 
     def test_proxy_v1_approve_needs_approve(self):
-        assert required_scope("POST", "/node/node-a/v1/api/approve") == "approve"
+        assert required_scope("POST", "/node/node-a/v1/api/workstreams/abc/approve") == "approve"
 
     def test_proxy_v1_read_endpoint_needs_read(self):
         assert required_scope("GET", "/node/node-a/v1/api/workstreams") == "read"
@@ -402,7 +411,7 @@ class TestCheckRequest:
 
     def test_write_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/send", read_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/send", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
@@ -410,14 +419,14 @@ class TestCheckRequest:
 
     def test_write_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/send", full_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/send", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
         assert status == 200
 
     def test_approve_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/approve", read_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/approve", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
@@ -425,7 +434,10 @@ class TestCheckRequest:
     def test_proxy_write_read_token_403(self, read_jwt):
         """Read tokens cannot escalate to write ops via proxy routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/api/send", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/api/workstreams/abc/send",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
@@ -433,7 +445,10 @@ class TestCheckRequest:
     def test_proxy_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on proxy routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/api/send/", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/api/workstreams/abc/send/",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
@@ -441,7 +456,7 @@ class TestCheckRequest:
     def test_direct_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on direct routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/api/send/", read_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/send/", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
@@ -449,14 +464,20 @@ class TestCheckRequest:
     def test_proxy_write_full_token_ok(self, full_jwt):
         """Full tokens pass through proxy write routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/api/send", full_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/api/workstreams/abc/send",
+            full_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
 
     def test_proxy_v1_write_read_token_403(self, read_jwt):
         """Read tokens cannot escalate to write ops via v1 proxy routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/v1/api/send", read_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/v1/api/workstreams/abc/send",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
@@ -464,7 +485,10 @@ class TestCheckRequest:
     def test_proxy_v1_write_full_token_ok(self, full_jwt):
         """Full tokens pass through v1 proxy write routes."""
         allowed, status, msg, _result = check_request(
-            "POST", "/node/node-a/v1/api/send", full_jwt, jwt_secret=self._SECRET
+            "POST",
+            "/node/node-a/v1/api/workstreams/abc/send",
+            full_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
 
@@ -496,7 +520,7 @@ class TestCheckRequest:
 
     def test_approve_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            "POST", "/api/approve", full_jwt, jwt_secret=self._SECRET
+            "POST", "/api/workstreams/abc/approve", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
@@ -538,7 +562,7 @@ class TestCheckRequestWithCookie:
     def test_bearer_takes_precedence_over_cookie(self, read_jwt, full_jwt):
         allowed, status, _, _r = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             f"Bearer {full_jwt}",
             cookie_header=f"turnstone_auth={read_jwt}",
             jwt_secret=self._SECRET,
@@ -559,7 +583,7 @@ class TestCheckRequestWithCookie:
     def test_cookie_read_on_write_403(self, read_jwt):
         allowed, status, _, _r = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             None,
             cookie_header=f"turnstone_auth={read_jwt}",
             jwt_secret=self._SECRET,
@@ -570,7 +594,7 @@ class TestCheckRequestWithCookie:
     def test_cookie_full_on_write_ok(self, full_jwt):
         allowed, status, _, _r = check_request(
             "POST",
-            "/api/send",
+            "/api/workstreams/abc/send",
             None,
             cookie_header=f"turnstone_auth={full_jwt}",
             jwt_secret=self._SECRET,
@@ -635,9 +659,15 @@ class TestServerAuth:
         mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
         mock_ws.session = mock_session
+        # Set kind / parent_ws_id / user_id explicitly so list_workstreams
+        # JSON-serializes them — a bare MagicMock attribute returns another
+        # MagicMock that fails json.dumps and surfaces as 500.
+        mock_ws.kind = "interactive"
+        mock_ws.parent_ws_id = None
+        mock_ws.user_id = "u1"
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         from turnstone.core.auth import JWT_AUD_SERVER
 
@@ -694,25 +724,25 @@ class TestServerAuth:
 
     def test_api_send_read_token_403(self):
         resp = self.client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/x/send",
             headers=self._read_hdr,
-            json={"message": "hello", "ws_id": "x"},
+            json={"message": "hello"},
         )
         assert resp.status_code == 403
         assert "Forbidden" in resp.json().get("error", "")
 
     def test_api_send_full_token_passes_auth(self):
         resp = self.client.post(
-            "/v1/api/send",
+            "/v1/api/workstreams/nonexistent/send",
             headers=self._full_hdr,
-            json={"message": "hello", "ws_id": "nonexistent"},
+            json={"message": "hello"},
         )
         assert resp.status_code not in (401, 403)
 
     def test_api_send_no_token_401(self):
         resp = self.client.post(
-            "/v1/api/send",
-            json={"message": "hello", "ws_id": "x"},
+            "/v1/api/workstreams/x/send",
+            json={"message": "hello"},
         )
         assert resp.status_code == 401
 
@@ -725,7 +755,7 @@ class TestServerAuth:
 
     def test_options_no_auth_required(self):
         resp = self.client.options(
-            "/v1/api/send",
+            "/v1/api/workstreams/x/send",
             headers={
                 "Origin": "http://example.com",
                 "Access-Control-Request-Method": "POST",
@@ -851,9 +881,15 @@ class TestServerLogin:
         mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
         mock_ws.session = mock_session
+        # Set kind / parent_ws_id / user_id explicitly so list_workstreams
+        # JSON-serializes them — a bare MagicMock attribute returns another
+        # MagicMock that fails json.dumps and surfaces as 500.
+        mock_ws.kind = "interactive"
+        mock_ws.parent_ws_id = None
+        mock_ws.user_id = "u1"
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         # Mock storage with a test user for password login
         from turnstone.core.auth import hash_password
@@ -940,6 +976,163 @@ class TestServerLogin:
         # API should now fail (cookie cleared)
         resp = self.test_client.get("/v1/api/workstreams")
         assert resp.status_code == 401
+
+    def test_whoami_includes_exp(self):
+        """whoami exposes the JWT exp so the frontend can schedule refresh."""
+        import time
+
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        resp = self.test_client.get("/v1/api/auth/whoami")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "exp" in data
+        # Default JWT TTL is 24h; exp should be > now and < now + 25h.
+        now = int(time.time())
+        assert now < data["exp"] < now + 25 * 3600
+
+    def test_refresh_returns_new_jwt_and_cookie(self):
+        """POST /api/auth/refresh re-mints the cookie with a fresh exp."""
+        from turnstone.core.auth import AUTH_COOKIE
+
+        # Storage needs get_user_permissions for the refresh re-resolve path.
+        # Mock is shared across tests in the class — re-arm here in case a
+        # prior test left it default.
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        refresh = self.test_client.post("/v1/api/auth/refresh")
+        assert refresh.status_code == 200
+        body = refresh.json()
+        assert body["status"] == "ok"
+        assert body["user_id"] == "uid_test"
+        assert "jwt" in body
+        # Set-Cookie header must be present so the browser updates.  Don't
+        # assert the new JWT differs from the original — sub-second login
+        # and refresh produce identical iat/exp claims and therefore an
+        # identical token, which is fine: the cookie still gets re-set.
+        cookie_hdr = refresh.headers.get("set-cookie", "")
+        assert AUTH_COOKIE in cookie_hdr
+        assert "HttpOnly" in cookie_hdr
+
+        # The refreshed cookie must keep working.
+        resp = self.test_client.get("/v1/api/workstreams")
+        assert resp.status_code == 200
+
+    def test_refresh_response_includes_exp_and_permissions(self):
+        """Refresh response shape must match whoami so the frontend can
+        populate sessionStorage + reschedule the next refresh off the
+        single round-trip without a follow-up /whoami call."""
+        import time
+
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        refresh = self.test_client.post("/v1/api/auth/refresh")
+        assert refresh.status_code == 200
+        body = refresh.json()
+        # exp present + within the expected default JWT TTL window
+        assert "exp" in body, body
+        now = int(time.time())
+        assert now < body["exp"] < now + 25 * 3600, body
+        # permissions present + non-empty (matches the seeded role set)
+        assert body.get("permissions"), body
+        assert "write" in body["permissions"].split(",")
+
+    def test_refresh_unauthenticated_401(self):
+        """Refresh requires a currently-valid cookie — no cookie → 401."""
+        # Clear cookies on the test client
+        self.test_client.cookies.clear()
+        resp = self.test_client.post("/v1/api/auth/refresh")
+        assert resp.status_code == 401
+
+    def test_refresh_storage_failure_falls_back(self):
+        """Transient storage error → fall back to in-token claims, not 403.
+
+        The earlier implementation called _load_user_permissions() which
+        swallows exceptions and returns set(); that path was
+        indistinguishable from a deleted user (legitimate 403).  The
+        handler now calls storage.get_user_permissions() directly so
+        DB hiccups fall through to in-token perms.
+        """
+        # Re-arm the storage so login works first
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        # Now make storage raise on the refresh re-resolve
+        self.test_client.app.state.auth_storage.get_user_permissions.side_effect = RuntimeError(
+            "db down"
+        )
+        try:
+            resp = self.test_client.post("/v1/api/auth/refresh")
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            # Permissions should still be present (fell back to in-token claims)
+            assert body.get("permissions"), body
+        finally:
+            # Restore for any subsequent tests
+            self.test_client.app.state.auth_storage.get_user_permissions.side_effect = None
+            self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+                "read",
+                "write",
+                "approve",
+            }
+
+    def test_refresh_user_with_no_perms_403(self):
+        """Storage returns empty (user deleted/role-stripped) → 403.
+
+        Distinguished from the storage-failure case above because
+        get_user_permissions returned a value (the empty set) without
+        raising — that's an authoritative "no roles", not a hiccup.
+        """
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+            "read",
+            "write",
+            "approve",
+        }
+        login = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
+        assert login.status_code == 200
+
+        self.test_client.app.state.auth_storage.get_user_permissions.return_value = set()
+        try:
+            resp = self.test_client.post("/v1/api/auth/refresh")
+            assert resp.status_code == 403
+        finally:
+            self.test_client.app.state.auth_storage.get_user_permissions.return_value = {
+                "read",
+                "write",
+                "approve",
+            }
 
 
 class TestConsoleLogin:
@@ -1127,6 +1320,56 @@ class TestJWTAudienceIssuer:
         token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
         result = validate_jwt(token, self.SECRET, audience="")
         assert result is not None
+
+    def test_validate_jwt_accepts_within_leeway_after_expiry(self):
+        """validate_jwt has 30s leeway for clock skew across hosts/processes."""
+        import time
+
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_ISSUER, validate_jwt
+
+        # Mint a token that "expired" 10 seconds ago — still within 30s leeway.
+        now = int(time.time())
+        token = pyjwt.encode(
+            {
+                "sub": "user1",
+                "scopes": "read",
+                "src": "test",
+                "iss": JWT_ISSUER,
+                "iat": now - 100,
+                "exp": now - 10,
+            },
+            self.SECRET,
+            algorithm="HS256",
+        )
+        result = validate_jwt(token, self.SECRET, audience="")
+        assert result is not None
+        assert result.user_id == "user1"
+
+    def test_validate_jwt_rejects_past_leeway(self):
+        """Tokens expired beyond the 30s leeway must still be rejected."""
+        import time
+
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_ISSUER, validate_jwt
+
+        now = int(time.time())
+        token = pyjwt.encode(
+            {
+                "sub": "user1",
+                "scopes": "read",
+                "src": "test",
+                "iss": JWT_ISSUER,
+                "iat": now - 200,
+                "exp": now - 60,
+            },
+            self.SECRET,
+            algorithm="HS256",
+        )
+        result = validate_jwt(token, self.SECRET, audience="")
+        assert result is None
 
     def test_create_jwt_expiry_seconds(self):
         import jwt as pyjwt
@@ -1452,7 +1695,7 @@ class TestCorsConfigurable:
 
         mgr = MagicMock()
         mgr.list_all.return_value = []
-        mgr.max_workstreams = 10
+        mgr.max_active = 10
         app = srv_mod.create_app(
             workstreams=mgr,
             global_queue=queue.Queue(),
@@ -1473,7 +1716,7 @@ class TestCorsConfigurable:
 
         mgr = MagicMock()
         mgr.list_all.return_value = []
-        mgr.max_workstreams = 10
+        mgr.max_active = 10
         app = srv_mod.create_app(
             workstreams=mgr,
             global_queue=queue.Queue(),

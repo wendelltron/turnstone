@@ -6,7 +6,7 @@ real in-process components:
 1. Create + list + detail round-trip via the Starlette TestClient.
 2. CoordinatorClient against a MockTransport "server node" stub.
 3. list_children storage read flow (kind filtering, parent scoping).
-4. Lazy rehydration via GET /v1/api/coordinator/{ws_id}.
+4. Lazy rehydration via GET /v1/api/workstreams/{ws_id}.
 
 Intentionally no real LLM infrastructure — session factories return
 MagicMock-backed stubs.  All four tests run in < 2 s total.
@@ -26,17 +26,44 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from turnstone.console.coordinator import CoordinatorManager
+from turnstone.console.collector import ClusterCollector
+from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_client import CoordinatorClient
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
-    coordinator_close,
-    coordinator_create,
-    coordinator_detail,
-    coordinator_list,
+    _audit_close_coordinator,
+    _audit_coordinator_create,
+    _coord_create_build_kwargs,
+    _coord_create_post_install,
+    _coord_create_validate_request,
+    _require_admin_coordinator,
+    _require_coord_mgr,
 )
 from turnstone.core.auth import AuthResult
+from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_routes import (
+    SessionEndpointConfig,
+    make_close_handler,
+    make_create_handler,
+    make_detail_handler,
+    make_list_handler,
+)
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+# Per-kind config the lifted handler factories capture by closure.
+_coord_endpoint_config = SessionEndpointConfig(
+    permission_gate=_require_admin_coordinator,
+    manager_lookup=_require_coord_mgr,
+    tenant_check=None,
+    not_found_label="coordinator not found",
+    audit_action_prefix="coordinator",
+    create_supports_attachments=True,
+    create_supports_user_id_override=False,
+    create_validate_request=_coord_create_validate_request,
+    create_build_kwargs=_coord_create_build_kwargs,
+    create_post_install=_coord_create_post_install,
+)
+
 
 # ---------------------------------------------------------------------------
 # Shared auth-injection middleware (mirrors test_coordinator_endpoints.py)
@@ -81,8 +108,8 @@ def _fake_registry() -> MagicMock:
     return reg
 
 
-def _build_mgr(storage: SQLiteBackend) -> CoordinatorManager:
-    """Build a CoordinatorManager backed by stub factories."""
+def _build_mgr(storage: SQLiteBackend) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) backed by stub factories."""
 
     def _sf(ui, model_alias=None, ws_id=None, **kw):
         s = MagicMock()
@@ -90,18 +117,26 @@ def _build_mgr(storage: SQLiteBackend) -> CoordinatorManager:
         s.send.return_value = None
         return s
 
-    return CoordinatorManager(
+    adapter = CoordinatorAdapter(
+        collector=MagicMock(),
+        ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
         session_factory=_sf,
-        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
+    )
+    mgr = SessionManager(
+        adapter,
         storage=storage,
         max_active=5,
+        node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+        event_emitter=adapter,
     )
+    adapter.attach(mgr)
+    return mgr
 
 
 def _make_client(
     storage: SQLiteBackend,
     *,
-    coord_mgr: CoordinatorManager | None = None,
+    coord_mgr: SessionManager | None = None,
     alias: str = "my-model",
     registry: Any = None,
 ) -> TestClient:
@@ -109,25 +144,34 @@ def _make_client(
     app = Starlette(
         routes=[
             Route(
-                "/v1/api/coordinator/new",
-                coordinator_create,
-                methods=["POST"],
-            ),
-            Route("/v1/api/coordinator", coordinator_list, methods=["GET"]),
-            Route(
-                "/v1/api/coordinator/{ws_id}/close",
-                coordinator_close,
+                "/v1/api/workstreams/new",
+                make_create_handler(_coord_endpoint_config, audit_emit=_audit_coordinator_create),
                 methods=["POST"],
             ),
             Route(
-                "/v1/api/coordinator/{ws_id}",
-                coordinator_detail,
+                "/v1/api/workstreams",
+                make_list_handler(_coord_endpoint_config),
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}/close",
+                make_close_handler(
+                    _coord_endpoint_config,
+                    audit_emit=_audit_close_coordinator,
+                    supports_close_reason=False,
+                ),
+                methods=["POST"],
+            ),
+            Route(
+                "/v1/api/workstreams/{ws_id}",
+                make_detail_handler(_coord_endpoint_config),
                 methods=["GET"],
             ),
         ],
         middleware=[Middleware(_AuthMiddleware)],
     )
     app.state.coord_mgr = coord_mgr
+    app.state.coord_adapter = coord_mgr._adapter if coord_mgr is not None else None
     app.state.config_store = _FakeConfigStore({"coordinator.model_alias": alias})
     app.state.coord_registry = registry
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
@@ -151,32 +195,33 @@ def test_create_list_detail_lifecycle(tmp_path):
 
     # --- Create ---
     resp = client.post(
-        "/v1/api/coordinator/new",
+        "/v1/api/workstreams/new",
         json={"name": "e2e-coord"},
         headers=_COORD_HEADERS,
     )
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     ws_id = body["ws_id"]
     assert ws_id
     assert "e2e-coord" in body["name"]
 
     # --- List: caller sees their own coordinator ---
-    resp = client.get("/v1/api/coordinator", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
-    coordinators = resp.json()["coordinators"]
+    coordinators = resp.json()["workstreams"]
     ids = {c["ws_id"] for c in coordinators}
     assert ws_id in ids
 
-    # Coordinator created by a different user is invisible to our caller.
+    # Trusted-team visibility: every ``admin.coordinator`` caller sees
+    # every active coordinator regardless of owner.
     mgr.create(user_id="other-user", name="not-mine")
-    resp = client.get("/v1/api/coordinator", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams", headers=_COORD_HEADERS)
     assert resp.status_code == 200
-    names = {c["name"] for c in resp.json()["coordinators"]}
-    assert "not-mine" not in names
+    names = {c["name"] for c in resp.json()["workstreams"]}
+    assert "not-mine" in names
 
     # --- Detail ---
-    resp = client.get(f"/v1/api/coordinator/{ws_id}", headers=_COORD_HEADERS)
+    resp = client.get(f"/v1/api/workstreams/{ws_id}", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
     detail = resp.json()
     assert detail["ws_id"] == ws_id
@@ -184,7 +229,7 @@ def test_create_list_detail_lifecycle(tmp_path):
     assert detail["user_id"] == "user-1"
 
     # --- Close ---
-    resp = client.post(f"/v1/api/coordinator/{ws_id}/close", headers=_COORD_HEADERS)
+    resp = client.post(f"/v1/api/workstreams/{ws_id}/close", headers=_COORD_HEADERS)
     assert resp.status_code == 200
 
     # Manager no longer tracks it after close.
@@ -272,9 +317,11 @@ def test_coordinator_client_spawn_close_delete(tmp_path):
     assert close_result.get("status") in (200, "ok"), close_result
 
     close_req = captured[0]
-    assert close_req.url.path == "/v1/api/route/workstreams/close"
+    # Path-keyed shape post-#422: ws_id rides in the URL.
+    assert close_req.url.path == "/v1/api/route/workstreams/child-99/close"
     close_body = json.loads(close_req.content)
-    assert close_body["ws_id"] == "child-99"
+    # Body no longer carries ws_id — the path is authoritative.
+    assert "ws_id" not in close_body
 
     # delete --------------------------------------------------------------
     captured.clear()
@@ -380,7 +427,7 @@ def test_list_children_skill_filter(seeded_storage):
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — Lazy rehydration via GET /v1/api/coordinator/{ws_id}
+# Test 4 — Lazy rehydration via GET /v1/api/workstreams/{ws_id}
 # ---------------------------------------------------------------------------
 
 
@@ -389,8 +436,8 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
 
     Sequence:
     1. Pre-seed storage with a coordinator row (simulating a previous process).
-    2. Build a CoordinatorManager that doesn't know about it yet.
-    3. Hit GET /v1/api/coordinator/{ws_id} — expect 200.
+    2. Build a SessionManager (coordinator kind) that doesn't know about it yet.
+    3. Hit GET /v1/api/workstreams/{ws_id} — expect 200.
     4. Manager now tracks the rehydrated session.
     5. The response body carries the correct kind / user_id metadata.
     """
@@ -410,7 +457,7 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     assert mgr.get("persisted-coord") is None
 
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    resp = client.get("/v1/api/coordinator/persisted-coord", headers=_COORD_HEADERS)
+    resp = client.get("/v1/api/workstreams/persisted-coord", headers=_COORD_HEADERS)
     assert resp.status_code == 200, resp.text
 
     body = resp.json()
@@ -421,15 +468,17 @@ def test_lazy_rehydration_on_detail_get(tmp_path):
     # The endpoint triggers lazy rehydration — manager now tracks it.
     assert mgr.get("persisted-coord") is not None
 
-    # Non-owner cannot reach the same endpoint (returns 404 — no existence leak).
+    # Trusted-team visibility: any admin.coordinator caller can read
+    # the coordinator's detail, regardless of ``user_id``.
     resp_stranger = client.get(
-        "/v1/api/coordinator/persisted-coord",
+        "/v1/api/workstreams/persisted-coord",
         headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
     )
-    assert resp_stranger.status_code == 404
+    assert resp_stranger.status_code == 200
+    assert resp_stranger.json()["user_id"] == "user-1"
 
     # A workstream with kind='interactive' is not reachable via the coordinator
     # endpoint even when it exists in storage.
     storage.register_workstream("interactive-ws", kind="interactive", user_id="user-1")
-    resp_int = client.get("/v1/api/coordinator/interactive-ws", headers=_COORD_HEADERS)
+    resp_int = client.get("/v1/api/workstreams/interactive-ws", headers=_COORD_HEADERS)
     assert resp_int.status_code == 404

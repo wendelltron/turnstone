@@ -171,11 +171,56 @@ def test_route_map_matches_console_routes():
     mirrors the shape we expect.
     """
     assert _ROUTE_PATHS["spawn"] == "/v1/api/route/workstreams/new"
-    assert _ROUTE_PATHS["send"] == "/v1/api/route/send"
-    assert _ROUTE_PATHS["approve"] == "/v1/api/route/approve"
-    assert _ROUTE_PATHS["cancel"] == "/v1/api/route/cancel"
-    assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/close"
+    assert _ROUTE_PATHS["send"] == "/v1/api/route/workstreams/{ws_id}/send"
+    assert _ROUTE_PATHS["approve"] == "/v1/api/route/workstreams/{ws_id}/approve"
+    assert _ROUTE_PATHS["cancel"] == "/v1/api/route/workstreams/{ws_id}/cancel"
+    assert _ROUTE_PATHS["close"] == "/v1/api/route/workstreams/{ws_id}/close"
+    # ``delete`` keeps the body-keyed shape — it has its own
+    # ``route_workstream_delete`` handler instead of going through
+    # the generic route_proxy.
     assert _ROUTE_PATHS["delete"] == "/v1/api/route/workstreams/delete"
+    # Cascade endpoint lives on the console itself (not a node), so the
+    # path slots in the coord ws_id rather than routing through a proxy.
+    assert _ROUTE_PATHS["close_all_children"] == "/v1/api/workstreams/{ws_id}/close_all_children"
+
+
+def test_route_paths_match_actual_console_mounts():
+    """Every entry in ``_ROUTE_PATHS`` must correspond to an actually
+    mounted Starlette route on the console app. Catches the kind of
+    drift that broke close_workstream / close_all_children when the
+    #422 legacy URL adapter removal deleted the body-keyed
+    /v1/api/route/{verb} routes without a corresponding update to
+    the coord client's route table."""
+    from unittest.mock import MagicMock
+
+    from starlette.routing import Mount, Route
+
+    from turnstone.console.coordinator_client import _ROUTE_PATHS
+    from turnstone.console.server import create_app
+
+    app = create_app(
+        collector=MagicMock(),
+        jwt_secret="x" * 64,
+    )
+
+    def _walk(routes, prefix=""):
+        for r in routes:
+            if isinstance(r, Mount):
+                yield from _walk(r.routes, prefix=prefix + r.path)
+            elif isinstance(r, Route):
+                yield prefix + r.path
+
+    mounted = set(_walk(app.routes))
+
+    for key, template in _ROUTE_PATHS.items():
+        # Starlette's Route.path uses ``{name}`` placeholders just
+        # like our templates, so a literal containment check works.
+        assert template in mounted, (
+            f"_ROUTE_PATHS[{key!r}] = {template!r} is not a mounted "
+            f"console route. Mounted routes containing 'route' or "
+            f"'workstreams': "
+            f"{sorted(p for p in mounted if 'route' in p or 'workstreams' in p)}"
+        )
 
 
 def test_spawn_posts_to_routing_proxy_with_bearer_token():
@@ -217,24 +262,77 @@ def test_spawn_omits_optional_empty_fields():
 def test_send_posts_to_send_route():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.send("ws-x", "hello")
-    assert captured[0].url.path == "/v1/api/route/send"
+    # Path-keyed shape post-#422: ws_id rides in the URL, not the body.
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/send"
     body = json.loads(captured[0].content)
-    assert body == {"ws_id": "ws-x", "message": "hello"}
+    assert body == {"message": "hello"}
 
 
 def test_close_workstream_posts_to_close_route():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.close_workstream("ws-x")
-    assert captured[0].url.path == "/v1/api/route/workstreams/close"
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
     body = json.loads(captured[0].content)
-    assert body == {"ws_id": "ws-x"}  # no reason → omitted
+    assert body == {}  # no reason → omitted; ws_id rides the path
 
 
 def test_close_workstream_includes_reason_when_provided():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.close_workstream("ws-x", reason="done")
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/close"
     body = json.loads(captured[0].content)
-    assert body == {"ws_id": "ws-x", "reason": "done"}
+    assert body == {"reason": "done"}
+
+
+def test_close_all_children_posts_to_console_endpoint():
+    """Targets the console directly (not the routing proxy).  The URL
+    embeds the coord's own ws_id so the server can resolve the session.
+    """
+    client, captured = _mock_client(
+        _ok_json(
+            {
+                "status": "ok",
+                "closed": ["c-1", "c-2"],
+                "failed": [],
+                "skipped": [],
+            }
+        )
+    )
+    result = client.close_all_children(reason="batch done")
+    assert result["closed"] == ["c-1", "c-2"]
+    assert captured[0].url.path == "/v1/api/workstreams/coord-1/close_all_children"
+    assert captured[0].headers["Authorization"] == "Bearer test-token"
+    body = json.loads(captured[0].content)
+    assert body == {"reason": "batch done"}
+
+
+def test_close_all_children_omits_empty_reason():
+    client, captured = _mock_client(
+        _ok_json({"status": "ok", "closed": [], "failed": [], "skipped": []})
+    )
+    client.close_all_children()
+    body = json.loads(captured[0].content)
+    assert body == {}
+
+
+def test_close_all_children_surfaces_http_error():
+    def _boom(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "internal"})
+
+    client, _captured = _mock_client(_boom)
+    result = client.close_all_children()
+    assert result["status"] == 500
+    assert "error" in result
+
+
+def test_close_all_children_surfaces_transport_error():
+    def _raise(_req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    client, _captured = _mock_client(_raise)
+    result = client.close_all_children()
+    assert result["status"] == 0
+    assert "upstream unreachable" in result["error"]
 
 
 def test_delete_workstream_posts_to_delete_route():
@@ -247,11 +345,15 @@ def test_approve_and_cancel_hit_their_routes():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.approve("ws-x", call_id="c-1", approved=True, feedback="ok", always=True)
     client.cancel("ws-x")
-    assert captured[0].url.path == "/v1/api/route/approve"
-    assert captured[1].url.path == "/v1/api/route/cancel"
+    # Path-keyed shape post-#422: ws_id rides the URL.
+    assert captured[0].url.path == "/v1/api/route/workstreams/ws-x/approve"
+    assert captured[1].url.path == "/v1/api/route/workstreams/ws-x/cancel"
     approve_body = json.loads(captured[0].content)
     assert approve_body["approved"] is True
     assert approve_body["always"] is True
+    assert approve_body["call_id"] == "c-1"
+    # ws_id moved to the URL — make sure we didn't double-encode it.
+    assert "ws_id" not in approve_body
 
 
 def test_http_error_returns_structured_failure():
@@ -311,7 +413,7 @@ def test_mutating_ops_accept_self_ws_id():
     client, captured = _mock_client(_ok_json({"status": 200}))
     client.send("coord-1", "hi")
     assert len(captured) == 1
-    assert captured[0].url.path == "/v1/api/route/send"
+    assert captured[0].url.path == "/v1/api/route/workstreams/coord-1/send"
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +550,36 @@ def test_inspect_missing_ws_returns_error(populated_storage):
     client = _make_read_client(populated_storage)
     result = client.inspect("does-not-exist")
     assert "error" in result
+
+
+def test_inspect_not_found_does_not_echo_ws_id_in_error_string(populated_storage):
+    """The error STRING is bare ("workstream not found") — the
+    structured ``ws_id`` field carries the queried id.  Pre-fix the
+    error message echoed the ws_id back at the caller who just sent
+    it, which was redundant and a stylistic departure from the rest
+    of the surface.  Echo-in-string is also one more place a
+    hostile/oversize ws_id could land in operator-facing text."""
+    client = _make_read_client(populated_storage)
+    result = client.inspect("does-not-exist-xyz")
+    assert result["error"] == "workstream not found"
+    # The structured field still carries the ws_id for context.
+    assert result["ws_id"] == "does-not-exist-xyz"
+
+
+def test_inspect_cross_tenant_returns_same_shape_as_missing(populated_storage):
+    """The cross-tenant guard MUST return the exact same shape as a
+    genuinely missing ws_id — that's the existence-leak defence the
+    error-string echo was carrying weight for too.  Asserting the
+    shape match here pins the property going forward."""
+    # ``unrelated`` exists in storage but is not a coord-1 child.
+    client = _make_read_client(populated_storage)
+    cross_tenant = client.inspect("unrelated")
+    missing = client.inspect("does-not-exist-abc")
+    # Same key set, same error string, only the ws_id field differs.
+    assert cross_tenant.keys() == missing.keys()
+    assert cross_tenant["error"] == missing["error"] == "workstream not found"
+    assert cross_tenant["ws_id"] == "unrelated"
+    assert missing["ws_id"] == "does-not-exist-abc"
 
 
 def test_list_children_excludes_closed_by_default(tmp_path):
@@ -1028,6 +1160,37 @@ def test_inspect_omits_close_reason_when_absent(populated_storage):
     assert "close_reason" not in result
 
 
+def test_inspect_surfaces_last_error_when_state_is_error(populated_storage):
+    """A child that crashed (e.g. provider 4xx after retry exhaustion)
+    has its exception text persisted to workstream_config.last_error
+    by the worker-thread error path; inspect surfaces it for terminal
+    error rows so the coordinator can triage without parsing the
+    assistant tail."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "AuthenticationError: invalid api key"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert result.get("last_error") == "AuthenticationError: invalid api key"
+
+
+def test_inspect_omits_last_error_for_non_error_terminal_states(populated_storage):
+    """A historic last_error from an earlier failed turn that was later
+    closed cleanly must NOT surface on the close — the coord would
+    misread the close as an error close.  Gating on state=='error'
+    keeps the surface honest."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "stale error from a previous failed turn"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert "last_error" not in result
+
+
 def test_inspect_skips_workstream_config_read_for_live_workstreams(populated_storage, monkeypatch):
     """Hot-path optimisation: live (non-terminal) workstreams must NOT
     pay the per-inspect load_workstream_config round-trip.  close_reason
@@ -1288,7 +1451,329 @@ def test_wait_for_workstream_handles_non_string_mode(populated_storage):
 
 
 # ---------------------------------------------------------------------------
-# task_list
+# wait_for_workstream — last-message bundling
+# ---------------------------------------------------------------------------
+#
+# Each terminal child's last assistant turn (or a status sentinel) is
+# bundled inline so the coord LLM doesn't need a follow-up
+# inspect_workstream round-trip per ws.  The fields are additive
+# (``message`` / ``truncated``), so existing wait tests stay green.
+
+
+def test_wait_for_workstream_idle_returns_last_assistant_message(populated_storage):
+    """A child that finished normally surfaces its final assistant
+    turn inline so the coord doesn't have to inspect to read it."""
+    populated_storage.save_message("child-a", "user", "what's the answer?")
+    populated_storage.save_message("child-a", "assistant", "the answer is 42")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    assert snap["message"] == "the answer is 42"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_idle_walks_past_trailing_tool_messages(populated_storage):
+    """The most recent assistant turn often sits behind a few tool
+    messages (assistant emits tool_calls → tool results land → final
+    assistant content follows).  The walk must skip non-assistant
+    rows when picking the last assistant content."""
+    populated_storage.save_message("child-a", "user", "do the thing")
+    populated_storage.save_message("child-a", "assistant", "calling tool")
+    populated_storage.save_message("child-a", "tool", "tool output", tool_call_id="t1")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    # The assistant message above is the most recent assistant turn —
+    # the trailing tool row must not block extraction.
+    assert result["results"]["child-a"]["message"] == "calling tool"
+
+
+def test_wait_for_workstream_idle_skips_empty_assistant_with_tool_calls(populated_storage):
+    """An assistant message with empty content + only tool_calls isn't
+    a final answer — walk further back for the last assistant message
+    that actually has text."""
+    populated_storage.save_message("child-a", "user", "first turn")
+    populated_storage.save_message("child-a", "assistant", "first assistant reply")
+    populated_storage.save_message("child-a", "user", "second turn")
+    populated_storage.save_message(
+        "child-a", "assistant", "", tool_calls='[{"id": "t1", "name": "x"}]'
+    )
+    populated_storage.save_message("child-a", "tool", "tool result", tool_call_id="t1")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    # Last assistant with non-empty content is the FIRST assistant message
+    # — the empty-content tool-calls assistant must be skipped.
+    assert result["results"]["child-a"]["message"] == "first assistant reply"
+
+
+def test_wait_for_workstream_idle_no_assistant_returns_sentinel(populated_storage):
+    """A workstream that reaches idle without an assistant turn in the
+    tail (rare but possible for a freshly registered ws closed before
+    generation, or a long-running ws whose final assistant message is
+    buried beyond the tail window) gets a hedged sentinel rather than
+    null — the model can distinguish 'no recent output' from 'still
+    running'."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    # No messages were saved for child-a in this test — sentinel kicks in.
+    # Wording is hedged ("recent") because the tail-only walk can't
+    # actually prove no assistant output exists in the full history.
+    assert snap["message"] == "(no recent assistant output)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_returns_last_assistant_message(populated_storage):
+    """An errored child still gets its last assistant turn surfaced —
+    that's usually the most useful diagnostic ('I was about to ...
+    when the error happened')."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_error_with_no_output_returns_sentinel(populated_storage):
+    """When error fires with no assistant content in the tail (e.g. a
+    pre-flight provider auth failure that crashes before the model
+    speaks, or a >18-parallel-tool-call burst whose only assistant
+    row carries empty content), the same hedged sentinel applies.
+    The wording deliberately doesn't claim 'before producing output'
+    — the tail-only walk can't prove that.
+    """
+    populated_storage.update_workstream_state("child-a", "error")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "(no recent assistant output)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_prefers_persisted_last_error(populated_storage):
+    """When the worker thread persists ``last_error`` on a crash (e.g.
+    provider 429 after retry exhaustion, model misconfig), the error
+    text wins over the assistant tail — the actual cause is more
+    actionable than a half-finished prior turn."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    populated_storage.save_workstream_config(
+        "child-a",
+        {"last_error": "RateLimitError: 429 too many requests after 5 retries"},
+    )
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "error"
+    assert snap["message"] == "RateLimitError: 429 too many requests after 5 retries"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_error_falls_back_to_assistant_when_no_last_error(populated_storage):
+    """Legacy / pre-fix error rows (state=error, no last_error config)
+    keep the existing assistant-tail behaviour — the upgrade is
+    additive."""
+    populated_storage.update_workstream_state("child-a", "error")
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", "partial output before crash")
+    # Note: no save_workstream_config call.
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["message"] == "partial output before crash"
+
+
+def test_wait_for_workstream_closed_returns_sentinel(populated_storage):
+    """Closed children get a status sentinel rather than a partial
+    last message — a half-finished thought from a workstream the
+    operator explicitly closed isn't useful (and could be misleading)."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_message("child-a", "assistant", "mid-thought when closed")
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "closed"
+    assert snap["message"] == "(workstream closed)"
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_denied_returns_sentinel(populated_storage):
+    """Cross-tenant / nonexistent ws_ids surface as denied — the
+    sentinel lets the coord LLM recognise the rejection without
+    parsing state strings on its own."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["unrelated"], timeout=5, mode="any")
+    snap = result["results"]["unrelated"]
+    assert snap["state"] == "denied"
+    assert snap["message"].startswith("(workstream denied")
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_running_child_message_is_null(populated_storage):
+    """A still-running child after a timeout must report
+    ``message=None`` — anything else would be a partial last message
+    pretending to be a final answer.  The coord uses null to know
+    'still working, inspect later'."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=1.0, mode="all")
+    # mode='all' on (idle, running) hits the timeout — child-b is still
+    # running and must come back with message=None.
+    assert result["complete"] is False
+    assert result["results"]["child-b"]["state"] == "running"
+    assert result["results"]["child-b"]["message"] is None
+    assert result["results"]["child-b"]["truncated"] is False
+
+
+def test_wait_for_workstream_truncates_oversize_message(populated_storage):
+    """A message past WAIT_MESSAGE_MAX_BYTES is truncated from the
+    END (preserve the lead) and ``truncated=True`` so the coord LLM
+    knows to inspect for the rest if it needs the full text."""
+    from turnstone.console.coordinator_client import WAIT_MESSAGE_MAX_BYTES
+
+    big = "A" * (WAIT_MESSAGE_MAX_BYTES * 2)
+    populated_storage.save_message("child-a", "user", "hi")
+    populated_storage.save_message("child-a", "assistant", big)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    # Truncated — exactly the cap in bytes (single-byte chars), with the
+    # head preserved.
+    assert snap["truncated"] is True
+    assert len(snap["message"].encode("utf-8")) == WAIT_MESSAGE_MAX_BYTES
+    assert snap["message"].startswith("AAAA")
+
+
+def test_wait_for_workstream_storage_failure_leaves_message_null(populated_storage, monkeypatch):
+    """A transient storage error during the message read must not
+    fail the wait — the coord still gets state/tokens/updated, and
+    the per-ws ``message`` collapses to None so the model can fall
+    back to inspect."""
+    populated_storage.update_workstream_state("child-a", "idle")
+
+    def _broken_load(*_a, **_kw):
+        raise RuntimeError("simulated storage outage")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken_load)
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    snap = result["results"]["child-a"]
+    assert snap["state"] == "idle"
+    assert snap["message"] is None
+    assert snap["truncated"] is False
+
+
+def test_wait_for_workstream_does_not_pollute_progress_callback(populated_storage):
+    """The wait_progress SSE event shape is documented as separate
+    from the tool result — the per-tick snapshot dicts handed to the
+    progress callback must NOT carry the new ``message`` /
+    ``truncated`` fields, since enrichment happens after the loop
+    exits."""
+    populated_storage.save_message("child-a", "assistant", "ok")
+    client = _make_read_client(populated_storage)
+    captured: list[dict[str, dict[str, Any]]] = []
+
+    def _cb(snap: dict[str, dict[str, Any]], _elapsed: float) -> None:
+        # Deep-copy so a later mutation by enrichment can't fool the
+        # assertion (we want the shape AT CALLBACK TIME, not at end).
+        import copy
+
+        captured.append(copy.deepcopy(snap))
+
+    client.wait_for_workstream(["child-a"], timeout=5, mode="any", progress_callback=_cb)
+    assert captured  # at least one tick fired
+    for tick in captured:
+        for per_ws in tick.values():
+            assert "message" not in per_ws
+            assert "truncated" not in per_ws
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — helper-function unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_truncate_wait_message_below_cap_is_passthrough():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("hello", 100)
+    assert text == "hello"
+    assert trunc is False
+
+
+def test_truncate_wait_message_exact_cap_is_passthrough():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("a" * 5, 5)
+    assert text == "aaaaa"
+    assert trunc is False
+
+
+def test_truncate_wait_message_oversize_truncates_to_byte_cap():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("a" * 10, 5)
+    assert text == "aaaaa"
+    assert trunc is True
+
+
+def test_truncate_wait_message_handles_utf8_boundary():
+    """A multi-byte codepoint must never be split — back off to a valid
+    UTF-8 boundary even if it lands a couple bytes under the cap."""
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    # "café" is 5 bytes (c=1, a=1, f=1, é=2).  Cap at 4 bytes lands
+    # mid-codepoint on the é; truncation must back off to 3 bytes.
+    text, trunc = _truncate_wait_message("café", 4)
+    assert trunc is True
+    assert text == "caf"
+    # And the result must be valid UTF-8 — re-encoding doesn't error.
+    text.encode("utf-8")
+
+
+def test_truncate_wait_message_zero_or_negative_cap_returns_empty():
+    from turnstone.console.coordinator_client import _truncate_wait_message
+
+    text, trunc = _truncate_wait_message("anything", 0)
+    assert text == ""
+    assert trunc is True
+
+
+def test_last_assistant_text_returns_content_when_present(populated_storage):
+    """Pins the third leg of the tri-state contract: a populated tail
+    returns the actual assistant content string (not ``""``, not
+    ``None``).  Integration tests cover this through enrichment, but a
+    direct unit test makes the contract harder to break in a refactor."""
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    populated_storage.save_message("child-a", "user", "hello")
+    populated_storage.save_message("child-a", "assistant", "hi back")
+    assert _last_assistant_text(populated_storage, "child-a") == "hi back"
+
+
+def test_last_assistant_text_returns_empty_when_no_messages(populated_storage):
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    # child-a has no messages saved.
+    assert _last_assistant_text(populated_storage, "child-a") == ""
+
+
+def test_last_assistant_text_returns_none_on_storage_failure(populated_storage, monkeypatch):
+    from turnstone.console.coordinator_client import _last_assistant_text
+
+    def _broken(*_a, **_kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(populated_storage, "load_messages", _broken)
+    assert _last_assistant_text(populated_storage, "child-a") is None
+
+
+# ---------------------------------------------------------------------------
+# tasks
 # ---------------------------------------------------------------------------
 
 
@@ -1298,177 +1783,177 @@ def _task_client(tmp_path) -> CoordinatorClient:
     return _make_read_client(st)
 
 
-def test_task_list_get_empty_envelope_on_fresh_ws(tmp_path):
+def test_tasks_get_empty_envelope_on_fresh_ws(tmp_path):
     client = _task_client(tmp_path)
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert env == {"version": 1, "tasks": []}
 
 
-def test_task_list_add_then_get_roundtrip(tmp_path):
+def test_tasks_add_then_get_roundtrip(tmp_path):
     client = _task_client(tmp_path)
-    task = client.task_list_add("coord-1", title="spawn worker")
+    task = client.tasks_add("coord-1", title="spawn worker")
     assert task["title"] == "spawn worker"
     assert task["status"] == "pending"
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert len(env["tasks"]) == 1
     assert env["tasks"][0]["id"] == task["id"]
 
 
-def test_task_list_add_rejects_empty_title(tmp_path):
+def test_tasks_add_rejects_empty_title(tmp_path):
     client = _task_client(tmp_path)
-    result = client.task_list_add("coord-1", title="   ")
+    result = client.tasks_add("coord-1", title="   ")
     assert "error" in result
 
 
-def test_task_list_add_rejects_invalid_status(tmp_path):
+def test_tasks_add_rejects_invalid_status(tmp_path):
     client = _task_client(tmp_path)
-    result = client.task_list_add("coord-1", title="x", status="nonsense")
+    result = client.tasks_add("coord-1", title="x", status="nonsense")
     assert "error" in result
 
 
-def test_task_list_add_rejects_title_over_200(tmp_path):
+def test_tasks_add_rejects_title_over_200(tmp_path):
     """Silent truncation is a data-integrity footgun: the model may
     rely on the title it sent, not the one stored.  Reject instead."""
     client = _task_client(tmp_path)
     long_title = "a" * 201
-    result = client.task_list_add("coord-1", title=long_title)
+    result = client.tasks_add("coord-1", title=long_title)
     assert "error" in result
     assert "too long" in result["error"]
     # Exactly 200 chars is the boundary and still accepted.
     boundary = "a" * 200
-    task = client.task_list_add("coord-1", title=boundary)
+    task = client.tasks_add("coord-1", title=boundary)
     assert "error" not in task
     assert len(task["title"]) == 200
 
 
-def test_task_list_update_rejects_title_over_200(tmp_path):
+def test_tasks_update_rejects_title_over_200(tmp_path):
     client = _task_client(tmp_path)
-    added = client.task_list_add("coord-1", title="original")
-    result = client.task_list_update("coord-1", task_id=added["id"], title="b" * 201)
+    added = client.tasks_add("coord-1", title="original")
+    result = client.tasks_update("coord-1", task_id=added["id"], title="b" * 201)
     assert "error" in result
     assert "too long" in result["error"]
     # Original title untouched when update rejected.
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert env["tasks"][0]["title"] == "original"
 
 
-def test_task_list_update_by_id(tmp_path):
+def test_tasks_update_by_id(tmp_path):
     client = _task_client(tmp_path)
-    added = client.task_list_add("coord-1", title="plan")
-    updated = client.task_list_update(
+    added = client.tasks_add("coord-1", title="plan")
+    updated = client.tasks_update(
         "coord-1", task_id=added["id"], status="done", child_ws_id="ws-child"
     )
     assert updated["status"] == "done"
     assert updated["child_ws_id"] == "ws-child"
 
 
-def test_task_list_update_missing_id(tmp_path):
+def test_tasks_update_missing_id(tmp_path):
     client = _task_client(tmp_path)
-    result = client.task_list_update("coord-1", task_id="nope", status="done")
+    result = client.tasks_update("coord-1", task_id="nope", status="done")
     assert "error" in result
 
 
-def test_task_list_remove(tmp_path):
+def test_tasks_remove(tmp_path):
     client = _task_client(tmp_path)
-    added = client.task_list_add("coord-1", title="plan")
-    first = client.task_list_remove("coord-1", task_id=added["id"])
+    added = client.tasks_add("coord-1", title="plan")
+    first = client.tasks_remove("coord-1", task_id=added["id"])
     assert first.get("ok") is True
     assert first.get("task_id") == added["id"]
     # Second remove of the same id returns a distinguishable not-found
     # error (NOT a silent False that would mask a corrupt envelope).
-    second = client.task_list_remove("coord-1", task_id=added["id"])
+    second = client.tasks_remove("coord-1", task_id=added["id"])
     assert "error" in second
     assert "not found" in second["error"]
-    assert client.task_list_get("coord-1")["tasks"] == []
+    assert client.tasks_get("coord-1")["tasks"] == []
 
 
-def test_task_list_reorder_requires_permutation(tmp_path):
+def test_tasks_reorder_requires_permutation(tmp_path):
     client = _task_client(tmp_path)
-    a = client.task_list_add("coord-1", title="a")
-    b = client.task_list_add("coord-1", title="b")
+    a = client.tasks_add("coord-1", title="a")
+    b = client.tasks_add("coord-1", title="b")
     # Partial set — must reject.
-    bad = client.task_list_reorder("coord-1", task_ids=[a["id"]])
+    bad = client.tasks_reorder("coord-1", task_ids=[a["id"]])
     assert "error" in bad
     # Wrong id — reject.
-    wrong = client.task_list_reorder("coord-1", task_ids=[a["id"], "ghost"])
+    wrong = client.tasks_reorder("coord-1", task_ids=[a["id"], "ghost"])
     assert "error" in wrong
     # Valid permutation — accept.
-    ok = client.task_list_reorder("coord-1", task_ids=[b["id"], a["id"]])
+    ok = client.tasks_reorder("coord-1", task_ids=[b["id"], a["id"]])
     assert ok.get("ok") is True
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert [t["id"] for t in env["tasks"]] == [b["id"], a["id"]]
 
 
-def test_task_list_cross_ws_scope_violation_is_noop(tmp_path):
+def test_tasks_cross_ws_scope_violation_is_noop(tmp_path):
     client = _task_client(tmp_path)
     # Client is bound to coord-1; anything else returns an empty envelope
     # or an error without touching storage.
-    assert client.task_list_get("other-ws") == {"version": 1, "tasks": []}
-    res_add = client.task_list_add("other-ws", title="sneak")
+    assert client.tasks_get("other-ws") == {"version": 1, "tasks": []}
+    res_add = client.tasks_add("other-ws", title="sneak")
     assert "error" in res_add
-    res_remove = client.task_list_remove("other-ws", task_id="x")
+    res_remove = client.tasks_remove("other-ws", task_id="x")
     assert "error" in res_remove
     assert "scope violation" in res_remove["error"]
 
 
-def test_task_list_corrupt_json_returns_empty_envelope(tmp_path):
+def test_tasks_corrupt_json_returns_empty_envelope(tmp_path):
     """A hand-edited / corrupt config row must not crash the tool."""
     st = SQLiteBackend(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"tasks": "{not json"})
     client = _make_read_client(st)
-    env = client.task_list_get("coord-1")
+    env = client.tasks_get("coord-1")
     assert env == {"version": 1, "tasks": []}
 
 
-def test_task_list_mutations_refuse_corrupt_envelope(tmp_path):
+def test_tasks_mutations_refuse_corrupt_envelope(tmp_path):
     """When the envelope is corrupt on disk, mutators must error out
     (rather than silently overwrite — lost-data safety)."""
     st = SQLiteBackend(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"tasks": "{not json"})
     client = _make_read_client(st)
-    add_result = client.task_list_add("coord-1", title="new")
+    add_result = client.tasks_add("coord-1", title="new")
     assert "error" in add_result
     assert "corrupt" in add_result["error"]
     # Also: the corrupt blob is preserved after the refused mutation.
     assert st.load_workstream_config("coord-1").get("tasks") == "{not json"
-    update_result = client.task_list_update("coord-1", task_id="x", status="done")
+    update_result = client.tasks_update("coord-1", task_id="x", status="done")
     assert "error" in update_result
-    reorder_result = client.task_list_reorder("coord-1", task_ids=[])
+    reorder_result = client.tasks_reorder("coord-1", task_ids=[])
     assert "error" in reorder_result
-    remove_result = client.task_list_remove("coord-1", task_id="x")
+    remove_result = client.tasks_remove("coord-1", task_id="x")
     assert "error" in remove_result
     assert "corrupt" in remove_result["error"]
 
 
-def test_task_list_add_enforces_capacity_cap(tmp_path, monkeypatch):
+def test_tasks_add_enforces_capacity_cap(tmp_path, monkeypatch):
     from turnstone.console import coordinator_client as cc_module
 
-    monkeypatch.setattr(cc_module, "_TASK_LIST_MAX", 3)
+    monkeypatch.setattr(cc_module, "_TASKS_MAX", 3)
     client = _task_client(tmp_path)
     for i in range(3):
-        client.task_list_add("coord-1", title=f"t{i}")
-    overflow = client.task_list_add("coord-1", title="no-room")
+        client.tasks_add("coord-1", title=f"t{i}")
+    overflow = client.tasks_add("coord-1", title="no-room")
     assert "error" in overflow
     assert "capacity" in overflow["error"]
     # After a remove, add succeeds again.
-    env = client.task_list_get("coord-1")
-    client.task_list_remove("coord-1", task_id=env["tasks"][0]["id"])
-    added = client.task_list_add("coord-1", title="retry")
+    env = client.tasks_get("coord-1")
+    client.tasks_remove("coord-1", task_id=env["tasks"][0]["id"])
+    added = client.tasks_add("coord-1", title="retry")
     assert "error" not in added
 
 
-def test_task_list_save_preserves_other_workstream_config_keys(tmp_path):
-    """_save_task_list writes only the 'tasks' key so other keys survive."""
+def test_tasks_save_preserves_other_workstream_config_keys(tmp_path):
+    """_save_tasks writes only the 'tasks' key so other keys survive."""
     st = SQLiteBackend(str(tmp_path / "tasks.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.save_workstream_config("coord-1", {"reasoning_effort": "high"})
     client = _make_read_client(st)
-    client.task_list_add("coord-1", title="plan")
+    client.tasks_add("coord-1", title="plan")
     config = st.load_workstream_config("coord-1")
     assert config.get("reasoning_effort") == "high"
-    assert config.get("tasks")  # task_list wrote its key too
+    assert config.get("tasks")  # tasks wrote its key too
 
 
 def test_live_cache_lru_eviction_caps_memory(tmp_path):
@@ -1663,7 +2148,7 @@ def test_cleanup_dead_task_child_refs_blanks_dead_links(populated_storage):
     )
     blanked = client.cleanup_dead_task_child_refs("coord-1")
     assert blanked == 1
-    envelope = client.task_list_get("coord-1")
+    envelope = client.tasks_get("coord-1")
     tasks_by_id = {t["id"]: t for t in envelope["tasks"]}
     # Live link preserved.
     assert tasks_by_id["t1"]["child_ws_id"] == "child-a"
@@ -1699,9 +2184,9 @@ def test_cleanup_dead_task_child_refs_all_alive_is_noop(populated_storage):
 
 
 def test_cleanup_dead_task_child_refs_empty_envelope(populated_storage):
-    """A coordinator with no task_list persisted returns 0 without
+    """A coordinator with no tasks persisted returns 0 without
     raising — the cleanup runs on every close, including those that
-    never used the task_list tool."""
+    never used the tasks tool."""
     client = _make_read_client(populated_storage)
     blanked = client.cleanup_dead_task_child_refs("coord-1")
     assert blanked == 0
@@ -1718,7 +2203,7 @@ def test_cleanup_dead_task_child_refs_corrupt_envelope_skips(populated_storage):
 
 def test_cleanup_dead_task_child_refs_uses_task_lock(populated_storage):
     """The cleanup must acquire the same per-ws _task_lock that
-    task_list_add/update/remove/reorder hold, so a close racing an
+    tasks_add/update/remove/reorder hold, so a close racing an
     in-flight mutation can't lose writes (#bug-6).  Verified by
     swapping the cached lock for a stand-in that records acquisition."""
     client = _make_read_client(populated_storage)

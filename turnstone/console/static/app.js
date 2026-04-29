@@ -8,7 +8,7 @@ window.onLoginSuccess = function () {
   // Re-populate the home-composer skill dropdown and re-probe the
   // coordinator subsystem now that auth has landed.  The initial
   // page-load pass runs before login completes, so /v1/api/skills
-  // and /v1/api/coordinator both 401; without this re-run the
+  // and /v1/api/workstreams both 401; without this re-run the
   // dropdown stays empty and the 503 banner never flips correctly.
   if (typeof _populateHomeSkillDropdown === "function") {
     _populateHomeSkillDropdown();
@@ -20,6 +20,9 @@ window.onLoginSuccess = function () {
   // (#9) — no poller to restart after login.  The home-view renderer
   // reads from clusterState.nodes["console"].workstreams on every SSE
   // patch, so authenticating just unblocks the normal event stream.
+  if (typeof loadSavedCoordinators === "function") {
+    loadSavedCoordinators();
+  }
 };
 window.onLogout = function () {
   if (evtSource) {
@@ -64,9 +67,7 @@ window.onThemeChange = function (next) {
 })();
 
 // --- State ---
-var currentView = "home"; // "home" | "overview" | "node" | "filtered" | "admin"
-var currentNodeId = null;
-var currentServerUrl = "";
+var currentView = "home"; // "home" | "overview" | "filtered" | "admin"
 var currentFilter = { state: null, node: null, page: 1, per_page: 50 };
 var expandedGroups = {};
 var _lastOverviewJson = "";
@@ -141,12 +142,30 @@ function patchClusterState(data) {
       });
     }
   } else if (t === "ws_closed") {
+    // Peek BEFORE the filter so we can tell whether the closed ws was a
+    // coordinator (lives on the console pseudo-node, kind="coordinator")
+    // and only then refetch the saved list.  ws_closed payloads from
+    // real-node interactive closes don't carry kind on the wire, but
+    // they're already typed in clusterState from the matching ws_created
+    // event.  Skipping interactive closes avoids per-close fan-out into
+    // /v1/api/workstreams/saved on busy clusters.
+    var wasCoordinator = false;
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
+        if (ws.id === data.ws_id && ws.kind === "coordinator") {
+          wasCoordinator = true;
+        }
+      });
+    });
     Object.keys(clusterState.nodes).forEach(function (nid) {
       var n = clusterState.nodes[nid];
       n.workstreams = (n.workstreams || []).filter(function (ws) {
         return ws.id !== data.ws_id;
       });
     });
+    if (wasCoordinator && typeof loadSavedCoordinators === "function") {
+      loadSavedCoordinators();
+    }
   } else if (t === "ws_rename") {
     Object.keys(clusterState.nodes).forEach(function (nid) {
       (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
@@ -197,8 +216,8 @@ function recomputeOverview() {
   Object.keys(clusterState.nodes).forEach(function (nid) {
     // Skip the "console" pseudo-node — coordinators aren't compute-
     // node workstreams, and counting them here would inflate the
-    // cluster-summary totals the home view renders.  The
-    // active-coordinators list surfaces them separately.
+    // cluster totals.  The active-coordinators list surfaces them
+    // separately.
     if (nid === "console") return;
     var node = clusterState.nodes[nid];
     var nodeWsTokens = 0;
@@ -281,8 +300,7 @@ function renderFromState() {
   if (currentView === "home") {
     _renderHomeView();
     // Home view also hosts the inline node-list (cluster details);
-    // render it so expanding the cluster-summary reveals the current
-    // state without waiting for the next SSE tick.
+    // render it so the next SSE tick doesn't leave it stale.
     var nodesList = Object.keys(clusterState.nodes)
       .filter(function (nid) {
         // Exclude the "console" pseudo-node from the nodes list — it's
@@ -297,34 +315,6 @@ function renderFromState() {
       return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
     });
     renderNodeGroups(nodesList, nodesList.length);
-  } else if (currentView === "node" && currentNodeId) {
-    var snapNode = clusterState.nodes[currentNodeId];
-    if (snapNode) {
-      var wsList = snapNode.workstreams || [];
-      var active = wsList.filter(function (w) {
-        return w.state !== "idle";
-      }).length;
-      document.getElementById("node-ws-summary").textContent =
-        active + " active \u00b7 " + wsList.length + " total";
-      var mcpSumEl = document.getElementById("node-mcp-summary");
-      if (mcpSumEl) {
-        var mcpInfo = snapNode.health && snapNode.health.mcp;
-        if (mcpInfo && mcpInfo.servers > 0) {
-          mcpSumEl.textContent =
-            mcpInfo.servers +
-            " MCP server" +
-            (mcpInfo.servers !== 1 ? "s" : "") +
-            " \u00b7 " +
-            mcpInfo.resources +
-            " resources \u00b7 " +
-            mcpInfo.prompts +
-            " prompts";
-        } else {
-          mcpSumEl.textContent = "";
-        }
-      }
-      renderWsTable(document.getElementById("node-ws-table"), wsList);
-    }
   } else if (currentView === "filtered") {
     var allWs = [];
     Object.keys(clusterState.nodes).forEach(function (nid) {
@@ -442,16 +432,13 @@ function handleClusterEvent(data) {
 // --- Home View ---
 //
 // Coordinator-first landing: composer + active-coordinators list +
-// compact cluster summary.  The legacy #view-overview stays reachable
-// via the summary's expand button and the existing popstate / deep-
-// link wiring so `?view=overview` etc. still land on the node list.
+// inline node list.  The node list is self-collapsing (consecutive
+// same-prefix nodes group into a single row) so it stays visible
+// without dominating the page.
 function showHome() {
   currentView = "home";
-  currentNodeId = null;
-  currentServerUrl = "";
   currentFilter = { state: null, node: null, page: 1, per_page: 50 };
   _setLandingView("home");
-  _setClusterDetailsExpanded(false);
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
   var adminBtn = document.getElementById("admin-btn");
@@ -468,74 +455,15 @@ function showHome() {
 }
 
 function _setLandingView(which) {
-  // Toggle the three top-level landing panes.  The "overview" (node
-  // list) is no longer its own pane — it's an expandable section
-  // inside #view-home, toggled by toggleClusterDetails() — so every
-  // view transition only needs to choose between home / node /
-  // filtered.
-  var views = ["home", "node", "filtered"];
+  // Toggle the two top-level landing panes.  The node list lives inside
+  // #view-home as a sibling section, and clicking a node navigates
+  // straight to /node/<id>/ rather than swapping in a detail pane.
+  var views = ["home", "filtered"];
   views.forEach(function (name) {
     var el = document.getElementById("view-" + name);
     if (!el) return;
     el.style.display = name === which ? "" : "none";
   });
-}
-
-// Toggle the inline cluster-details (node list) panel inside
-// #view-home.  Replaces the old "swap to #view-overview" navigation so
-// operators never leave the landing page to see cluster state.
-function _setClusterDetailsExpanded(expanded) {
-  var details = document.getElementById("view-overview");
-  var btn = document.getElementById("cluster-summary-expand");
-  var caret = document.querySelector(".home-cluster-summary-caret");
-  if (!details) return;
-  if (expanded) {
-    details.removeAttribute("hidden");
-    if (btn) btn.setAttribute("aria-expanded", "true");
-    if (caret) caret.textContent = "\u25BE"; // ▾
-  } else {
-    details.setAttribute("hidden", "");
-    if (btn) btn.setAttribute("aria-expanded", "false");
-    if (caret) caret.textContent = "\u25B8"; // ▸
-  }
-}
-
-function toggleClusterDetails() {
-  var details = document.getElementById("view-overview");
-  if (!details) return;
-  _setClusterDetailsExpanded(details.hasAttribute("hidden"));
-}
-
-// --- Overview (alias: expanded cluster-details on the home view) ---
-// Preserved so breadcrumb "Cluster" links, popstate {view:"overview"},
-// and ?view=overview deep-links still land on a meaningful state.
-// Semantically equivalent to showHome() with the cluster-details
-// section forced open.
-function showOverview() {
-  currentView = "home";
-  currentNodeId = null;
-  currentServerUrl = "";
-  currentFilter = { state: null, node: null, page: 1, per_page: 50 };
-  _setLandingView("home");
-  _setClusterDetailsExpanded(true);
-  var adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
-  if (adminBtn) {
-    adminBtn.classList.remove("active");
-    adminBtn.setAttribute("aria-expanded", "false");
-  }
-  document.getElementById("breadcrumb").style.display = "none";
-  if (clusterState) renderFromState();
-  else loadOverview();
-  if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
-  // Scroll the details section into view so the click produces a
-  // visible reaction — the user expands the summary expecting to see
-  // the node list, not wonder whether the click worked.
-  var details = document.getElementById("view-overview");
-  if (details && typeof details.scrollIntoView === "function") {
-    details.scrollIntoView({ block: "start", behavior: "smooth" });
-  }
 }
 
 function loadOverview() {
@@ -844,13 +772,14 @@ function buildNodeRow(node) {
     healthPct +
     "%</span>";
 
+  var nodeUrl = "/node/" + encodeURIComponent(node.node_id) + "/";
   row.onclick = function () {
-    drillDownToNode(node.node_id, node.server_url);
+    window.location.href = nodeUrl;
   };
   row.onkeydown = function (e) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      drillDownToNode(node.node_id, node.server_url);
+      window.location.href = nodeUrl;
     }
   };
   return row;
@@ -1058,60 +987,6 @@ function renderNodeGroups(nodes, total) {
     groupEl.appendChild(body);
     table.appendChild(groupEl);
   });
-}
-
-// --- Drill-down: Node ---
-function drillDownToNode(nodeId, serverUrl) {
-  currentView = "node";
-  currentNodeId = nodeId;
-  currentServerUrl = serverUrl || "";
-  _setLandingView("node");
-  var adminView = document.getElementById("view-admin");
-  if (adminView) adminView.style.display = "none";
-  var adminBtn = document.getElementById("admin-btn");
-  if (adminBtn) {
-    adminBtn.classList.remove("active");
-    adminBtn.setAttribute("aria-expanded", "false");
-  }
-  document.getElementById("breadcrumb").style.display = "";
-  document.getElementById("breadcrumb-label").textContent = nodeId;
-  var link = document.getElementById("node-link");
-  // Use proxy path so users don't need direct server access
-  link.href = "/node/" + encodeURIComponent(nodeId) + "/";
-  link.style.display = "";
-  document.getElementById("main").scrollTop = 0;
-  if (clusterState && clusterState.nodes[nodeId]) {
-    renderFromState();
-  } else {
-    document.getElementById("node-ws-table").innerHTML =
-      '<div class="dashboard-empty">Loading workstreams...</div>';
-    loadNodeDetail(nodeId);
-  }
-  _loadNodeMetadataPanel(nodeId);
-  document.getElementById("breadcrumb-home").focus();
-  if (!_navigatingFromPopstate)
-    history.pushState(
-      { view: "node", nodeId: nodeId, serverUrl: serverUrl },
-      "",
-    );
-}
-
-function loadNodeDetail(nodeId) {
-  authFetch("/v1/api/cluster/snapshot")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      applySnapshot(data);
-      if (!clusterState || !clusterState.nodes[nodeId]) {
-        document.getElementById("node-ws-table").innerHTML =
-          '<div class="dashboard-empty">Node not found</div>';
-      }
-    })
-    .catch(function () {
-      document.getElementById("node-ws-table").innerHTML =
-        '<div class="dashboard-empty">Failed to load</div>';
-    });
 }
 
 // --- Drill-down: Filtered ---
@@ -1543,17 +1418,14 @@ window.addEventListener("popstate", function (e) {
       showHome();
       return;
     }
-    if (e.state.view === "home") showHome();
-    else if (e.state.view === "overview") showOverview();
+    if (e.state.view === "home" || e.state.view === "overview") showHome();
     else if (e.state.view === "admin" && typeof showAdmin === "function")
       showAdmin();
-    else if (e.state.view === "node" && e.state.nodeId)
-      drillDownToNode(e.state.nodeId, e.state.serverUrl);
     else if (e.state.view === "filtered" && e.state.filter) {
       currentFilter = e.state.filter;
       if (currentFilter.state) drillDownByState(currentFilter.state);
       else if (currentFilter.node) drillDownByNode(currentFilter.node);
-    }
+    } else showHome();
   } finally {
     _navigatingFromPopstate = false;
   }
@@ -1853,7 +1725,7 @@ function _hasCoordPermission() {
   return perms.split(",").indexOf("admin.coordinator") !== -1;
 }
 
-// POST /v1/api/coordinator/new.  Accepts the three request fields
+// POST /v1/api/workstreams/new.  Accepts the three request fields
 // directly + an errEl / setBusy callback so the caller owns the
 // loading-state UX (button label swap, composer disabled flag, etc.).
 // On success redirects to /coordinator/{ws_id}; on 503 invokes on503
@@ -1861,6 +1733,8 @@ function _hasCoordPermission() {
 function _createCoordinator(opts) {
   var name = (opts.name || "").trim();
   var skill = opts.skill || "";
+  var model = (opts.model || "").trim();
+  var judgeModel = (opts.judge_model || "").trim();
   var task = (opts.task || "").trim();
   var errEl = opts.errEl;
   var setBusy = opts.setBusy || function () {};
@@ -1874,9 +1748,11 @@ function _createCoordinator(opts) {
   var body = {};
   if (name) body.name = name;
   if (skill) body.skill = skill;
+  if (model) body.model = model;
+  if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
 
-  authFetch("/v1/api/coordinator/new", {
+  authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -1938,6 +1814,7 @@ function _ensureHomeComposerInit() {
   _homeComposerInit = true;
   _mountHomeCoordComposer();
   _populateHomeSkillDropdown();
+  _populateHomeModelDropdowns();
   _probeCoordSubsystem();
   _refreshHomeComposerVisibility();
 }
@@ -1966,6 +1843,8 @@ function _mountHomeCoordComposer() {
         var bits = [];
         if (v.name) bits.push(v.name);
         if (v.skill) bits.push(v.skill);
+        if (v.model) bits.push(v.model);
+        if (v.judge_model) bits.push("judge: " + v.judge_model);
         return bits.join(" \u00b7 ");
       },
       fields: [
@@ -1981,6 +1860,22 @@ function _mountHomeCoordComposer() {
           label: "Skill",
           type: "select",
           choices: [{ value: "", text: "Use defaults" }],
+        },
+        {
+          id: "model",
+          label: "Model",
+          type: "select",
+          choices: [{ value: "", text: "Default model" }],
+        },
+        {
+          id: "judge_model",
+          label: "Judge Model",
+          type: "select",
+          // Neutral label — the actual default is ConfigStore
+          // ``judge.model`` when set, IntentJudge's agent-model
+          // fallback when not.  "Default judge model" doesn't
+          // mislead either way.
+          choices: [{ value: "", text: "Default judge model" }],
         },
       ],
     },
@@ -2010,7 +1905,31 @@ function _populateHomeSkillDropdown() {
     });
 }
 
-// Probe GET /v1/api/coordinator — 200 = subsystem ready; 503 = no model
+// Populate Model + Judge Model dropdowns from /v1/api/models — same
+// list the interactive new-ws modal uses.  Empty/default option stays
+// at the top so submitting without a choice falls back to the
+// ConfigStore-configured coordinator.model_alias / judge.model.
+function _populateHomeModelDropdowns() {
+  if (!_homeCoordComposer) return;
+  authFetch("/v1/api/models")
+    .then(function (r) {
+      return r.ok ? r.json() : { models: [] };
+    })
+    .then(function (data) {
+      var choices = (data.models || []).map(function (m) {
+        var label =
+          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+        return { value: m.alias, text: label };
+      });
+      _homeCoordComposer.setOptionChoices("model", choices);
+      _homeCoordComposer.setOptionChoices("judge_model", choices);
+    })
+    .catch(function () {
+      /* defaults still work even without the dropdown populated */
+    });
+}
+
+// Probe GET /v1/api/workstreams — 200 = subsystem ready; 503 = no model
 // alias resolvable, show remediation banner.  4xx (auth / permission) is
 // treated as "unknown, don't flip the banner" because the probe cannot
 // actually tell us anything about subsystem readiness in that case —
@@ -2025,7 +1944,7 @@ function _populateHomeSkillDropdown() {
 // round-trip on every login.
 function _probeCoordSubsystem() {
   if (!_hasCoordPermission()) return;
-  authFetch("/v1/api/coordinator")
+  authFetch("/v1/api/workstreams")
     .then(function (r) {
       if (r.status === 503) {
         _homeCoordReady = false;
@@ -2065,6 +1984,8 @@ function submitHomeCoord(textFromComposer) {
   _createCoordinator({
     name: opts.name || "",
     skill: opts.skill || "",
+    model: opts.model || "",
+    judge_model: opts.judge_model || "",
     task: task,
     errEl: document.getElementById("home-coord-error"),
     setBusy: function (b) {
@@ -2098,14 +2019,12 @@ document.addEventListener("keydown", function (e) {
   if (!_homeCoordComposer.sendBtn.disabled) submitHomeCoord();
 });
 
-// Fingerprints of the last home-view render — skip DOM rebuilds when
-// nothing visible in either region has changed.  renderFromState fires
-// on every SSE patch (state_change, ws_created, ws_closed, cluster
-// aggregate update...) and most of those don't affect the coord list or
-// the summary line — short-circuiting here avoids a replaceChildren +
-// tree-group rebuild on every activity tick.
+// Fingerprint of the last active-coordinators render — skip the
+// replaceChildren + tree-group rebuild when nothing visible in the
+// coord list has changed.  renderFromState fires on every SSE patch
+// (state_change, ws_created, ws_closed, ...) and most of those don't
+// affect the coord list.
 var _homeCoordsFingerprint = "";
-var _homeSummaryFingerprint = "";
 
 // Active-coordinators list is SSE-driven — the console collector
 // registers a "console" pseudo-node and the coordinator manager fans
@@ -2194,57 +2113,114 @@ function _renderHomeView() {
       }
     }
   }
+}
 
-  // Cluster summary — one-line aggregate.  Mirrors the existing
-  // #cluster-summary header span (kept unchanged for deep-link callers)
-  // but with state counts inlined so operators don't have to expand
-  // to see the cluster's posture.
-  //
-  // The #cluster-summary header element is ALSO written by the overview
-  // branch of renderFromState with a different format ("1 nodes" vs
-  // "1 node").  Always rewrite it here so navigating overview → home
-  // doesn't leave the stale overview text behind when the cluster
-  // aggregate fingerprint hasn't actually changed.
-  var ovr = clusterState.overview || {};
-  var states = ovr.states || {};
-  var aggTokens = (ovr.aggregate || {}).total_tokens || 0;
-  var headerSum = document.getElementById("cluster-summary");
-  if (headerSum) {
-    headerSum.textContent =
-      (ovr.nodes || 0) +
-      " node" +
-      ((ovr.nodes || 0) === 1 ? "" : "s") +
-      " \u00b7 " +
-      formatCount(ovr.workstreams || 0) +
-      " workstreams";
+// ---------------------------------------------------------------------------
+// Saved coordinators — closed sessions persisted on disk.  Mirrors the
+// interactive UI's "Saved Workstreams" card grid (same /shared/cards.css
+// primitives, same /shared/cards.js renderSessionCard helper, same
+// response item shape from /v1/api/workstreams/saved).  Click a card →
+// POST /open then /coordinator/{ws_id}; the lifted detail factory
+// lazily rehydrates from storage on the GET miss.
+// ---------------------------------------------------------------------------
+
+// In-flight de-dup for loadSavedCoordinators.  ws_closed events can
+// arrive in bursts on a busy cluster; without this guard each one
+// triggers a parallel fetch.  Single boolean is enough because the
+// renderer reads from the latest response — a coalesced re-fetch right
+// after the in-flight one resolves catches any state change.
+var _savedCoordsInFlight = false;
+var _savedCoordsRetry = false;
+
+function loadSavedCoordinators() {
+  if (!_hasCoordPermission()) return;
+  if (_savedCoordsInFlight) {
+    _savedCoordsRetry = true;
+    return;
   }
+  _savedCoordsInFlight = true;
+  authFetch("/v1/api/workstreams/saved")
+    .then(function (r) {
+      return r.ok ? r.json() : { workstreams: [] };
+    })
+    .then(function (data) {
+      renderSavedCoordinators(data.workstreams || []);
+    })
+    .catch(function () {
+      /* silent — saved list is informational, not load-bearing */
+    })
+    .finally(function () {
+      _savedCoordsInFlight = false;
+      // If at least one call arrived while we were in flight, fire one
+      // catch-up fetch (not N) so the UI reflects the latest state
+      // without a per-event fan-out.
+      if (_savedCoordsRetry) {
+        _savedCoordsRetry = false;
+        loadSavedCoordinators();
+      }
+    });
+}
 
-  var summaryFp =
-    (ovr.nodes || 0) +
-    "|" +
-    (ovr.workstreams || 0) +
-    "|" +
-    (states.running || 0) +
-    "|" +
-    (states.attention || 0) +
-    "|" +
-    (states.error || 0) +
-    "|" +
-    aggTokens;
-  if (summaryFp === _homeSummaryFingerprint) return;
-  _homeSummaryFingerprint = summaryFp;
-
-  var parts = [
-    (ovr.nodes || 0) + " node" + ((ovr.nodes || 0) === 1 ? "" : "s"),
-    formatCount(ovr.workstreams || 0) + " workstreams",
-  ];
-  if (states.running) parts.push(states.running + " running");
-  if (states.attention) parts.push(states.attention + " attention");
-  if (states.error) parts.push(states.error + " error");
-  if (aggTokens) parts.push(formatTokens(aggTokens) + " tokens");
-  var summaryText = parts.join(" \u00b7 ");
-  var line = document.getElementById("cluster-summary-line");
-  if (line) line.textContent = summaryText;
+function renderSavedCoordinators(items) {
+  var section = document.getElementById("saved-coordinators");
+  var cards = document.getElementById("saved-coord-cards");
+  var countEl = document.getElementById("saved-coord-count");
+  if (!section || !cards) return;
+  if (!items.length) {
+    section.style.display = "none";
+    cards.replaceChildren();
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+  section.style.display = "";
+  if (countEl) countEl.textContent = "(" + items.length + ")";
+  cards.replaceChildren();
+  items.forEach(function (sess) {
+    var card = renderSessionCard(sess, {
+      ariaLabel: function (s) {
+        return (
+          "Resume coordinator: " + (s.alias || s.title || s.name || s.ws_id)
+        );
+      },
+      onActivate: function (s, cardEl) {
+        // POST /open BEFORE navigating so capacity issues surface as a
+        // toast instead of a broken-looking detail page.  The /open
+        // endpoint calls the same lazy-rehydrate path the GET would,
+        // but we get the status code synchronously so the user learns
+        // "all slots in use" instead of staring at a 404.
+        cardEl.classList.add("is-busy");
+        authFetch(
+          "/v1/api/workstreams/" + encodeURIComponent(s.ws_id) + "/open",
+          { method: "POST" },
+        )
+          .then(function (r) {
+            if (r.ok) {
+              window.location.href =
+                "/coordinator/" + encodeURIComponent(s.ws_id);
+              return;
+            }
+            cardEl.classList.remove("is-busy");
+            if (r.status === 429) {
+              showToast(
+                "All coordinator slots are active — close one first to restore this session",
+              );
+            } else if (r.status === 404) {
+              showToast("Coordinator no longer available");
+              loadSavedCoordinators();
+            } else if (r.status === 503) {
+              showToast("Coordinator subsystem not configured");
+            } else {
+              showToast("Failed to restore coordinator (" + r.status + ")");
+            }
+          })
+          .catch(function () {
+            cardEl.classList.remove("is-busy");
+            showToast("Failed to restore coordinator");
+          });
+      },
+    });
+    cards.appendChild(card);
+  });
 }
 
 // --- Init ---
@@ -2259,70 +2235,31 @@ function _ensureSSE() {
 }
 history.replaceState({ view: "home" }, "");
 initLogin();
-// loadOverview fetches the cluster snapshot — both the cluster-summary
-// aggregates AND the active-coordinators list come from the same
-// snapshot + SSE patch pipeline (#9); the console pseudo-node carries
-// coordinator ws_created / ws_closed / cluster_state events.
+// loadOverview fetches the cluster snapshot — both the node list AND
+// the active-coordinators list come from the same snapshot + SSE patch
+// pipeline (#9); the console pseudo-node carries coordinator
+// ws_created / ws_closed / cluster_state events.
 loadOverview();
 _ensureHomeComposerInit();
-// Refresh the coord button visibility after initial whoami lands in
-// sessionStorage (auth.js populates it asynchronously).  A short delay
-// is good enough — the shared pattern for permission-gated UI.
-setTimeout(_refreshHomeComposerVisibility, 500);
-
-// --- Node Metadata Panel (read-only in node detail view) ---
-function _loadNodeMetadataPanel(nodeId) {
-  var section = document.getElementById("node-metadata-section");
-  var table = document.getElementById("node-metadata-table");
-  if (!section || !table) return;
-  section.style.display = "none";
-  table.textContent = "";
-  authFetch("/v1/api/cluster/node/" + encodeURIComponent(nodeId))
-    .then(function (r) {
-      return r.ok ? r.json() : null;
-    })
-    .then(function (data) {
-      if (!data || !data.metadata || !data.metadata.length) return;
-      section.style.display = "";
-      var tbl = document.createElement("table");
-      tbl.className = "nm-table";
-      var thead = document.createElement("thead");
-      var hr = document.createElement("tr");
-      ["Key", "Value", "Source"].forEach(function (h) {
-        var th = document.createElement("th");
-        th.setAttribute("scope", "col");
-        th.textContent = h;
-        hr.appendChild(th);
-      });
-      thead.appendChild(hr);
-      tbl.appendChild(thead);
-      var tbody = document.createElement("tbody");
-      data.metadata.forEach(function (m) {
-        var tr = document.createElement("tr");
-        var tdKey = document.createElement("td");
-        tdKey.className = "nm-key";
-        tdKey.textContent = m.key;
-        tr.appendChild(tdKey);
-        var tdVal = document.createElement("td");
-        tdVal.className = "nm-val";
-        tdVal.textContent =
-          typeof m.value === "object"
-            ? JSON.stringify(m.value)
-            : String(m.value);
-        tdVal.title = tdVal.textContent;
-        tr.appendChild(tdVal);
-        var tdSrc = document.createElement("td");
-        var badge = document.createElement("span");
-        badge.className = "nm-source-badge nm-source-" + m.source;
-        badge.textContent = m.source;
-        tdSrc.appendChild(badge);
-        tr.appendChild(tdSrc);
-        tbody.appendChild(tr);
-      });
-      tbl.appendChild(tbody);
-      table.appendChild(tbl);
-    })
-    .catch(function () {
-      /* silent — metadata is supplementary */
-    });
+// Refresh the coord button visibility once auth.js has populated
+// sessionStorage from the initial whoami.  window.permissionsReady
+// resolves after that completes (success or failure); fall back to a
+// short timeout if the promise isn't available (older auth.js).
+//
+// NOTE: permissionsReady is one-shot — it fires exactly once per page
+// load (see auth.js).  Subsequent re-logins are caught by the
+// onLoginSuccess hook above which calls loadSavedCoordinators() again.
+if (
+  window.permissionsReady &&
+  typeof window.permissionsReady.then === "function"
+) {
+  window.permissionsReady.then(function () {
+    _refreshHomeComposerVisibility();
+    loadSavedCoordinators();
+  });
+} else {
+  setTimeout(function () {
+    _refreshHomeComposerVisibility();
+    loadSavedCoordinators();
+  }, 500);
 }

@@ -1000,7 +1000,7 @@ class BulkSetNodeMetadataRequest(BaseModel):
 
 
 class CoordinatorOpenResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/open."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/open."""
 
     ws_id: str
     name: str
@@ -1011,7 +1011,7 @@ class CoordinatorOpenResponse(BaseModel):
 
 
 class CoordinatorCreateRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/new."""
+    """Body for POST /v1/api/workstreams/new."""
 
     name: str = Field(default="", description="Optional display name; auto-generated when empty.")
     skill: str | None = Field(
@@ -1025,45 +1025,70 @@ class CoordinatorCreateRequest(BaseModel):
 
 
 class CoordinatorCreateResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/new (201)."""
+    """Response body for POST /v1/api/workstreams/new (200)."""
 
     ws_id: str
     name: str
-
-
-class CoordinatorInfo(BaseModel):
-    """Per-coordinator row in the list response."""
-
-    ws_id: str
-    name: str
-    state: str
-    user_id: str
-
-
-class CoordinatorListResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator."""
-
-    coordinators: list[CoordinatorInfo] = Field(default_factory=list)
-
-
-class CoordinatorDetailResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}."""
-
-    ws_id: str
-    name: str
-    state: str
-    user_id: str
-    kind: str = Field(default="coordinator")
+    # Always-include parity fields from the Stage 2 ``create`` verb
+    # lift. Coord doesn't populate ``resumed`` or ``message_count``
+    # today (no resume-on-create surface yet), so they default to
+    # ``False`` / ``0``. ``attachment_ids`` carries the saved-but-
+    # pending attachment ids when the request was multipart.
+    resumed: bool = False
+    message_count: int = 0
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class CoordinatorSendRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/send."""
+    """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
     message: str = Field(description="User message to queue onto the coordinator's worker.")
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "Explicit list of attachment ids to inject into this turn. "
+            "When omitted, any pending attachments for the caller on "
+            "this coordinator are auto-consumed. An empty list disables "
+            "auto-consumption for this send."
+        ),
+    )
+
+
+class CoordinatorSendResponse(BaseModel):
+    """Response shape for POST /v1/api/workstreams/{ws_id}/send (coord)."""
+
+    status: str = Field(
+        description="'ok' (fresh worker spawned), 'queued' (live worker reuse), or 'queue_full'.",
+        examples=["ok", "queued", "queue_full"],
+    )
+    attached_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Attachment ids actually reserved onto this turn. Subset of "
+            "the request's `attachment_ids` (or the auto-consumed pending "
+            "set). Empty when the send carries no attachments."
+        ),
+    )
+    dropped_attachment_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Attachment ids the caller requested that the server could "
+            "not reserve (lost a race, already consumed, or cross-scope). "
+            "The request still proceeds with whatever was reserved."
+        ),
+    )
+    priority: str | None = Field(
+        default=None,
+        description="Set on `queued` responses: relative priority of the queued message.",
+    )
+    msg_id: str | None = Field(
+        default=None,
+        description="Set on `queued` responses: id used to dequeue the message.",
+    )
 
 
 class CoordinatorApproveRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/approve."""
+    """Body for POST /v1/api/workstreams/{ws_id}/approve."""
 
     approved: bool = Field(description="True approves the pending tool call(s); False denies.")
     feedback: str | None = Field(
@@ -1075,20 +1100,6 @@ class CoordinatorApproveRequest(BaseModel):
         description=(
             "When approved=True, also adds the pending tool name(s) to the session's "
             "auto-approve set so subsequent calls of the same tool skip the prompt."
-        ),
-    )
-
-
-class CoordinatorHistoryResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}/history."""
-
-    ws_id: str
-    messages: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description=(
-            "Tail of the coordinator's reconstructed message history "
-            "(provider-fidelity OpenAI-like shape).  Bounded by the ``limit`` "
-            "query parameter (default 100, max 500)."
         ),
     )
 
@@ -1109,7 +1120,7 @@ class CoordinatorChildInfo(BaseModel):
 
 
 class CoordinatorChildrenResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}/children."""
+    """Response body for GET /v1/api/workstreams/{ws_id}/children."""
 
     items: list[CoordinatorChildInfo] = Field(default_factory=list)
     truncated: bool = Field(
@@ -1130,9 +1141,9 @@ class CoordinatorTaskInfo(BaseModel):
 
 
 class CoordinatorTasksResponse(BaseModel):
-    """Response body for GET /v1/api/coordinator/{ws_id}/tasks.
+    """Response body for GET /v1/api/workstreams/{ws_id}/tasks.
 
-    Mirrors the envelope the ``task_list(action='list')`` model tool returns.
+    Mirrors the envelope the ``tasks(action='list')`` model tool returns.
     """
 
     version: int = Field(default=1)
@@ -1140,7 +1151,7 @@ class CoordinatorTasksResponse(BaseModel):
 
 
 class CoordinatorTrustRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/trust."""
+    """Body for POST /v1/api/workstreams/{ws_id}/trust."""
 
     send: bool = Field(
         description=(
@@ -1153,14 +1164,14 @@ class CoordinatorTrustRequest(BaseModel):
 
 
 class CoordinatorTrustResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/trust."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/trust."""
 
     status: str = Field(default="ok")
     trust_send: bool = Field(description="Post-toggle value of the flag.")
 
 
 class CoordinatorRestrictRequest(BaseModel):
-    """Body for POST /v1/api/coordinator/{ws_id}/restrict."""
+    """Body for POST /v1/api/workstreams/{ws_id}/restrict."""
 
     revoke: list[str] = Field(
         description=(
@@ -1172,14 +1183,14 @@ class CoordinatorRestrictRequest(BaseModel):
 
 
 class CoordinatorRestrictResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/restrict."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/restrict."""
 
     status: str = Field(default="ok")
     revoked_tools: list[str] = Field(description="Full post-revocation set of revoked tool names.")
 
 
 class CoordinatorStopCascadeResponse(BaseModel):
-    """Response body for POST /v1/api/coordinator/{ws_id}/stop_cascade."""
+    """Response body for POST /v1/api/workstreams/{ws_id}/stop_cascade."""
 
     status: str = Field(default="ok")
     cancelled: list[str] = Field(
@@ -1199,6 +1210,47 @@ class CoordinatorStopCascadeResponse(BaseModel):
         default_factory=list,
         description=(
             "Child ws_ids that returned 404 on cancel (already gone).  "
+            "Reported separately from ``failed`` so operators can "
+            "distinguish already-done from dispatch-broken."
+        ),
+    )
+
+
+class CoordinatorCloseAllChildrenRequest(BaseModel):
+    """Body for POST /v1/api/workstreams/{ws_id}/close_all_children."""
+
+    reason: str = Field(
+        default="",
+        max_length=512,
+        description=(
+            "Optional human-readable reason — propagated to every closed "
+            "child's audit + workstream_config for postmortem.  Capped at "
+            "512 chars; the handler returns 400 on overflow."
+        ),
+    )
+
+
+class CoordinatorCloseAllChildrenResponse(BaseModel):
+    """Response body for POST /v1/api/workstreams/{ws_id}/close_all_children."""
+
+    status: str = Field(default="ok")
+    closed: list[str] = Field(
+        default_factory=list,
+        description="Child ws_ids that accepted the close dispatch.",
+    )
+    failed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Child ws_ids whose close dispatch returned an error other "
+            "than an already-gone 404 — the cascade continues on per-"
+            "child failure so a single unreachable node doesn't abort "
+            "the whole batch."
+        ),
+    )
+    skipped: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Child ws_ids that returned 404 on close (already gone).  "
             "Reported separately from ``failed`` so operators can "
             "distinguish already-done from dispatch-broken."
         ),

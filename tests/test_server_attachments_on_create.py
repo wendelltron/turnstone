@@ -50,9 +50,11 @@ def _auth(user: str) -> dict[str, str]:
 
 class TestValidateAndSaveUploadedFiles:
     def test_saves_image_and_text(self, tmp_path):
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.memory import list_pending_attachments
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -73,8 +75,10 @@ class TestValidateAndSaveUploadedFiles:
 
     def test_rejects_oversized_image(self, tmp_path):
         from turnstone.core.attachments import IMAGE_SIZE_CAP
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -90,8 +94,10 @@ class TestValidateAndSaveUploadedFiles:
             reset_storage()
 
     def test_rejects_unsupported_text(self, tmp_path):
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -107,9 +113,11 @@ class TestValidateAndSaveUploadedFiles:
 
     def test_pending_cap_returns_409(self, tmp_path):
         from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
+        from turnstone.core.attachments import (
+            validate_and_save_uploaded_files as _validate_and_save_uploaded_files,
+        )
         from turnstone.core.memory import save_attachment
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _validate_and_save_uploaded_files
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -131,9 +139,11 @@ class TestValidateAndSaveUploadedFiles:
 class TestReserveAndResolveAttachments:
     def test_reserves_and_returns_attachments(self, tmp_path):
         from turnstone.core.attachments import Attachment
+        from turnstone.core.attachments import (
+            reserve_and_resolve_attachments as _reserve_and_resolve_attachments,
+        )
         from turnstone.core.memory import save_attachment
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _reserve_and_resolve_attachments
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -153,9 +163,11 @@ class TestReserveAndResolveAttachments:
             reset_storage()
 
     def test_double_reserve_drops_second(self, tmp_path):
+        from turnstone.core.attachments import (
+            reserve_and_resolve_attachments as _reserve_and_resolve_attachments,
+        )
         from turnstone.core.memory import save_attachment
         from turnstone.core.storage import init_storage, reset_storage
-        from turnstone.server import _reserve_and_resolve_attachments
 
         reset_storage()
         init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -253,11 +265,12 @@ class _FakeUI:
 
 @pytest.fixture
 def app_client(tmp_path, monkeypatch):
-    """End-to-end app with a fake session factory + WorkstreamManager."""
+    """End-to-end app with a fake session factory + SessionManager."""
+    from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
     from turnstone.core.metrics import MetricsCollector
-    from turnstone.core.storage import init_storage, reset_storage
-    from turnstone.core.workstream import WorkstreamManager
-    from turnstone.server import create_app
+    from turnstone.core.session_manager import SessionManager
+    from turnstone.core.storage import get_storage, init_storage, reset_storage
+    from turnstone.server import WebUI, create_app
 
     reset_storage()
     init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
@@ -278,9 +291,20 @@ def app_client(tmp_path, monkeypatch):
         fake_sessions.append(s)
         return s
 
-    mgr = WorkstreamManager(_factory, max_workstreams=10, node_id="node-test")
+    gq: queue.Queue[dict] = queue.Queue(maxsize=1000)
+    WebUI._global_queue = gq
+    adapter = InteractiveAdapter(
+        global_queue=gq,
+        ui_factory=lambda ws: _FakeUI(
+            ws_id=ws.id,
+            user_id=ws.user_id,
+        ),
+        session_factory=_factory,
+    )
+    mgr = SessionManager(
+        adapter, storage=get_storage(), max_active=10, node_id="node-test", event_emitter=adapter
+    )
 
-    gq: queue.Queue[dict] = queue.Queue()
     app = create_app(
         workstreams=mgr,
         global_queue=gq,

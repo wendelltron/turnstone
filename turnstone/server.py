@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import collections
 import contextlib
 import functools
 import hashlib
@@ -32,6 +31,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -43,6 +45,8 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
+from turnstone.core import session_worker
+from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import (
     DENY_EMPTY_SUB,
     JWT_AUD_SERVER,
@@ -54,12 +58,37 @@ from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
+from turnstone.core.session_manager import SessionManager
+from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_routes import (
+    AttachmentUploadHelpers,
+    SessionEndpointConfig,
+    SharedSessionVerbHandlers,
+    make_approve_handler,
+    make_attachment_handlers,
+    make_cancel_handler,
+    make_close_handler,
+    make_create_handler,
+    make_dequeue_handler,
+    make_detail_handler,
+    make_events_handler,
+    make_history_handler,
+    make_list_handler,
+    make_open_handler,
+    make_saved_handler,
+    make_send_handler,
+    register_session_routes,
+)
+from turnstone.core.session_ui_base import (
+    AutoApproveReason,
+    SessionUIBase,
+    fire_judge_verdict_metric,
+)
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
-    WorkstreamManager,
     WorkstreamState,
 )
 from turnstone.prompts import ClientType
@@ -86,8 +115,6 @@ _VALID_WS_ID = re.compile(r"^[0-9a-f]{32}$")
 # WebUI — implements SessionUI for browser-based interaction
 # ---------------------------------------------------------------------------
 
-_MAX_TURN_CONTENT_CHARS = 256 * 1024  # cap piggybacked content on idle events
-
 # Orphan-attachment-reservation sweep cadence.  Threshold is measured
 # against the storage layer's `reserved_at` column (time the row last
 # transitioned into reserved state, NOT upload time), so a 1-hour cap
@@ -113,7 +140,7 @@ _LOCAL_KOKORO_VOICES_URL = os.environ.get(
 
 
 
-class WebUI:
+class WebUI(SessionUIBase):
     """Browser-based UI using SSE for streaming and HTTP POST for actions.
 
     Implements the SessionUI protocol from turnstone.core.session.
@@ -123,7 +150,7 @@ class WebUI:
     # Shared global event queue for state-change broadcasts across all
     # workstreams.  Set by main() before any WebUI instances are created.
     _global_queue: queue.Queue[dict[str, Any]] | None = None  # bounded in main()
-    _workstream_mgr: WorkstreamManager | None = None
+    _workstream_mgr: SessionManager | None = None
 
     def __init__(
         self,
@@ -133,8 +160,7 @@ class WebUI:
         kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
     ) -> None:
-        self.ws_id = ws_id
-        self._user_id = user_id
+        super().__init__(ws_id=ws_id, user_id=user_id)
         # Cached for broadcast event payloads — both are immutable for
         # the lifetime of the workstream, so locking the manager on
         # every state/activity tick to re-read them burns lock budget.
@@ -144,63 +170,11 @@ class WebUI:
         # holds in every ws_state/ws_activity event payload — mirrors
         # the storage-layer normalization at register_workstream.
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
-        self._listeners: list[queue.Queue[dict[str, Any]]] = []
-        self._listeners_lock = threading.Lock()
-        self._approval_event = threading.Event()
-        self._approval_result: tuple[bool, str | None] = (False, None)
-        self._pending_approval: dict[str, Any] | None = None  # re-sent on SSE reconnect
-        self._plan_event = threading.Event()
-        self._plan_result: str = ""
-        self._pending_plan_review: dict[str, Any] | None = None  # re-sent on SSE reconnect
-        self.auto_approve = False
-        self.auto_approve_tools: set[str] = set()
-        # Per-workstream metrics accumulators (written by worker thread, read by metrics handler)
-        self._ws_lock = threading.Lock()
-        self._ws_prompt_tokens: int = 0
-        self._ws_completion_tokens: int = 0
-        self._ws_messages: int = 0
-        self._ws_tool_calls: dict[str, int] = {}
-        self._ws_tool_calls_reported: int = 0  # last cumulative total sent to usage
-        self._ws_context_ratio: float = 0.0
-        self._ws_turn_tool_calls: int = 0
-        # Activity tracking for dashboard (current tool / thinking / approval)
-        self._ws_current_activity: str = ""
-        self._ws_activity_state: str = ""  # "tool" | "approval" | "thinking" | ""
-        # Verdicts awaiting user_decision update on approval resolution
-        self._pending_verdicts: list[dict[str, Any]] = []
-        # Last user decision for late-arriving verdicts (set in resolve_approval)
-        self._last_verdict_decision: str = ""
-        # Content accumulator — tokens appended in on_content_token(), joined
-        # and piggybacked onto the ws_state:idle global SSE event, then reset.
-        self._ws_turn_content: list[str] = []
-        self._ws_turn_content_size: int = 0
-        # Cached LLM verdicts keyed by call_id — replayed on SSE reconnect
-        # so tab-switching doesn't lose the final judge result.
-        self._llm_verdicts: dict[str, dict[str, Any]] = {}
 
-    def _enqueue(self, data: dict[str, Any]) -> None:
-        # Stamp ws_id on every per-workstream event so the client can
-        # validate it belongs to the pane's current workstream.
-        # Shallow copy to avoid mutating caller's dict (e.g. _pending_approval).
-        if "ws_id" not in data:
-            data = {**data, "ws_id": self.ws_id}
-        with self._listeners_lock:
-            snapshot = list(self._listeners)
-        for lq in snapshot:
-            with contextlib.suppress(queue.Full):
-                lq.put_nowait(data)
-
-    def _register_listener(self) -> queue.Queue[dict[str, Any]]:
-        """Create a per-client queue and register it as a listener."""
-        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
-        with self._listeners_lock:
-            self._listeners.append(client_queue)
-        return client_queue
-
-    def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
-        """Remove a client queue from the listeners list."""
-        with self._listeners_lock, contextlib.suppress(ValueError):
-            self._listeners.remove(client_queue)
+    # ``_enqueue`` / ``_register_listener`` / ``_unregister_listener``
+    # inherited from :class:`SessionUIBase`. ``_ws_turn_content`` /
+    # ``_ws_turn_content_size`` accumulator fields lifted to
+    # :class:`SessionUIBase` so coord can populate them too.
 
     def _ws_kind_and_parent(self) -> tuple[WorkstreamKind, str | None]:
         """Return cached (kind, parent_ws_id) for broadcast event payloads.
@@ -213,32 +187,30 @@ class WebUI:
         return self._kind, self._parent_ws_id
 
     def _broadcast_state(self, state: str) -> None:
-        """Send a state-change event to the global SSE channel."""
+        """Send a state-change event to the global SSE channel.
+
+        Reads the rich-payload snapshot via the lifted
+        :meth:`SessionUIBase.snapshot_and_consume_state_payload`
+        helper, then puts the assembled ``ws_state`` event on the
+        global queue. The snapshot helper handles the IDLE/ERROR
+        ``_ws_turn_content`` consume + clear under ``_ws_lock``.
+        """
         if WebUI._global_queue is not None:
-            with self._ws_lock:
-                tokens = self._ws_prompt_tokens + self._ws_completion_tokens
-                ctx = self._ws_context_ratio
-                activity = self._ws_current_activity
-                activity_state = self._ws_activity_state
+            payload = self.snapshot_and_consume_state_payload(state)
             kind, parent_ws_id = self._ws_kind_and_parent()
             event: dict[str, Any] = {
                 "type": "ws_state",
                 "ws_id": self.ws_id,
                 "state": state,
-                "tokens": tokens,
-                "context_ratio": ctx,
-                "activity": activity,
-                "activity_state": activity_state,
+                "tokens": payload["tokens"],
+                "context_ratio": payload["context_ratio"],
+                "activity": payload["activity"],
+                "activity_state": payload["activity_state"],
                 "kind": kind,
                 "parent_ws_id": parent_ws_id,
             }
             if state == "idle":
-                event["content"] = "".join(self._ws_turn_content)
-                self._ws_turn_content = []
-                self._ws_turn_content_size = 0
-            elif state == "error":
-                self._ws_turn_content = []
-                self._ws_turn_content_size = 0
+                event["content"] = payload["content"]
             try:
                 WebUI._global_queue.put_nowait(event)
             except queue.Full:
@@ -264,210 +236,31 @@ class WebUI:
                 )
 
     # --- SessionUI protocol ---
+    #
+    # ``on_thinking_start`` / ``on_thinking_stop`` / ``on_reasoning_token``
+    # / ``on_content_token`` / ``on_stream_end`` / ``on_tool_output_chunk``
+    # / ``on_info`` / ``on_error`` are inherited from
+    # :class:`SessionUIBase`. ``on_status`` and ``on_tool_result`` are
+    # overridden below to layer Prometheus ``_metrics.record_*`` calls
+    # (node-only) on top of the shared per-ws metric writes.
 
-    def on_thinking_start(self) -> None:
-        with self._ws_lock:
-            self._ws_current_activity = "Thinking\u2026"
-            self._ws_activity_state = "thinking"
-        self._broadcast_activity()
-        self._enqueue({"type": "thinking_start"})
+    # ``approve_tools`` is inherited from :class:`SessionUIBase`. The
+    # node-level prometheus metric for heuristic verdicts is layered via
+    # the ``_record_judge_metric`` hook below so the lifted body stays
+    # transport-agnostic.
 
-    def on_thinking_stop(self) -> None:
-        self._enqueue({"type": "thinking_stop"})
+    def _record_judge_metric(self, verdict: dict[str, Any]) -> None:
+        """Layer the per-node Prometheus metric on top of the shared body.
 
-    def on_reasoning_token(self, text: str) -> None:
-        self._enqueue({"type": "reasoning", "text": text})
-
-    def on_content_token(self, text: str) -> None:
-        if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
-            self._ws_turn_content.append(text)
-            self._ws_turn_content_size += len(text)
-        self._enqueue({"type": "content", "text": text})
-
-    def on_stream_end(self) -> None:
-        with self._ws_lock:
-            self._ws_current_activity = ""
-            self._ws_activity_state = ""
-        self._broadcast_activity()
-        self._enqueue({"type": "stream_end"})
-
-    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
-        self._last_verdict_decision = ""  # reset for new approval cycle
-        with self._ws_lock:
-            self._llm_verdicts.clear()  # clear stale verdicts from prior cycle
-        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
-
-        # Always send tool info to the browser
-        serialized = []
-        for item in items:
-            entry: dict[str, Any] = {
-                "call_id": item.get("call_id", ""),
-                "header": item.get("header", ""),
-                "preview": item.get("preview", ""),
-                "func_name": item.get("func_name", ""),
-                "approval_label": item.get("approval_label", item.get("func_name", "")),
-                "needs_approval": item.get("needs_approval", False),
-                "error": item.get("error"),
-            }
-            if "_heuristic_verdict" in item:
-                entry["verdict"] = item["_heuristic_verdict"]
-            serialized.append(entry)
-
-        # -- Tool policy evaluation -----------------------------------------------
-        # Check admin-defined tool policies before the auto_approve check.
-        if pending:
-            try:
-                from turnstone.core.policy import evaluate_tool_policies_batch
-                from turnstone.core.storage._registry import get_storage
-
-                storage = get_storage()
-                if storage is not None:
-                    tool_names = [
-                        it.get("approval_label", "") or it.get("func_name", "")
-                        for it in pending
-                        if it.get("func_name")
-                    ]
-                    if tool_names:
-                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
-                        still_pending = []
-                        for it in pending:
-                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
-                            verdict = verdicts.get(policy_name)
-                            if verdict == "deny":
-                                it["denied"] = True
-                                it["denial_msg"] = (
-                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
-                                )
-                            elif verdict == "allow":
-                                it["needs_approval"] = False
-                            else:
-                                still_pending.append(it)
-                        # Rebuild serialized to reflect policy verdicts
-                        serialized = []
-                        for it in items:
-                            rebuilt: dict[str, Any] = {
-                                "call_id": it.get("call_id", ""),
-                                "header": it.get("header", ""),
-                                "preview": it.get("preview", ""),
-                                "func_name": it.get("func_name", ""),
-                                "approval_label": it.get("approval_label", it.get("func_name", "")),
-                                "needs_approval": it.get("needs_approval", False),
-                                "error": it.get("denial_msg") if it.get("denied") else None,
-                            }
-                            if "_heuristic_verdict" in it:
-                                rebuilt["verdict"] = it["_heuristic_verdict"]
-                            serialized.append(rebuilt)
-                        # If all were resolved by policy, check if any were denied
-                        if not still_pending:
-                            any_denied = any(it.get("denied") for it in items)
-                            if any_denied:
-                                self._enqueue({"type": "tool_info", "items": serialized})
-                                return False, "Blocked by tool policy"
-                        pending = still_pending
-            except Exception:
-                log.debug("Tool policy evaluation failed", exc_info=True)
-        # -- End tool policy evaluation -------------------------------------------
-
-        # Per-tool auto-approve check (from workstream template or interactive "Always")
-        if pending and self.auto_approve_tools:
-            pending_names = {
-                it.get("approval_label", "") or it.get("func_name", "")
-                for it in pending
-                if it.get("func_name")
-            }
-            if pending_names and pending_names.issubset(self.auto_approve_tools):
-                pending = []
-
-        # Budget override requires explicit approval — never auto-approved by
-        # blanket auto_approve (tool policies can still allow it explicitly).
-        has_budget_override = any(it.get("func_name") == "__budget_override__" for it in pending)
-        if not pending or (self.auto_approve and not has_budget_override):
-            # Track auto-approved tool activity
-            first = items[0] if items else {}
-            label = first.get("func_name", "")
-            preview = first.get("preview", "")[:80]
-            with self._ws_lock:
-                self._ws_current_activity = f"\u2699 {label}: {preview}" if label else ""
-                self._ws_activity_state = "tool" if label else ""
-            self._broadcast_activity()
-            self._enqueue({"type": "tool_info", "items": serialized})
-            return True, None
-
-        # Track pending approval activity
-        first_pending = pending[0]
-        label = first_pending.get("func_name", "")
-        preview = first_pending.get("preview", "")[:60]
-        with self._ws_lock:
-            self._ws_current_activity = f"\u23f3 Awaiting approval: {label} \u2014 {preview}"
-            self._ws_activity_state = "approval"
-        self._broadcast_activity()
-
-        # Persist heuristic verdicts and track for user_decision update.
-        # Build list locally, then assign under lock to avoid racing with
-        # the judge daemon thread's on_intent_verdict() appends.
-        heuristic_verdicts: list[dict[str, Any]] = []
-        for item in items:
-            hv = item.get("_heuristic_verdict")
-            if hv:
-                heuristic_verdicts.append(hv)
-                try:
-                    from turnstone.core.storage._registry import get_storage
-
-                    storage = get_storage()
-                    if storage is not None:
-                        storage.create_intent_verdict(
-                            verdict_id=hv.get("verdict_id", ""),
-                            ws_id=self.ws_id,
-                            call_id=hv.get("call_id", ""),
-                            func_name=hv.get("func_name", ""),
-                            func_args=hv.get("func_args", ""),
-                            intent_summary=hv.get("intent_summary", ""),
-                            risk_level=hv.get("risk_level", "medium"),
-                            confidence=hv.get("confidence", 0.5),
-                            recommendation=hv.get("recommendation", "review"),
-                            reasoning=hv.get("reasoning", ""),
-                            evidence=json.dumps(hv.get("evidence", [])),
-                            tier=hv.get("tier", "heuristic"),
-                            judge_model=hv.get("judge_model", ""),
-                            latency_ms=hv.get("latency_ms", 0),
-                        )
-                except Exception:
-                    log.debug("Failed to persist heuristic verdict", exc_info=True)
-                _metrics.record_judge_verdict(
-                    hv.get("tier", "heuristic"),
-                    hv.get("risk_level", "medium"),
-                    hv.get("latency_ms", 0),
-                )
-
-        with self._ws_lock:
-            self._pending_verdicts = heuristic_verdicts
-
-        # Send approval request and block
-        judge_pending = bool(any(it.get("_heuristic_verdict") for it in items))
-        self._approval_event.clear()
-        self._pending_approval = {
-            "type": "approve_request",
-            "items": serialized,
-            "judge_pending": judge_pending,
-        }
-        self._enqueue(self._pending_approval)
-        if not self._approval_event.wait(timeout=3600):
-            # Approval timed out (e.g., user disconnected). Deny via
-            # resolve_approval so verdicts and state are updated consistently.
-            log.warning("Approval timed out for ws_id=%s", self.ws_id)
-            self.resolve_approval(False, "Approval timed out after 1 hour")
-        self._pending_approval = None
-        approved, feedback = self._approval_result
-
-        if not approved:
-            denial_msg = "Denied by user"
-            if feedback:
-                denial_msg += f": {feedback}"
-            for item in pending:
-                item["denied"] = True
-                item["denial_msg"] = denial_msg
-
-        return approved, feedback
+        ``SessionUIBase.approve_tools`` calls this for each persisted
+        heuristic verdict; ``ConsoleCoordinatorUI`` overrides the same
+        hook to feed the console's ``ConsoleMetrics`` — same metric
+        name, so a cluster-wide PromQL query rolls coord and
+        interactive verdicts up uniformly. The LLM-tier counterpart
+        lives in ``on_intent_verdict`` below — same metric, different
+        tier label, same ``record_judge_verdict`` call.
+        """
+        fire_judge_verdict_metric(_metrics, verdict, "heuristic")
 
     def on_tool_result(
         self,
@@ -477,97 +270,43 @@ class WebUI:
         *,
         is_error: bool = False,
     ) -> None:
+        """Layer node-only Prometheus metrics on top of the shared body."""
         _metrics.record_tool_call(name)
-        with self._ws_lock:
-            self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
-            self._ws_turn_tool_calls += 1
-            self._ws_current_activity = ""
-            self._ws_activity_state = ""
-        self._broadcast_activity()
-        event: dict[str, Any] = {
-            "type": "tool_result",
-            "call_id": call_id,
-            "name": name,
-            "output": output,
-        }
-        if is_error:
-            event["is_error"] = True
-        self._enqueue(event)
-
-    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
-        self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
+        super().on_tool_result(call_id, name, output, is_error=is_error)
 
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
-        total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
-        pct = total_tok / context_window * 100 if context_window > 0 else 0
+        """Layer node-only Prometheus metrics on top of the shared body.
+
+        ``_metrics.record_*`` calls feed the node's prometheus
+        endpoint; the per-ws counter writes, the ``status`` event
+        enqueue, and the ``usage_event`` storage row are inherited
+        from :meth:`SessionUIBase.on_status`. ``usage`` field access
+        is defensive for parity with the lifted body.
+        """
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tok = prompt_tokens + completion_tokens
         cache_creation = usage.get("cache_creation_tokens", 0)
         cache_read = usage.get("cache_read_tokens", 0)
-        _metrics.record_tokens(usage["prompt_tokens"], usage["completion_tokens"])
+        _metrics.record_tokens(prompt_tokens, completion_tokens)
         _metrics.record_cache_tokens(cache_creation, cache_read)
         _metrics.record_context_ratio(total_tok / context_window if context_window > 0 else 0.0)
-        with self._ws_lock:
-            self._ws_prompt_tokens += usage["prompt_tokens"]
-            self._ws_completion_tokens += usage["completion_tokens"]
-            self._ws_context_ratio = total_tok / context_window if context_window > 0 else 0.0
-            tool_total = sum(self._ws_tool_calls.values())
-            tool_count = tool_total - self._ws_tool_calls_reported
-            self._ws_tool_calls_reported = tool_total
-            turn_tool_calls = self._ws_turn_tool_calls
-            turn_count = self._ws_messages
-        self._enqueue(
-            {
-                "type": "status",
-                "prompt_tokens": usage["prompt_tokens"],
-                "completion_tokens": usage["completion_tokens"],
-                "total_tokens": total_tok,
-                "context_window": context_window,
-                "pct": round(pct, 1),
-                "effort": effort,
-                "cache_creation_tokens": cache_creation,
-                "cache_read_tokens": cache_read,
-                "tool_calls_this_turn": turn_tool_calls,
-                "turn_count": turn_count,
-            }
-        )
-        # Record usage event for governance dashboard
-        try:
-            from turnstone.core.storage._registry import get_storage
-
-            storage = get_storage()
-            if storage is not None:
-                import uuid
-
-                storage.record_usage_event(
-                    event_id=uuid.uuid4().hex,
-                    user_id=self._user_id,
-                    ws_id=self.ws_id,
-                    node_id="",
-                    model=usage.get("model", ""),
-                    prompt_tokens=usage["prompt_tokens"],
-                    completion_tokens=usage["completion_tokens"],
-                    tool_calls_count=tool_count,
-                    cache_creation_tokens=cache_creation,
-                    cache_read_tokens=cache_read,
-                )
-        except Exception:
-            log.warning("Failed to record usage event", exc_info=True)
+        super().on_status(usage, context_window, effort)
 
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()
         self._pending_plan_review = {"type": "plan_review", "content": content}
         self._enqueue(self._pending_plan_review)
-        if not self._plan_event.wait(timeout=3600):
+        if not self._plan_event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
             log.warning("Plan review timed out for ws_id=%s", self.ws_id)
             self._plan_result = ""
         self._pending_plan_review = None
         return self._plan_result
 
-    def on_info(self, message: str) -> None:
-        self._enqueue({"type": "info", "message": message})
-
     def on_error(self, message: str) -> None:
+        """Layer node-only Prometheus error counter on top of the shared body."""
         _metrics.record_error()
-        self._enqueue({"type": "error", "message": message})
+        super().on_error(message)
 
     def on_state_change(self, state: str) -> None:
         # Update the Workstream object so dashboard/polling sees the new state
@@ -592,139 +331,18 @@ class WebUI:
                 )
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
-        """Deliver LLM judge verdict to frontend via SSE."""
-        # Cache for replay on SSE reconnect (tab switching)
-        call_id = verdict.get("call_id", "")
-        if call_id:
-            with self._ws_lock:
-                # Evict oldest entry if cache is full (defensive cap of 50)
-                if len(self._llm_verdicts) >= 50 and call_id not in self._llm_verdicts:
-                    oldest_key = next(iter(self._llm_verdicts))
-                    del self._llm_verdicts[oldest_key]
-                self._llm_verdicts[call_id] = verdict
-        self._enqueue({"type": "intent_verdict", **verdict})
-        # Persist the LLM verdict (fire-and-forget)
-        try:
-            from turnstone.core.storage._registry import get_storage
+        """Extend :meth:`SessionUIBase.on_intent_verdict` with a
+        node-level prometheus metric update.
+        """
+        super().on_intent_verdict(verdict)
+        fire_judge_verdict_metric(_metrics, verdict, "llm")
 
-            storage = get_storage()
-            if storage is not None:
-                storage.create_intent_verdict(
-                    verdict_id=verdict.get("verdict_id", ""),
-                    ws_id=self.ws_id,
-                    call_id=verdict.get("call_id", ""),
-                    func_name=verdict.get("func_name", ""),
-                    func_args=verdict.get("func_args", ""),
-                    intent_summary=verdict.get("intent_summary", ""),
-                    risk_level=verdict.get("risk_level", "medium"),
-                    confidence=verdict.get("confidence", 0.5),
-                    recommendation=verdict.get("recommendation", "review"),
-                    reasoning=verdict.get("reasoning", ""),
-                    evidence=json.dumps(verdict.get("evidence", [])),
-                    tier=verdict.get("tier", "llm"),
-                    judge_model=verdict.get("judge_model", ""),
-                    latency_ms=verdict.get("latency_ms", 0),
-                )
-        except Exception:
-            log.debug("Failed to persist LLM verdict", exc_info=True)
-        _metrics.record_judge_verdict(
-            verdict.get("tier", "llm"),
-            verdict.get("risk_level", "medium"),
-            verdict.get("latency_ms", 0),
-        )
-        # If approval already resolved, update user_decision immediately.
-        # Read decision under lock to avoid racing with resolve_approval().
-        with self._ws_lock:
-            decision = self._last_verdict_decision
-        if decision:
-            try:
-                from turnstone.core.storage._registry import get_storage
+    # ``on_output_warning`` inherited from :class:`SessionUIBase`.
 
-                storage = get_storage()
-                if storage is not None:
-                    storage.update_intent_verdict(
-                        verdict.get("verdict_id", ""), user_decision=decision
-                    )
-            except Exception:
-                log.debug("Failed to update late verdict user_decision", exc_info=True)
-        else:
-            with self._ws_lock:
-                self._pending_verdicts.append(verdict)
-
-    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
-        """Deliver output guard warning to frontend via SSE + persist."""
-        self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
-        # Fire-and-forget persistence
-        try:
-            from turnstone.core.storage._registry import get_storage
-
-            storage = get_storage()
-            if storage is not None:
-                storage.record_output_assessment(
-                    assessment_id=uuid.uuid4().hex,
-                    ws_id=self.ws_id,
-                    call_id=call_id,
-                    func_name=assessment.get("func_name", ""),
-                    flags=json.dumps(assessment.get("flags", [])),
-                    risk_level=assessment.get("risk_level", "none"),
-                    annotations=json.dumps(assessment.get("annotations", [])),
-                    output_length=assessment.get("output_length", 0),
-                    redacted=assessment.get("redacted", False),
-                )
-        except Exception:
-            log.debug("Failed to persist output assessment", exc_info=True)
-
-    def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
-        """Resolve a pending approval, whether triggered by the HTTP handler
-        (user approves/denies in the browser) or by server-initiated flows
-        such as cancellations or timeouts."""
-        self._approval_result = (approved, feedback)
-        self._enqueue(
-            {
-                "type": "approval_resolved",
-                "approved": approved,
-                "feedback": feedback or "",
-            }
-        )
-        # Update user_decision on all tracked verdicts (fire-and-forget).
-        # Swap-and-clear + set decision under lock to avoid racing with
-        # the daemon judge thread's on_intent_verdict() appends.
-        decision_str = "approved" if approved else "denied"
-        with self._ws_lock:
-            pending = self._pending_verdicts
-            self._pending_verdicts = []
-            self._last_verdict_decision = decision_str
-        if pending:
-            try:
-                from turnstone.core.storage._registry import get_storage
-
-                storage = get_storage()
-                if storage is not None:
-                    for v in pending:
-                        vid = v.get("verdict_id", "")
-                        if vid:
-                            storage.update_intent_verdict(vid, user_decision=decision_str)
-            except Exception:
-                log.debug("Failed to update verdict user_decision", exc_info=True)
-        self._approval_event.set()
-
-    def resolve_plan(self, feedback: str) -> None:
-        """Called by the HTTP handler when the user responds to a plan."""
-        self._plan_result = feedback
-        if self._pending_plan_review is None:
-            # cancel_generation calls us unconditionally to unblock any wait.
-            # No plan pending — just signal and skip the broadcast frame.
-            self._plan_event.set()
-            return
-        # Clear pending BEFORE broadcasting so a client reconnecting in the
-        # window between enqueue and clear cannot receive both the replayed
-        # plan_review (SSE re-injection at the connect handler) AND the live
-        # plan_resolved.  Broadcast lets other clients (e.g. desktop while
-        # phone approved) dismiss their plan modals in sync — mirrors the
-        # approval_resolved pattern used by resolve_approval().
-        self._pending_plan_review = None
-        self._enqueue({"type": "plan_resolved", "feedback": feedback})
-        self._plan_event.set()
+    # ``resolve_approval`` / ``resolve_plan`` inherited from
+    # :class:`SessionUIBase`. Intent-verdict decision propagation lives
+    # in the base now — both interactive and coord share the same
+    # bookkeeping.
 
 
 # ---------------------------------------------------------------------------
@@ -950,9 +568,7 @@ class LogContextMiddleware:
 # ---------------------------------------------------------------------------
 
 
-def _get_ws(
-    mgr: WorkstreamManager, ws_id: str | None
-) -> tuple[Workstream, WebUI] | tuple[None, None]:
+def _get_ws(mgr: SessionManager, ws_id: str | None) -> tuple[Workstream, WebUI] | tuple[None, None]:
     """Look up workstream by id.  Returns (Workstream, WebUI) or (None, None)."""
     if not ws_id:
         return None, None
@@ -980,6 +596,202 @@ def _audit_context(request: Request) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-kind policies passed to the lifted session_routes handlers
+# ---------------------------------------------------------------------------
+
+
+def _interactive_manager_lookup(
+    request: Request,
+) -> tuple[SessionManager | None, JSONResponse | None]:
+    """Return the interactive ``SessionManager`` from app.state.
+
+    Interactive always has the manager loaded (it's constructed
+    synchronously at server startup), so the 503 branch is unused
+    on this side. Matches the :attr:`SessionEndpointConfig.manager_lookup`
+    callable shape so the lifted handler bodies can call it uniformly.
+    """
+    return request.app.state.workstreams, None
+
+
+def _interactive_tenant_check(
+    request: Request, ws_id: str, mgr: SessionManager
+) -> JSONResponse | None:
+    """Cross-tenant gate for the lifted session handlers.
+
+    Forwards to :func:`_require_ws_access`, which returns 404 on
+    owner mismatch (the interactive trusted-team model).
+    """
+    _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
+    return err
+
+
+def _audit_close_workstream(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,
+    reason: str,
+) -> None:
+    """Record the ``workstream.closed`` audit event for interactive close.
+
+    Passed to :func:`make_close_handler` as the ``audit_emit``
+    callable. ``storage`` is guaranteed non-``None`` by the lifted
+    handler's upstream gate; the ``getattr`` fallback is defensive
+    consistency with the rest of the storage access pattern.
+    """
+    from turnstone.core.audit import record_audit
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    _, ip = _audit_context(request)
+    detail: dict[str, Any] = {
+        "kind": str(ws_before.kind),
+        "parent_ws_id": ws_before.parent_ws_id,
+    }
+    if reason:
+        detail["reason"] = reason
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "workstream.closed",
+        "workstream",
+        ws_id,
+        detail,
+        ip,
+    )
+
+
+def _interactive_events_replay(
+    ws: Workstream, ui: Any, request: Request
+) -> Iterable[dict[str, Any]]:
+    """Initial SSE replay payload for interactive ``events`` connections.
+
+    Pre-lift ``events_sse`` yielded five things on connect: a
+    ``connected`` event with model + skip_permissions; a ``status``
+    event with the workstream's last token usage + context %; the
+    full conversation ``history`` (with pending-approval flagging on
+    the last assistant entry's tool calls); the pending approval
+    prompt + cached intent verdicts (if a prompt is pending); the
+    pending plan-review (if a review is pending). The lifted
+    ``make_events_handler`` body delegates that yield sequence to
+    this callback so the kind-specific shape stays in this module.
+
+    Pure read — never mutates ``ws`` / ``ui`` / ``session``.
+    """
+    del request  # not needed; replay reads ws/ui/session state
+    session = ws.session
+    if session is None:
+        # Defensive — the lifted body's UI presence check guarantees
+        # the workstream made it past placeholder state, but the
+        # session can still be detached on the close-then-reopen path.
+        return
+
+    # Connected + status preamble — same shape coord replays use; the
+    # shared helper keeps the two surfaces from drifting on a future
+    # field add.
+    yield from session_replay_preamble(session, ui)
+
+    # History replay — pending-approval flag rides on the last
+    # assistant entry's tool_calls so the client renders them as
+    # awaiting approval rather than already approved.
+    pending_approval = getattr(ui, "_pending_approval", None)
+    history = _build_history(session, has_pending_approval=pending_approval is not None)
+    if history:
+        yield {"type": "history", "messages": history}
+
+    # Pending approval re-injection (so a reconnecting tab sees the
+    # prompt) + cached LLM verdicts received since the prompt fired.
+    if pending_approval is not None:
+        yield pending_approval
+        with ui._ws_lock:
+            cached_verdicts = list(ui._llm_verdicts.values())
+        for v in cached_verdicts:
+            yield {"type": "intent_verdict", **v}
+
+    # Pending plan-review re-injection.
+    pending_plan = getattr(ui, "_pending_plan_review", None)
+    if pending_plan is not None:
+        yield pending_plan
+
+
+def _interactive_open_post_load(request: Request, ws: Workstream) -> None:
+    """Post-load hook for the lifted interactive ``open`` body.
+
+    Runs after ``mgr.open(ws_id)`` returns the workstream (which
+    internally already attempted ``ws.session.resume(ws_id)`` and
+    fired ``InteractiveAdapter.emit_rehydrated`` — the latter being
+    a no-op stub on interactive per the documented asymmetry). This
+    callback handles the interactive-only out-of-band emissions:
+
+    1. Sync the workstream's name to the persisted display alias
+       (a user-renamed workstream stores its alias separately from
+       the manager's in-memory name).
+    2. Replay clear_ui + history onto the per-workstream UI listener
+       queue so a freshly-connected browser tab sees the conversation
+       state. Only fires when ``ws.session.messages`` is non-empty
+       (resume succeeded and there's history to show).
+    3. Enqueue ``ws_created`` onto the global SSE queue so dashboards
+       and other multi-workstream consumers see the rehydrate. The
+       handler-side emission is the load-bearing path on interactive;
+       ``InteractiveAdapter.emit_rehydrated`` is a no-op stub
+       precisely because this enqueue lives here.
+    """
+    from turnstone.core.memory import get_workstream_display_name
+
+    ws.name = get_workstream_display_name(ws.id) or ws.name
+    ui = ws.ui
+    session = ws.session
+    if isinstance(ui, WebUI) and session is not None and session.messages:
+        ui._enqueue({"type": "clear_ui"})
+        history = _build_history(session)
+        if history:
+            ui._enqueue({"type": "history", "messages": history})
+
+    gq: queue.Queue[dict[str, Any]] | None = getattr(request.app.state, "global_queue", None)
+    if gq is not None:
+        with contextlib.suppress(queue.Full):
+            gq.put_nowait(
+                {
+                    "type": "ws_created",
+                    "ws_id": ws.id,
+                    "name": ws.name,
+                    "model": session.model if session else "",
+                    "model_alias": session.model_alias if session else "",
+                    "kind": ws.kind,
+                    "parent_ws_id": ws.parent_ws_id,
+                    "user_id": ws.user_id,
+                }
+            )
+
+
+def _audit_workstream_opened(request: Request, ws: Workstream) -> None:
+    """Record the ``workstream.opened`` audit event.
+
+    Passed to :func:`make_open_handler` as the ``audit_emit``
+    callable. Mirrors :func:`_audit_close_workstream`'s shape.
+    Distinguishing rehydrate from fresh-create in the audit trail
+    (same ``ws_created`` SSE shape on the wire; the audit action
+    name is the disambiguator) is the original justification for
+    this row.
+    """
+    from turnstone.core.audit import record_audit
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    _, ip = _audit_context(request)
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "workstream.opened",
+        "workstream",
+        ws.id,
+        {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
+        ip,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Route handlers — all async
 # ---------------------------------------------------------------------------
 
@@ -994,100 +806,6 @@ async def index(request: Request) -> Response:
     return resp
 
 
-async def events_sse(request: Request) -> Response:
-    """GET /v1/api/events — per-workstream SSE event stream."""
-    mgr = request.app.state.workstreams
-    ws_id = request.query_params.get("ws_id")
-    # Subscribing to another tenant's stream would leak their messages,
-    # tool calls, and pending approvals in real time.  Gate before
-    # _register_listener so non-owners get a flat 404 (no enumeration).
-    # In-memory fast path via mgr= keeps SSE resilient to DB blips.
-    _owner, err = _require_ws_access(request, ws_id or "", mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-
-    # Each client gets its own queue — no drain needed.
-    client_queue = ui._register_listener()
-
-    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
-        assert ws.session is not None
-        session: ChatSession = ws.session
-        # Connected event
-        yield {
-            "data": json.dumps(
-                {
-                    "type": "connected",
-                    "model": session.model,
-                    "model_alias": session.model_alias or "",
-                    "skip_permissions": ui.auto_approve,
-                }
-            )
-        }
-        # Replay last status so the per-pane status bar populates on resume
-        if session._last_usage is not None:
-            u = session._last_usage
-            total_tok = u["prompt_tokens"] + u["completion_tokens"]
-            cw = session.context_window
-            pct = total_tok / cw * 100 if cw > 0 else 0
-            with ui._ws_lock:
-                turn_tool_calls = ui._ws_turn_tool_calls
-                turn_count = ui._ws_messages
-            yield {
-                "data": json.dumps(
-                    {
-                        "type": "status",
-                        "prompt_tokens": u["prompt_tokens"],
-                        "completion_tokens": u["completion_tokens"],
-                        "total_tokens": total_tok,
-                        "context_window": cw,
-                        "pct": round(pct, 1),
-                        "effort": session.reasoning_effort,
-                        "cache_creation_tokens": u.get("cache_creation_tokens", 0),
-                        "cache_read_tokens": u.get("cache_read_tokens", 0),
-                        "tool_calls_this_turn": turn_tool_calls,
-                        "turn_count": turn_count,
-                    }
-                )
-            }
-        # History replay
-        history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
-        if history:
-            yield {"data": json.dumps({"type": "history", "messages": history})}
-        # Re-inject pending approval or plan review
-        if ui._pending_approval is not None:
-            yield {"data": json.dumps(ui._pending_approval)}
-            # Replay any LLM verdicts received since the approval was sent
-            with ui._ws_lock:
-                cached_verdicts = list(ui._llm_verdicts.values())
-            for v in cached_verdicts:
-                yield {"data": json.dumps({"type": "intent_verdict", **v})}
-        if ui._pending_plan_review is not None:
-            yield {"data": json.dumps(ui._pending_plan_review)}
-
-        _metrics.record_sse_connect()
-        try:
-            loop = asyncio.get_running_loop()
-            executor = request.app.state.sse_executor
-            while True:
-                try:
-                    event = await loop.run_in_executor(
-                        executor, functools.partial(client_queue.get, timeout=5)
-                    )
-                    if event.get("type") == "ws_closed":
-                        return
-                    yield {"data": json.dumps(event)}
-                except queue.Empty:
-                    pass  # poll timeout, retry
-        finally:
-            _metrics.record_sse_disconnect()
-            ui._unregister_listener(client_queue)
-
-    return EventSourceResponse(event_generator(), ping=5)
-
-
 def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
     """Build a complete node state snapshot for SSE consumers.
 
@@ -1096,7 +814,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
     """
     from turnstone.core.memory import get_workstream_display_name
 
-    mgr: WorkstreamManager = app_state.workstreams
+    mgr: SessionManager = app_state.workstreams
     wss = mgr.list_all()
     total_tokens = 0
     total_tool_calls = 0
@@ -1224,52 +942,14 @@ async def global_events_sse(request: Request) -> Response:
     return EventSourceResponse(event_generator(), ping=5)
 
 
-def _visible_workstreams(request: Request, wss: list[Workstream]) -> list[Workstream]:
-    """Filter an in-memory workstream list to the caller's tenant view.
-
-    Service-scoped tokens see everything (internal cluster callers,
-    console routing proxy).  End-user tokens see only workstreams they
-    own — a blank ``ws.user_id`` (legacy / pre-migration rows) is
-    hidden from non-service callers to prevent orphan leakage.
-    """
-    if "service" in _auth_scopes(request):
-        return wss
-    caller = _auth_user_id(request)
-    if not caller:
-        return []
-    return [ws for ws in wss if ws.user_id and ws.user_id == caller]
-
-
-async def list_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams — list workstreams visible to the caller."""
-    from turnstone.core.memory import get_workstream_display_name
-
-    mgr: WorkstreamManager = request.app.state.workstreams
-    result = []
-    for ws in _visible_workstreams(request, mgr.list_all()):
-        title = get_workstream_display_name(ws.id) or ws.name
-        # kind + parent_ws_id mirror the shape /dashboard returns below so
-        # client consumers (SDK, frontend, integrators) see one consistent
-        # row schema across adjacent endpoints instead of a subset here
-        # and a superset there.
-        result.append(
-            {
-                "id": ws.id,
-                "name": title,
-                "state": ws.state.value,
-                "kind": ws.kind,
-                "parent_ws_id": ws.parent_ws_id,
-            }
-        )
-    return JSONResponse({"workstreams": result})
-
-
 async def dashboard(request: Request) -> JSONResponse:
     """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
     from turnstone.core.memory import get_workstream_display_name
 
-    mgr: WorkstreamManager = request.app.state.workstreams
-    wss = _visible_workstreams(request, mgr.list_all())
+    mgr: SessionManager = request.app.state.workstreams
+    # No per-user filter — see list_workstreams above for the rationale
+    # (trusted-team deployment shape; mutations stay owner-gated).
+    wss = mgr.list_all()
     total_tokens = 0
     total_tool_calls = 0
     active_count = 0
@@ -1291,7 +971,7 @@ async def dashboard(request: Request) -> JSONResponse:
             title = get_workstream_display_name(ws.session.ws_id) or ""
         ws_list.append(
             {
-                "id": ws.id,
+                "ws_id": ws.id,
                 "name": title or ws.name,
                 "state": ws.state.value,
                 "title": title,
@@ -1306,6 +986,13 @@ async def dashboard(request: Request) -> JSONResponse:
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
+                "pending_approval_detail": ui.serialize_pending_approval_detail(),
+                # Per-ws ring buffer of recent auto-approves (last 10).
+                # Lets the coord-tree render a "recently auto-approved
+                # by skill X" pill without a per-child round-trip — the
+                # tools-bypassed-the-prompt set is otherwise invisible
+                # to anyone watching the dashboard tree.
+                "recent_auto_approvals": ui.serialize_recent_auto_approvals(),
             }
         )
     uptime_sec = round(time.monotonic() - _metrics.start_time)
@@ -1322,56 +1009,6 @@ async def dashboard(request: Request) -> JSONResponse:
             },
         }
     )
-
-
-async def list_saved_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/saved — list saved workstreams with conversation history.
-
-    Tenant-scoped — service-scoped callers (console collector, cluster
-    tooling) see cluster-wide rows; end-user callers see only their
-    own workstreams (matching ``_visible_workstreams``).  A non-service
-    call with a blank ``user_id`` returns an empty list rather than
-    leaking orphan rows.
-
-    Restricted to ``kind="interactive"`` — the interactive UI's "saved
-    workstreams" sidebar is not a coordinator surface, and coordinator
-    rows (which persist conversation history too) would otherwise leak
-    into it.
-    """
-    from turnstone.core.memory import list_workstreams_with_history
-    from turnstone.core.workstream import WorkstreamKind
-
-    scopes = _auth_scopes(request)
-    if "service" in scopes:
-        # Cluster-wide visibility for service-scoped callers.
-        user_filter: str | None = None
-    else:
-        caller_uid = _auth_user_id(request)
-        if not caller_uid:
-            # Blank sub on a non-service token — fail closed instead of
-            # matching every orphan / migration-artifact row with empty
-            # user_id.  Mirrors _visible_workstreams.
-            return JSONResponse({"workstreams": []})
-        user_filter = caller_uid
-
-    rows = list_workstreams_with_history(
-        limit=50,
-        kind=WorkstreamKind.INTERACTIVE,
-        user_id=user_filter,
-    )
-    result = [
-        {
-            "ws_id": wid,
-            "alias": alias,
-            "title": title,
-            "name": name,
-            "created": created,
-            "updated": updated,
-            "message_count": count,
-        }
-        for wid, alias, title, name, created, updated, count, *_extra in rows
-    ]
-    return JSONResponse({"workstreams": result})
 
 
 async def list_skills_summary(request: Request) -> JSONResponse:
@@ -1484,7 +1121,7 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
 
     Shared by the ``/health`` endpoint and the global SSE snapshot.
     """
-    mgr: WorkstreamManager = app_state.workstreams
+    mgr: SessionManager = app_state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
     health_reg = getattr(app_state, "health_registry", None)
@@ -1507,7 +1144,7 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
         "node_id": getattr(app_state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
         "model": _metrics.model,
-        "max_ws": mgr.max_workstreams,
+        "max_ws": mgr.max_active,
         "workstreams": {"total": len(wss), **states},
         "backend": {
             "status": "up" if backend_ok else "down",
@@ -1530,7 +1167,7 @@ async def health(request: Request) -> JSONResponse:
 
 async def metrics_endpoint(request: Request) -> Response:
     """GET /metrics — Prometheus text exposition format."""
-    mgr: WorkstreamManager = request.app.state.workstreams
+    mgr: SessionManager = request.app.state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
     ws_data = []
@@ -1569,348 +1206,50 @@ async def metrics_endpoint(request: Request) -> Response:
 def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
     """Create a dispatch function for watch results on a workstream.
 
-    Handles both idle (start worker thread) and busy (enqueue for IDLE drain)
-    cases.  Mirrors the ``send_message`` worker-thread pattern.
+    Handles both busy (enqueue into ``session._watch_pending`` for drain at IDLE)
+    and idle (spawn a worker thread) cases via the shared
+    :func:`turnstone.core.session_worker.send` dispatcher. The shared
+    dispatcher's ``_worker_running`` gate keeps watches and the path-keyed
+    send endpoint from racing into parallel workers on the same ChatSession.
     """
     pending = session._watch_pending
 
     def dispatch(msg: str) -> None:
-        with ws._lock:
-            if ws.worker_thread and ws.worker_thread.is_alive():
-                # Workstream is busy — queue for drain at IDLE (Path A)
-                try:
-                    pending.put_nowait({"message": msg})
-                except queue.Full:
-                    log.warning(
-                        "Watch pending queue full, dropping result for ws %s",
-                        ws.id,
-                    )
-                return
-
-            # Workstream is idle — start a worker thread (Path B)
-            # Mirrors the send_message() run() pattern for proper cleanup.
-            def run() -> None:
-                me = threading.current_thread()
-                try:
-                    session.send(msg)
-                except GenerationCancelled:
-                    if ws.worker_thread is me and ui:
-                        ui.on_stream_end()
-                        ui.on_state_change("idle")
-                except Exception as exc:
-                    if ws.worker_thread is me and ui:
-                        ui.on_error(f"Watch error: {exc}")
-                        ui.on_stream_end()
-                        ui.on_state_change("error")
-
-            t = threading.Thread(target=run, daemon=True)
-            ws.worker_thread = t
-            t.start()
-
-    return dispatch
-
-
-async def send_message(request: Request) -> JSONResponse:
-    """POST /v1/api/send — send or queue a user message.
-
-    DELETE /v1/api/send — remove a queued message by ``msg_id``.
-    """
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-
-    # DELETE — remove a queued message
-    if request.method == "DELETE":
-        ws_id = body.get("ws_id")
-        msg_id = body.get("msg_id")
-        if not msg_id:
-            return JSONResponse({"error": "msg_id required"}, status_code=400)
-        mgr = request.app.state.workstreams
-        ws, ui = _get_ws(mgr, ws_id)
-        if not ws or not ui:
-            return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-        session = ws.session
-        if session is None:
-            return JSONResponse({"error": "No session"}, status_code=400)
-        removed = session.dequeue_message(msg_id)
-        return JSONResponse({"status": "removed" if removed else "not_found"})
-
-    # POST — send or queue
-    message = body.get("message", "").strip()
-    ws_id = body.get("ws_id")
-    if not message:
-        return JSONResponse({"error": "Empty message"}, status_code=400)
-    mgr = request.app.state.workstreams
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-
-    # --- Atomic reserve-then-dispatch for attachments ---------------------
-    # Generate a send token up front and reserve attachments BEFORE we
-    # commit to queueing or starting a worker.  The reserved set is the
-    # source of truth — overlapping requests can't select the same row.
-    # Idle path and busy path both reserve, so session.send / dequeue can
-    # consume with defense-in-depth (matching reserved_for_msg_id).
-    from turnstone.core.attachments import Attachment
-    from turnstone.core.memory import (
-        get_attachments as _get_attachments,
-    )
-    from turnstone.core.memory import (
-        get_pending_attachments_with_content as _get_pending_with_content,
-    )
-    from turnstone.core.memory import (
-        reserve_attachments as _reserve,
-    )
-
-    # Actor resolution: service-scoped callers file attachments under the
-    # workstream owner (matches upload/list/delete semantics).  Returns
-    # 404 on missing/foreign workstreams.
-    attach_user_id, err = _require_ws_access(request, ws_id or "")
-    if err:
-        return err
-    # _require_ws_access already 404'd on missing ws_id; the explicit
-    # check keeps the type-checker happy without a bare assert.
-    if not isinstance(ws_id, str):
-        return JSONResponse({"error": "ws_id required"}, status_code=400)
-
-    # Full UUID hex — this token scopes both the attachment reservation
-    # and the eventual consume, so keep the full 128 bits.
-    send_id = uuid.uuid4().hex
-    raw_ids = body.get("attachment_ids")
-    auto_consume_rows: list[dict[str, Any]] = []
-    if raw_ids is None:
-        # Auto-consume: pull the current user's pending (unreserved)
-        # rows in creation order IN ONE QUERY (bytes included) — we'll
-        # reserve them below and skip the second fetch.  The reserve
-        # call is scoped to message_id IS NULL AND reserved_for_msg_id
-        # IS NULL so a concurrent reservation can't double-book.
-        auto_consume_rows = _get_pending_with_content(ws_id, attach_user_id)
-        requested_ids = [str(r["attachment_id"]) for r in auto_consume_rows]
-    elif isinstance(raw_ids, list) and raw_ids:
-        # Cap inbound id-list length so a hostile client can't blow up
-        # the storage IN (...) clause with millions of bogus ids.
-        from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
-
-        if len(raw_ids) > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-            return JSONResponse(
-                {
-                    "error": (
-                        f"Too many attachment_ids (max {MAX_PENDING_ATTACHMENTS_PER_USER_WS})"
-                    ),
-                    "code": "too_many",
-                },
-                status_code=400,
-            )
-        requested_ids = [str(x) for x in raw_ids if x]
-    else:
-        requested_ids = []
-
-    reserved_ids: list[str] = (
-        _reserve(requested_ids, send_id, ws_id, attach_user_id) if requested_ids else []
-    )
-    # Preserve request order; reserve returned a set that may be a
-    # strict subset (lost a race, already consumed, etc.).  Silently
-    # drop losers — the user can re-upload if needed and sees the
-    # partial outcome via the UI's chip-clearing on success.
-    reserved_set = set(reserved_ids)
-    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
-
-    resolved_atts: list[Attachment] = []
-    if ordered_reserved:
-        # Prefer the bytes we already fetched on the auto-consume path.
-        # Bytes were pre-reserve-call though, so reserved_for_msg_id
-        # needs refresh from the authoritative row.  Re-fetch if the
-        # auto-fetch is stale or empty.
-        if auto_consume_rows and all(
-            str(r["attachment_id"]) in set(ordered_reserved) for r in auto_consume_rows
-        ):
-            rows_by_id = {str(r["attachment_id"]): r for r in auto_consume_rows}
-            # reserved_for_msg_id was None at pre-fetch; patch in the token
-            # so the belt-and-braces scope check below doesn't reject the
-            # rows we just reserved.
-            for r in rows_by_id.values():
-                r["reserved_for_msg_id"] = send_id
-        else:
-            rows = _get_attachments(ordered_reserved)
-            rows_by_id = {str(r["attachment_id"]): r for r in rows}
-        for aid in ordered_reserved:
-            row = rows_by_id.get(aid)
-            if not row:
-                continue
-            r = row
-            # Scope check — belt and braces on top of the reservation.
-            if (
-                r.get("ws_id") != ws_id
-                or r.get("user_id") != attach_user_id
-                or r.get("message_id") is not None
-                or r.get("reserved_for_msg_id") != send_id
-            ):
-                continue
-            content = r.get("content")
-            if not isinstance(content, bytes):
-                continue
-            resolved_atts.append(
-                Attachment(
-                    attachment_id=str(r["attachment_id"]),
-                    filename=str(r.get("filename") or ""),
-                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
-                    kind=str(r.get("kind") or ""),
-                    content=content,
+        def _enq() -> None:
+            # Watches don't pump through ChatSession.queue_message; instead
+            # they drop into the IDLE-drain pending queue. Swallow Full
+            # locally — drop-on-full is the long-standing watch behavior
+            # (no 429 surface).
+            try:
+                pending.put_nowait({"message": msg})
+            except queue.Full:
+                log.warning(
+                    "Watch pending queue full, dropping result for ws %s",
+                    ws.id,
                 )
-            )
 
-    def _release_reservation_on_fail() -> None:
-        """Unreserve if we bail out before dispatching."""
-        if reserved_ids:
-            from turnstone.core.memory import unreserve_attachments as _unreserve
-
-            _unreserve(send_id, ws_id, attach_user_id)
-
-    # Atomically check-and-start to prevent two concurrent workers on the
-    # same session (ChatSession.send() is not thread-safe).
-    # If cancel was requested, poll briefly for the worker to exit before
-    # rejecting.  Snapshot the thread ref since force-cancel can set it to
-    # None concurrently.  Uses async sleep to avoid blocking the event loop.
-    worker = ws.worker_thread
-    if worker and worker.is_alive() and ws.session and ws.session._cancel_event.is_set():
-        for _ in range(30):  # up to 3s in 100ms steps
-            await asyncio.sleep(0.1)
-            if not worker.is_alive():
-                break
-    with ws._lock:
-        if ws.worker_thread and ws.worker_thread.is_alive():
-            # Queue the message for injection at the next tool-result seam
-            # instead of rejecting outright.  Attachments were already
-            # reserved above using ``send_id`` as the token — we pass
-            # the same id in as ``queue_msg_id`` so the queue entry, the
-            # reservation, and the eventual consume all share one token.
-            if ws.session is not None:
-                try:
-                    cleaned, priority, msg_id = ws.session.queue_message(
-                        message,
-                        attachment_ids=list(ordered_reserved),
-                        queue_msg_id=send_id,
-                    )
-                except queue.Full:
-                    _release_reservation_on_fail()
-                    return JSONResponse({"status": "queue_full"})
-                ui._enqueue(
-                    {
-                        "type": "message_queued",
-                        "message": cleaned,
-                        "priority": priority,
-                        "msg_id": msg_id,
-                    }
-                )
-                # Report the reservation outcome so the UI can clear
-                # only the chips that actually got attached, leaving
-                # un-reserved ones visible for retry.
-                dropped = [aid for aid in requested_ids if aid not in reserved_set]
-                return JSONResponse(
-                    {
-                        "status": "queued",
-                        "priority": priority,
-                        "msg_id": msg_id,
-                        "attached_ids": list(ordered_reserved),
-                        "dropped_attachment_ids": dropped,
-                    }
-                )
-            _release_reservation_on_fail()
-            ui._enqueue(
-                {
-                    "type": "busy_error",
-                    "message": "Already processing a request. Please wait.",
-                }
-            )
-            return JSONResponse({"status": "busy"})
-        session = ws.session
-        if session is None:
-            _release_reservation_on_fail()
-            return JSONResponse({"error": "No session"}, status_code=500)
-
-        def run() -> None:
-            assert ui is not None
+        def _run() -> None:
             me = threading.current_thread()
             try:
-                session.send(
-                    message,
-                    attachments=resolved_atts or None,
-                    send_id=send_id,
-                )
+                session.send(msg)
             except GenerationCancelled:
-                # Safety net — send() normally handles this internally.
-                # If this thread was force-abandoned, ws.worker_thread will
-                # have been set to None — don't emit spurious events.
-                _release_reservation_on_fail()
-                if ws.worker_thread is me:
+                if ws.worker_thread is me and ui:
                     ui.on_stream_end()
                     ui.on_state_change("idle")
-            except Exception as e:
-                # Release the reservation so the attachments don't stay
-                # soft-locked forever when the worker crashes before
-                # reaching the consume step.  Safe-by-idempotency: once
-                # mark_attachments_consumed has cleared the token, a
-                # follow-up unreserve is a no-op.
-                _release_reservation_on_fail()
-                if ws.worker_thread is me:
-                    ui.on_error(f"Error: {e}")
+            except Exception as exc:
+                if ws.worker_thread is me and ui:
+                    ui.on_error(f"Watch error: {exc}")
                     ui.on_stream_end()
                     ui.on_state_change("error")
 
-        t = threading.Thread(target=run, daemon=True)
-        ws.worker_thread = t
-        t.start()
-    _metrics.record_message_sent()
-    with ui._ws_lock:
-        ui._ws_messages += 1
-        ui._ws_turn_tool_calls = 0
-    dropped = [aid for aid in requested_ids if aid not in reserved_set]
-    return JSONResponse(
-        {
-            "status": "ok",
-            "attached_ids": list(ordered_reserved),
-            "dropped_attachment_ids": dropped,
-        }
-    )
+        session_worker.send(
+            ws,
+            enqueue=_enq,
+            run=_run,
+            thread_name=f"watch-worker-{ws.id[:8]}",
+        )
 
-
-async def approve(request: Request) -> JSONResponse:
-    """POST /v1/api/approve — approve or deny a tool call."""
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    approved = body.get("approved", False)
-    feedback = body.get("feedback")
-    always = body.get("always", False)
-    ws_id = body.get("ws_id")
-    mgr = request.app.state.workstreams
-    # Cross-tenant guard: resolving a pending tool approval on another
-    # tenant's workstream is RCE-adjacent (the victim queued a command
-    # expecting to decide themselves).  Gate before touching the UI.
-    # Pass mgr= so the check uses the in-memory ws.user_id and survives
-    # transient storage outages.
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    if always and approved and ui._pending_approval:
-        tool_names = {
-            it.get("approval_label", "") or it.get("func_name", "")
-            for it in ui._pending_approval.get("items", [])
-            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-        }
-        tool_names.discard("")
-        tool_names.discard("__budget_override__")
-        if tool_names:
-            ui.auto_approve_tools.update(tool_names)
-    ui.resolve_approval(approved, feedback)
-    return JSONResponse({"status": "ok"})
+    return dispatch
 
 
 async def plan_feedback(request: Request) -> JSONResponse:
@@ -1931,59 +1270,6 @@ async def plan_feedback(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
     ui.resolve_plan(feedback)
     return JSONResponse({"status": "ok"})
-
-
-async def cancel_generation(request: Request) -> JSONResponse:
-    """POST /v1/api/cancel — cancel the active generation in a workstream.
-
-    Returns ``{status, dropped}`` where ``dropped`` captures a forensic
-    snapshot of what was in flight at cancel time: any pending approval's
-    tool names, queued-message count and a short preview, and whether a
-    worker thread was actively generating.  The model-invoked
-    ``cancel_workstream`` tool passes this through so a coordinator can
-    tell operators what it just killed instead of a bare ``{cancelled:
-    true}``.  Absent keys mean "nothing observable in that lane".
-    """
-    from turnstone.core.web_helpers import read_json_or_400
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    ws_id = body.get("ws_id")
-    mgr = request.app.state.workstreams
-    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
-    if err:
-        return err
-    ws, ui = _get_ws(mgr, ws_id)
-    if not ws or not ui:
-        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    session = ws.session
-    if session is None:
-        return JSONResponse({"error": "No session"}, status_code=400)
-    force = body.get("force", False) is True
-    was_running = bool(ws.worker_thread and ws.worker_thread.is_alive())
-    dropped = _capture_cancel_forensics(session, ui, was_running=was_running)
-    # Only act if generation is actually in progress
-    if was_running:
-        # Set the cooperative cancel flag (worker thread checks at checkpoints)
-        session.cancel()
-        # Unblock any pending approval/plan review waits
-        ui.resolve_approval(False, "Cancelled by user")
-        ui.resolve_plan("reject")
-        if force:
-            # Force cancel: abandon the stuck worker thread (daemon, will
-            # die on process exit or stream timeout) and emit stream_end
-            # so the UI and session recover immediately.  The per-generation
-            # cancel event stays set so the abandoned thread still kills
-            # subprocesses at its next checkpoint.
-            with ws._lock:
-                ws.worker_thread = None
-            ui._enqueue({"type": "stream_end"})
-            ui.on_state_change("idle")
-        else:
-            # Emit cancelled SSE event so SDK consumers get a typed signal
-            ui._enqueue({"type": "cancelled"})
-    return JSONResponse({"status": "ok", "dropped": dropped})
 
 
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
@@ -2073,9 +1359,14 @@ async def command(request: Request) -> JSONResponse:
             if err:
                 ui.on_error("Permission denied: conversation.modify required")
                 return err
-            # Prevent rewind/retry while a generation is in progress
+            # Prevent rewind/retry while a generation is in progress.
+            # Gate on ``_worker_running`` (not ``worker_thread.is_alive()``)
+            # for parity with session_worker.send: spawn paths set the
+            # flag before assigning ws.worker_thread, so a reader using
+            # the old gate could see a stale dead thread while a new
+            # worker is in the middle of starting.
             with ws._lock:
-                if ws.worker_thread and ws.worker_thread.is_alive():
+                if ws._worker_running:
                     ui._enqueue(
                         {
                             "type": "busy_error",
@@ -2135,11 +1426,21 @@ async def command(request: Request) -> JSONResponse:
                             ui.on_error(f"Error: {exc}")
                             ui.on_stream_end()
                             ui.on_state_change("error")
+                    finally:
+                        with ws._lock:
+                            ws._worker_running = False
 
+                # Inlined rather than via ``session_worker.send`` because
+                # retry-when-busy is a hard reject (UI error, no fallback
+                # queue) — the shared dispatcher's enqueue/spawn shape
+                # doesn't fit. We gate on ``_worker_running`` for parity
+                # with that dispatcher so the two paths can't race into
+                # parallel workers on the same ChatSession.
                 with ws._lock:
-                    if ws.worker_thread and ws.worker_thread.is_alive():
+                    if ws._worker_running:
                         ui.on_error("Cannot retry: workstream is busy")
                     else:
+                        ws._worker_running = True
                         t = threading.Thread(target=run_retry, daemon=True)
                         ws.worker_thread = t
                         t.start()
@@ -2331,261 +1632,55 @@ def _deliver_notification(
             time.sleep(1.0 if attempt == 0 else 3.0)
 
 
-def _reserve_and_resolve_attachments(
-    requested_ids: list[str],
-    send_id: str,
-    ws_id: str,
-    user_id: str,
-) -> tuple[list[Any], list[str], list[str]]:
-    """Reserve attachment ids for ``send_id`` and resolve to Attachment objects.
+async def _interactive_create_validate_request(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    uploaded_files: list[tuple[str, str, bytes]],
+) -> JSONResponse | None:
+    """Per-kind pre-create gates for interactive workstreams.
 
-    Returns ``(resolved, ordered_reserved, dropped)``. ``dropped`` is the
-    subset of *requested_ids* that could not be reserved (already consumed,
-    lost a race, or cross-scope).  Used by the create-with-attachments
-    path; ``send_message`` has its own inlined variant with an
-    auto-consume fast path that reuses bytes fetched during selection.
+    Wired onto :attr:`SessionEndpointConfig.create_validate_request`
+    and called by :func:`make_create_handler` after body parsing
+    but before skill resolution / ``mgr.create``. Returns the
+    rejection response or ``None`` to continue.
+
+    Gates:
+    - ws_id format must match :data:`_VALID_WS_ID` (32 hex chars)
+      when supplied.
+    - attachments + resume_ws combo is disallowed (resume forks an
+      existing ws; attachments belong on the *fresh* turn — caller
+      should resume first, then upload via the standard endpoint).
+    - body kind must be ``INTERACTIVE``: coordinator workstreams
+      land on the console handler with ``admin.coordinator`` scope,
+      not this one. Unknown / future kind values 400 rather than
+      silently coerce.
+    - parent_ws_id (when supplied) must reference a coordinator
+      owned by ``uid``. Without this gate an attacker could point a
+      new interactive workstream at someone else's coordinator and
+      receive that coordinator's child_ws_* SSE events
+      (name/state/tokens leak).
+    - notify_targets (when supplied) must validate.
+      :func:`_validate_notify_targets` is pure-read and doesn't need
+      ``ws`` to be built — gating here preserves pre-lift's 400
+      semantic for caller-supplied input. Without this pre-create
+      gate a malformed ``notify_targets`` would land in
+      ``post_install`` (after ``mgr.create``, audit emit, and the
+      ``ws_created`` broadcast) and the only available signal is to
+      raise — which the factory turns into 500. 400 at the gate is
+      correct shape for client-input validation.
     """
-    from turnstone.core.attachments import Attachment
-    from turnstone.core.memory import get_attachments as _get_attachments
-    from turnstone.core.memory import reserve_attachments as _reserve
-
-    if not requested_ids:
-        return [], [], []
-
-    reserved_ids: list[str] = _reserve(requested_ids, send_id, ws_id, user_id)
-    reserved_set = set(reserved_ids)
-    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
-    dropped: list[str] = [aid for aid in requested_ids if aid not in reserved_set]
-
-    resolved: list[Any] = []
-    if ordered_reserved:
-        rows = _get_attachments(ordered_reserved)
-        rows_by_id = {str(r["attachment_id"]): r for r in rows}
-        for aid in ordered_reserved:
-            r = rows_by_id.get(aid)
-            if not r:
-                continue
-            if (
-                r.get("ws_id") != ws_id
-                or r.get("user_id") != user_id
-                or r.get("message_id") is not None
-                or r.get("reserved_for_msg_id") != send_id
-            ):
-                continue
-            content = r.get("content")
-            if not isinstance(content, bytes):
-                continue
-            resolved.append(
-                Attachment(
-                    attachment_id=str(r["attachment_id"]),
-                    filename=str(r.get("filename") or ""),
-                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
-                    kind=str(r.get("kind") or ""),
-                    content=content,
-                )
-            )
-    return resolved, ordered_reserved, dropped
-
-
-def _validate_and_save_uploaded_files(
-    files: list[tuple[str, str, bytes]],
-    ws_id: str,
-    user_id: str,
-) -> tuple[list[str], JSONResponse | None]:
-    """Classify + save a list of ``(filename, claimed_mime, data)`` tuples.
-
-    Applies the same validation rules as ``upload_attachment`` (magic-byte
-    image sniffing, UTF-8 text decode, per-kind size cap, per-(ws,user)
-    pending cap) under the shared ``_attachment_upload_lock``.
-
-    Returns ``(attachment_ids, None)`` on success or ``(ids_saved_so_far,
-    JSONResponse)`` on the first failure so the caller can roll back any
-    partial state.
-    """
-    from turnstone.core.attachments import (
-        IMAGE_SIZE_CAP,
-        MAX_PENDING_ATTACHMENTS_PER_USER_WS,
-        TEXT_DOC_SIZE_CAP,
-    )
-    from turnstone.core.memory import list_pending_attachments, save_attachment
-
-    saved_ids: list[str] = []
-    if not files:
-        return saved_ids, None
-
-    lock = _attachment_upload_lock(ws_id, user_id)
-    with lock:
-        pending_count = len(list_pending_attachments(ws_id, user_id))
-        for filename, claimed_mime, data in files:
-            if not data:
-                return saved_ids, JSONResponse({"error": "Empty file"}, status_code=400)
-            sniffed_image = _sniff_image_mime(data)
-            if sniffed_image is not None:
-                if len(data) > IMAGE_SIZE_CAP:
-                    return saved_ids, JSONResponse(
-                        {
-                            "error": (
-                                f"Image too large ({len(data):,} bytes); "
-                                f"cap is {IMAGE_SIZE_CAP:,} bytes."
-                            ),
-                            "code": "too_large",
-                        },
-                        status_code=413,
-                    )
-                kind = "image"
-                mime = sniffed_image
-            else:
-                if len(data) > TEXT_DOC_SIZE_CAP:
-                    return saved_ids, JSONResponse(
-                        {
-                            "error": (
-                                f"Text document too large ({len(data):,} bytes); "
-                                f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
-                            ),
-                            "code": "too_large",
-                        },
-                        status_code=413,
-                    )
-                mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
-                if mime_or_err[0] is None:
-                    return saved_ids, JSONResponse(
-                        {"error": mime_or_err[1], "code": "unsupported"},
-                        status_code=400,
-                    )
-                kind = "text"
-                mime = mime_or_err[0]
-
-            if pending_count + 1 > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
-                return saved_ids, JSONResponse(
-                    {
-                        "error": (
-                            f"Too many pending attachments "
-                            f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
-                        ),
-                        "code": "too_many",
-                    },
-                    status_code=409,
-                )
-            attachment_id = uuid.uuid4().hex
-            save_attachment(
-                attachment_id,
-                ws_id,
-                user_id,
-                filename,
-                mime,
-                len(data),
-                kind,
-                data,
-            )
-            saved_ids.append(attachment_id)
-            pending_count += 1
-    return saved_ids, None
-
-
-async def create_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/new — create a new workstream.
-
-    Accepts two content types:
-
-    - ``application/json`` (default): body is a :class:`CreateWorkstreamRequest`.
-    - ``multipart/form-data``: one ``meta`` field (JSON object, same shape
-      as the JSON body) plus zero-or-more ``file`` parts. Files are saved
-      as attachments under the new workstream and reserved onto the first
-      ``initial_message`` turn (if provided) before the worker dispatches.
-    """
-    from turnstone.core.attachments import IMAGE_SIZE_CAP
-    from turnstone.core.audit import record_audit
-    from turnstone.core.memory import get_workstream_display_name
-    from turnstone.core.web_helpers import (
-        read_json_or_400,
-        read_multipart_create_or_400,
-    )
-
-    content_type = (request.headers.get("content-type") or "").lower()
-    uploaded_files: list[tuple[str, str, bytes]] = []
-    body: dict[str, Any]
-    if content_type.startswith("multipart/form-data"):
-        # Multipart cap: up to MAX_PENDING × image cap, plus slack for
-        # JSON meta + multipart framing.  Per-file size is enforced in
-        # _validate_and_save_uploaded_files against the kind-specific cap.
-        parsed = await read_multipart_create_or_400(
-            request,
-            max_files=10,
-            max_per_file_bytes=IMAGE_SIZE_CAP,
-            max_total_bytes=10 * IMAGE_SIZE_CAP,
-        )
-        if isinstance(parsed, JSONResponse):
-            return parsed
-        body, uploaded_files = parsed
-    else:
-        json_body = await read_json_or_400(request)
-        if isinstance(json_body, JSONResponse):
-            return json_body
-        body = json_body
-    mgr: WorkstreamManager = request.app.state.workstreams
-    skip: bool = request.app.state.skip_permissions
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    uid: str = getattr(auth, "user_id", "") or ""
-    # Trusted services (console) may forward the real user_id in the request
-    # body when creating workstreams on behalf of a user.  Only service
-    # identities are trusted — end-user tokens (including console-proxy tokens
-    # that carry the real user's identity) must not override user_id.
-    trusted_sources = {"console"}
-    if (
-        body.get("user_id")
-        and isinstance(body["user_id"], str)
-        and auth is not None
-        and auth.token_source in trusted_sources
-    ):
-        uid = body["user_id"]
-    body_skill = body.get("skill", "")
-    resume_ws_id = body.get("resume_ws", "")
-    # Resolve skill — applies content + session config (model, temperature, etc.)
-    # Skip when resuming: the resumed session restores its own skill from config.
-    skill_data: dict[str, Any] | None = None
-    if body_skill and not resume_ws_id:
-        from turnstone.core.memory import get_skill_by_name
-
-        skill_data = get_skill_by_name(body_skill)
-        if not skill_data or not skill_data.get("enabled", False):
-            return JSONResponse(
-                {"error": f"Skill not found or disabled: {body_skill}"},
-                status_code=400,
-            )
-    resolved_model = body.get("model") or None
-    if skill_data and skill_data.get("model"):
-        resolved_model = skill_data["model"]
-    resolved_skill: str | None = body_skill if skill_data else None
-    applied_skill_version = 0
-    if skill_data:
-        from turnstone.core.storage import get_storage as _get_storage
-
-        _st = _get_storage()
-        applied_skill_version = len(_st.list_skill_versions(skill_data["template_id"])) + 1
     requested_ws_id = body.get("ws_id", "") or ""
     if not isinstance(requested_ws_id, str):
         requested_ws_id = ""
     if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
         return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
-    # Disallow attachments + resume_ws in the same request — semantics
-    # are unclear (resume forks an existing ws, but attachments are for
-    # the *fresh* turn).  Caller should resume first, then upload via
-    # the standard endpoint.  Checked before mgr.create() so we don't
-    # waste work on a request we'll reject.
+    resume_ws_id = body.get("resume_ws", "") or ""
     if uploaded_files and resume_ws_id:
         return JSONResponse(
             {"error": "attachments cannot be combined with resume_ws"},
             status_code=400,
         )
-    # Kind + parent relationship: coordinator-spawned children forward
-    # these from the console's CoordinatorClient.  Default kind is
-    # ``INTERACTIVE``; coordinators themselves are created by the console's
-    # own CoordinatorManager and never land in this handler.  Only
-    # ``INTERACTIVE`` is accepted here — requests that try to create a
-    # coordinator via the generic workstream endpoint are rejected, and
-    # unknown kinds (typos, future-only values) are 400 rather than being
-    # silently coerced.  User-facing edge: the storage_edge and manager
-    # layers below re-validate, see comments at those sites for why.
     try:
         body_kind = WorkstreamKind.from_raw(body.get("kind"))
     except ValueError:
@@ -2595,21 +1690,16 @@ async def create_workstream(request: Request) -> JSONResponse:
         )
     if body_kind != WorkstreamKind.INTERACTIVE:
         return JSONResponse(
-            {"error": "coordinator workstreams must be created via /v1/api/coordinator/new"},
+            {
+                "error": (
+                    "coordinator workstreams must be created on the console via "
+                    "POST /v1/api/workstreams/new (with admin.coordinator scope)"
+                )
+            },
             status_code=400,
         )
     body_parent = body.get("parent_ws_id") or None
     if body_parent is not None:
-        # Ownership gate: parent_ws_id is client-supplied in the request
-        # body, so a malicious caller could previously point a new
-        # interactive workstream at another tenant's coordinator — the
-        # coordinator's SSE fan-out would then route child_ws_* events
-        # (carrying the attacker's name/state/tokens) to that victim.
-        # Validate against storage: the parent must exist, be a
-        # coordinator, and belong to the same user.  Coordinator-spawned
-        # children satisfy this by construction (the coordinator's JWT
-        # `sub` claim is the owning user and parent_ws_id is the coord's
-        # own ws_id); external clients that fabricate the field get 403.
         from turnstone.core.storage._registry import get_storage as _get_storage_for_parent
 
         _pstorage = _get_storage_for_parent()
@@ -2662,314 +1752,183 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
 
-        # Save attachments BEFORE the ws_created broadcast so failed
-        # validation doesn't make SSE consumers flash a workstream that
-        # never really existed.  Validate + save happens early; rollback
-        # is silent (no ws_created → no ws_closed needed).
-        attachment_ids: list[str] = []
-        if uploaded_files:
-            saved_ids, save_err = _validate_and_save_uploaded_files(uploaded_files, ws.id, uid)
-            if save_err is not None:
-                from turnstone.core.memory import delete_workstream as _delete_ws
+    # Atomic workstream resume during creation.
+    resumed = False
+    message_count = 0
+    resume_ws_id = body.get("resume_ws", "") or ""
+    if resume_ws_id and ws.session is not None:
+        from turnstone.core.memory import resolve_workstream
 
-                with contextlib.suppress(Exception):
-                    mgr.close(ws.id)
-                with contextlib.suppress(Exception):
-                    _delete_ws(ws.id)
-                return save_err
-            attachment_ids = saved_ids
+        target_id = resolve_workstream(resume_ws_id)
+        if target_id and ws.session.resume(target_id, fork=True):
+            resumed = True
+            message_count = len(ws.session.messages)
+            user_name = body.get("name", "").strip()
+            if user_name:
+                from turnstone.core.memory import set_workstream_alias
 
-        # Emit creation event on global queue for SSE consumers (console).
-        # Deferred until past attachment validation so a rejected create
-        # doesn't surface a phantom create→close pair.
-        display_name = get_workstream_display_name(ws.id) or ws.name
-        with contextlib.suppress(queue.Full):
-            gq.put_nowait(
-                {
-                    "type": "ws_created",
-                    "ws_id": ws.id,
-                    "name": display_name,
-                    "model": ws.session.model if ws.session else "",
-                    "model_alias": ws.session.model_alias if ws.session else "",
-                    "kind": ws.kind,
-                    "parent_ws_id": ws.parent_ws_id,
-                    # Owner id is propagated through the cluster event
-                    # stream so console-side fan-out can enforce tenant
-                    # isolation — a coordinator must never receive
-                    # child_ws_* events for workstreams it doesn't own.
-                    "user_id": ws.user_id,
-                }
-            )
-        # Tamper-evident audit trail.  Lives alongside the broadcast
-        # event (not replacing it — the broadcast is ephemeral UI
-        # signalling, the audit row survives for forensic review).
-        _audit_storage = getattr(request.app.state, "auth_storage", None)
-        if _audit_storage is not None:
-            _, _audit_ip = _audit_context(request)
-            record_audit(
-                _audit_storage,
-                uid,
-                "workstream.created",
-                "workstream",
-                ws.id,
-                {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
-                _audit_ip,
-            )
-        # Emit eviction event if a workstream was evicted to make room
-        evicted = mgr.last_evicted
-        if evicted is not None:
+                set_workstream_alias(ws.id, user_name)
+                ws.name = user_name
+            ui = ws.ui
+            if isinstance(ui, WebUI):
+                ui._enqueue({"type": "clear_ui"})
+                history = _build_history(ws.session)
+                if history:
+                    ui._enqueue({"type": "history", "messages": history})
             with contextlib.suppress(queue.Full):
-                gq.put_nowait(
-                    {
-                        "type": "ws_closed",
-                        "ws_id": evicted.id,
-                        "name": evicted.name,
-                        "reason": "evicted",
-                    }
+                gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
+
+    # Apply skill session config (only for new workstreams with a skill).
+    if skill_data and not resumed and ws.session:
+        sess = ws.session
+        if skill_data.get("temperature") is not None:
+            sess.temperature = skill_data["temperature"]
+        if skill_data.get("reasoning_effort"):
+            sess.reasoning_effort = skill_data["reasoning_effort"]
+        if skill_data.get("max_tokens") is not None:
+            sess.max_tokens = skill_data["max_tokens"]
+        if skill_data.get("token_budget", 0) > 0:
+            sess._token_budget = skill_data["token_budget"]
+        if skill_data.get("agent_max_turns") is not None:
+            sess.agent_max_turns = skill_data["agent_max_turns"]
+        if skill_data.get("auto_approve"):
+            ws.ui.auto_approve = True
+        allowed = skill_data.get("allowed_tools", "")
+        if allowed and allowed != "[]":
+            import json as _json
+
+            try:
+                tools_list = _json.loads(allowed)
+            except (ValueError, TypeError):
+                tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
+            if tools_list:
+                ws.ui.auto_approve_tools = set(tools_list)
+                # Tag each as skill-sourced so the dashboard can show
+                # "auto-approved by skill X" instead of a generic
+                # auto-approval pill — distinguishes the (often
+                # surprising) skill-template path from a deliberate
+                # operator "Approve + Always" click.
+                ws.ui._auto_approve_tools_source = {t: AutoApproveReason.SKILL for t in tools_list}
+        sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
+        sess._applied_skill_id = skill_data["template_id"]
+        sess._applied_skill_version = applied_skill_version
+        if skill_data.get("content"):
+            sess._applied_skill_content = skill_data["content"]
+        sess._save_config()
+
+    # notify_targets: schedule targets override skill targets. The
+    # validator already gated malformed input as 400; here we just
+    # canonicalise (list → JSON-encoded string) and apply the skill
+    # fallback if the caller didn't supply targets.
+    notify_targets_raw = body.get("notify_targets", "[]")
+    if isinstance(notify_targets_raw, list):
+        notify_targets_raw = json.dumps(notify_targets_raw)
+    nt_str, _ = _validate_notify_targets(notify_targets_raw)
+    if nt_str == "[]" and skill_data:
+        skill_notify = skill_data.get("notify_on_complete", "[]")
+        if skill_notify and skill_notify != "{}" and skill_notify != "[]":
+            fallback_str, fallback_err = _validate_notify_targets(skill_notify)
+            if not fallback_err:
+                nt_str = fallback_str
+    ws.notify_targets = nt_str
+
+    # Pin locally-created workstreams so the console routes to this node.
+    requested_ws_id = body.get("ws_id", "") or ""
+    if not requested_ws_id:
+        node_id = getattr(request.app.state, "node_id", "")
+        if node_id:
+            try:
+                from turnstone.core.storage import get_storage as _gs
+
+                _gs().set_workstream_override(ws.id, node_id, reason="local")
+            except Exception:
+                log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
+
+    # Initial-message worker thread.
+    initial_message = body.get("initial_message", "").strip()
+    if initial_message and ws.session is not None:
+        from turnstone.core.attachments import (
+            reserve_and_resolve_attachments as _reserve_and_resolve,
+        )
+
+        session = ws.session
+        send_id = uuid.uuid4().hex
+        resolved_atts: list[Any] = []
+        if attachment_ids:
+            resolved_atts, _ord, _drop = _reserve_and_resolve(attachment_ids, send_id, ws.id, uid)
+
+        def _run_initial() -> None:
+            try:
+                session.send(
+                    initial_message,
+                    attachments=resolved_atts or None,
+                    send_id=send_id if resolved_atts else None,
                 )
-        # Atomic workstream resume during creation.
-        resumed = False
-        message_count = 0
-        if resume_ws_id and ws.session is not None:
-            from turnstone.core.memory import resolve_workstream
-
-            target_id = resolve_workstream(resume_ws_id)
-            if target_id and ws.session.resume(target_id, fork=True):
-                resumed = True
-                message_count = len(ws.session.messages)
-                # If the user provided a custom name, set it as the fork's alias
-                # so it takes priority in display.  Otherwise keep the
-                # auto-generated name so auto-title can run fresh.
-                user_name = body.get("name", "").strip()
-                if user_name:
-                    from turnstone.core.memory import set_workstream_alias
-
-                    set_workstream_alias(ws.id, user_name)
-                    ws.name = user_name
-                ui = ws.ui
-                if isinstance(ui, WebUI):
-                    ui._enqueue({"type": "clear_ui"})
-                    history = _build_history(ws.session)
-                    if history:
-                        ui._enqueue({"type": "history", "messages": history})
-                # Broadcast a rename so the tab picks up the correct fork name
-                # (the ws_created event fired before fork with the pre-fork name).
-                with contextlib.suppress(queue.Full):
-                    gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
-
-        # Apply skill session config (only for new workstreams with a skill)
-        if skill_data and not resumed and ws.session:
-            sess = ws.session
-            # Session settings from skill
-            if skill_data.get("temperature") is not None:
-                sess.temperature = skill_data["temperature"]
-            if skill_data.get("reasoning_effort"):
-                sess.reasoning_effort = skill_data["reasoning_effort"]
-            if skill_data.get("max_tokens") is not None:
-                sess.max_tokens = skill_data["max_tokens"]
-            if skill_data.get("token_budget", 0) > 0:
-                sess._token_budget = skill_data["token_budget"]
-            if skill_data.get("agent_max_turns") is not None:
-                sess.agent_max_turns = skill_data["agent_max_turns"]
-            # Approval policy
-            if skill_data.get("auto_approve"):
-                ws.ui.auto_approve = True
-            allowed = skill_data.get("allowed_tools", "")
-            if allowed and allowed != "[]":
-                # Parse as JSON array or comma-separated
-                import json as _json
-
-                try:
-                    tools_list = _json.loads(allowed)
-                except (ValueError, TypeError):
-                    tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
-                if tools_list:
-                    ws.ui.auto_approve_tools = set(tools_list)
-            # Metadata
-            sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
-            sess._applied_skill_id = skill_data["template_id"]
-            sess._applied_skill_version = applied_skill_version
-            if skill_data.get("content"):
-                sess._applied_skill_content = skill_data["content"]
-            sess._save_config()
-
-        # Resolve notify_targets: schedule targets override skill targets
-        notify_targets_raw = body.get("notify_targets", "[]")
-        if isinstance(notify_targets_raw, list):
-            notify_targets_raw = json.dumps(notify_targets_raw)
-        nt_str, nt_err = _validate_notify_targets(notify_targets_raw)
-        if nt_err:
-            return JSONResponse({"error": nt_err}, status_code=400)
-        # Skill fallback (only if schedule didn't specify targets)
-        if nt_str == "[]" and skill_data:
-            skill_notify = skill_data.get("notify_on_complete", "[]")
-            if skill_notify and skill_notify != "{}" and skill_notify != "[]":
-                fallback_str, fallback_err = _validate_notify_targets(skill_notify)
-                if not fallback_err:
-                    nt_str = fallback_str
-        ws.notify_targets = nt_str
-
-        # Pin locally-created workstreams so the console routes to this node.
-        # Console-routed creates pass ws_id in the request body — those are
-        # already bucket-aligned and don't need an override. Direct creates
-        # (web UI, watch, TurnstoneInit) generate their own ws_id, which may
-        # hash to a bucket assigned to a different node.
-        if not requested_ws_id:
-            node_id = getattr(request.app.state, "node_id", "")
-            if node_id:
-                try:
-                    from turnstone.core.storage import get_storage as _gs
-
-                    _gs().set_workstream_override(ws.id, node_id, reason="local")
-                except Exception:
-                    log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
-
-        # If an initial_message was provided, send it as the first user message.
-        # This replaces the old bridge behavior where CreateWorkstreamMessage
-        # carried initial_message and the bridge sent it as a follow-up.
-        initial_message = body.get("initial_message", "").strip()
-        if initial_message and ws.session is not None:
-            session = ws.session
-            # Reserve any attachments uploaded in this request before the
-            # worker dispatches.  Mirrors the /send endpoint pattern: the
-            # send_id token scopes both the reservation and the eventual
-            # consume.  Unreserve on worker failure so the rows don't stay
-            # soft-locked forever.
-            send_id = uuid.uuid4().hex
-            resolved_atts: list[Any] = []
-            if attachment_ids:
-                resolved_atts, _ord, _drop = _reserve_and_resolve_attachments(
-                    attachment_ids, send_id, ws.id, uid
-                )
-
-            def _run_initial() -> None:
-                try:
-                    session.send(
-                        initial_message,
-                        attachments=resolved_atts or None,
-                        send_id=send_id if resolved_atts else None,
+            except (Exception, GenerationCancelled):
+                if attachment_ids:
+                    from turnstone.core.memory import (
+                        unreserve_attachments as _unreserve,
                     )
-                except (Exception, GenerationCancelled):
-                    if attachment_ids:
-                        from turnstone.core.memory import (
-                            unreserve_attachments as _unreserve,
-                        )
 
-                        with contextlib.suppress(Exception):
-                            _unreserve(send_id, ws.id, uid)
-                    if isinstance(ws.ui, WebUI):
-                        ws.ui.on_stream_end()
-                        ws.ui.on_state_change("idle")
-                finally:
-                    try:
-                        last_content = _extract_last_assistant_content(session)
-                        _fire_notify_targets(ws, last_content)
-                    except Exception:
-                        log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
+                    with contextlib.suppress(Exception):
+                        _unreserve(send_id, ws.id, uid)
+                if isinstance(ws.ui, WebUI):
+                    ws.ui.on_stream_end()
+                    ws.ui.on_state_change("idle")
+            finally:
+                try:
+                    last_content = _extract_last_assistant_content(session)
+                    _fire_notify_targets(ws, last_content)
+                except Exception:
+                    log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
+                with ws._lock:
+                    ws._worker_running = False
 
+        # Inlined rather than via ``session_worker.send`` because at
+        # workstream creation no live worker can exist by
+        # construction — the enqueue branch of the shared dispatch
+        # is dead code here. ``_worker_running`` + ``ws.worker_thread``
+        # are set together under ``ws._lock`` so a path-keyed send
+        # arriving immediately after creation observes the running
+        # state via the shared session_worker gate instead of racing
+        # into a parallel worker.
+        with ws._lock:
+            ws._worker_running = True
             t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
             ws.worker_thread = t
             t.start()
 
-        return JSONResponse(
-            {
-                "ws_id": ws.id,
-                "name": ws.name,
-                "resumed": resumed,
-                "message_count": message_count,
-                "attachment_ids": attachment_ids,
-            }
-        )
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"resumed": resumed, "message_count": message_count}
 
 
-async def close_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/close — close a workstream.
+def _audit_workstream_created(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+) -> None:
+    """Audit emitter for the interactive ``workstream.created`` event.
 
-    Optional ``reason`` from the request body is persisted on the
-    workstream's config row so post-mortem tooling (and the coordinator's
-    ``inspect_workstream``) can surface why the workstream was retired
-    without scraping the audit log.
+    Wired onto :func:`make_create_handler` as ``audit_emit``. Runs
+    after the workstream is built and attachments saved; failures
+    are caught + logged at ``warning`` by the factory without
+    changing the create handler's successful 200 response.
     """
     from turnstone.core.audit import record_audit
-    from turnstone.core.output_guard import redact_credentials
-    from turnstone.core.web_helpers import read_json_or_400
 
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    ws_id = str(body.get("ws_id", ""))
-    raw_reason = body.get("reason", "")
-    # Cap reason length so a model that accidentally / maliciously dumps
-    # a multi-KB blob (or a captured secret) can't grow workstream_config
-    # rows without bound.  512 BYTES is enough for any human-readable
-    # close reason; anything longer is suspicious.  Slice on UTF-8 bytes
-    # (not code points) so a CJK / emoji-heavy payload can't sneak past
-    # the cap at 3-4x the documented budget.  ``errors="ignore"`` drops
-    # any partial code point left at the truncation boundary.  Then run
-    # the same credential-redaction the output guard applies to tool
-    # output — a model under prompt injection that dumps a captured
-    # secret in ``reason`` doesn't get to plant it in plaintext audit
-    # logs / workstream_config.
-    if isinstance(raw_reason, str):
-        capped = raw_reason.strip().encode("utf-8")[:512].decode("utf-8", errors="ignore")
-        reason = redact_credentials(capped)
-    else:
-        reason = ""
-    mgr = request.app.state.workstreams
-    # Cross-tenant close would abort another tenant's running generation.
-    # _require_ws_access returns 404 on non-owner — same shape as the
-    # "last workstream" (400) / "not found" (404) branches below.
-    owner_uid, err = _require_ws_access(request, ws_id, mgr=mgr)
-    if err:
-        return err
-    # Distinguish "last workstream" (400) from "not found" (404).
-    # Note: get() and close() acquire the manager lock independently, so a
-    # concurrent close between the two could produce a wrong error code.
-    # The failure mode is cosmetic (400 instead of 404), not data corruption.
-    ws_before = mgr.get(ws_id)
-    if not ws_before:
-        return JSONResponse({"error": "Workstream not found"}, status_code=404)
-    if mgr.close(ws_id):
-        # Single storage handle for both the close-reason persist and
-        # the audit emit — avoids a duplicate getattr() and a future
-        # third storage call mistakenly using a different binding.
-        storage = getattr(request.app.state, "auth_storage", None)
-        # Persist before emitting the global ws_closed event so any
-        # downstream consumer that re-reads workstream_config sees the
-        # reason in the same observation window as the state change.
-        if reason and storage is not None:
-            try:
-                storage.save_workstream_config(ws_id, {"close_reason": reason})
-            except Exception:
-                log.debug(
-                    "ws.close.reason_persist_failed ws=%s",
-                    ws_id[:8] if ws_id else "",
-                    exc_info=True,
-                )
-        gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
-        with contextlib.suppress(queue.Full):
-            gq.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "closed"})
-        if storage is not None:
-            _, ip = _audit_context(request)
-            audit_detail: dict[str, Any] = {
-                "kind": str(ws_before.kind),
-                "parent_ws_id": ws_before.parent_ws_id,
-            }
-            if reason:
-                audit_detail["reason"] = reason
-            record_audit(
-                storage,
-                owner_uid,
-                "workstream.closed",
-                "workstream",
-                ws_id,
-                audit_detail,
-                ip,
-            )
-        return JSONResponse({"status": "ok"})
-    return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
+    _audit_storage = getattr(request.app.state, "auth_storage", None)
+    if _audit_storage is None:
+        return
+    _, _audit_ip = _audit_context(request)
+    record_audit(
+        _audit_storage,
+        uid,
+        "workstream.created",
+        "workstream",
+        ws.id,
+        {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
+        _audit_ip,
+    )
 
 
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
@@ -2992,22 +1951,47 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     storage = getattr(request.app.state, "auth_storage", None)
     kind: str = ""
     parent_ws_id: str | None = None
+    name: str = ""
     _, ip = _audit_context(request)
     try:
-        # Snapshot kind/parent for the audit record before the delete
-        # wipes the row.  Inside the try so a transient storage error
-        # surfaces through the endpoint's redacted 500 handler below
-        # rather than as an unhandled exception.
+        # Snapshot row fields before the delete wipes the row.  Inside
+        # the try so a transient storage error surfaces through the
+        # endpoint's redacted 500 handler below rather than as an
+        # unhandled exception.  ``kind`` / ``parent_ws_id`` go into the
+        # audit record; ``name`` is forwarded ONLY to ``mgr.delete`` so
+        # the ``ws_closed`` event payload carries the same field other
+        # terminal transitions emit (interactive operators see the name
+        # in close toasts; coord-side ``child_ws_closed`` ignores it
+        # but the global queue contract is uniform).  ``name`` is
+        # deliberately NOT in the audit detail — display names can be
+        # long / operator-noisy and aren't needed for forensic recall
+        # (ws_id + kind + parent are enough).
         if storage is not None:
             row = storage.get_workstream(ws_id) or {}
             kind = row.get("kind", "")
             parent_ws_id = row.get("parent_ws_id")
+            name = row.get("name", "") or ""
         if delete_workstream(ws_id):
             log.info("ws.deleted", ws_id=ws_id[:8])
+            # Fire ``ws_closed`` with ``reason='deleted'`` so the
+            # cluster collector → coord adapter chain re-emits as
+            # ``child_ws_closed`` and the operator's child-tree drops
+            # the row.  Without this the row stays visible (with its
+            # last-known state) until a full reload — a model that
+            # spawns→completes→deletes children leaves an
+            # ever-growing tree on the dashboard.  Best-effort: an
+            # emit failure must not roll back the storage delete or
+            # 500 the response.
+            mgr = getattr(request.app.state, "workstreams", None)
+            if mgr is not None:
+                try:
+                    mgr.delete(ws_id, name=name)
+                except Exception:
+                    log.warning("ws.delete.event_emit_failed", ws_id=ws_id[:8], exc_info=True)
             if storage is not None:
                 record_audit(
                     storage,
-                    owner_uid,
+                    _auth_user_id(request),
                     "workstream.deleted",
                     "workstream",
                     ws_id,
@@ -3031,9 +2015,6 @@ async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONRes
     ws_id = request.path_params.get("ws_id", "")
     log.info("ws.title.refresh_requested", ws_id=ws_id[:8] if ws_id else "empty")
     mgr = request.app.state.workstreams
-    # Cross-tenant rename is a phishing / denial-of-use vector — a
-    # malicious caller could push the victim's title to a misleading
-    # string visible in list/dashboard responses.
     _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
@@ -3069,7 +2050,6 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
     mgr = request.app.state.workstreams
-    # Cross-tenant rename gate — same rationale as refresh-title above.
     _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
@@ -3281,9 +2261,16 @@ def _classify_text_attachment(
 
 
 def _auth_user_id(request: Request) -> str:
-    """Return the authenticated user's id (empty string when absent)."""
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    return str(getattr(auth, "user_id", "") or "")
+    """Return the authenticated user's id (empty string when absent).
+
+    Thin shim over :func:`turnstone.core.web_helpers.auth_user_id` —
+    kept as a module-level alias so existing call sites don't need a
+    sweeping rename. The lifted helper is the canonical version
+    (shared by both kinds since P1.5).
+    """
+    from turnstone.core.web_helpers import auth_user_id
+
+    return auth_user_id(request)
 
 
 def _auth_scopes(request: Request) -> set[str]:
@@ -3324,25 +2311,18 @@ def _require_ws_access(
     request: Request,
     ws_id: str,
     *,
-    mgr: WorkstreamManager | None = None,
+    mgr: SessionManager | None = None,
 ) -> tuple[str, JSONResponse | None]:
-    """Resolve ``ws_id`` to its owner after verifying the caller has access.
+    """Resolve ``ws_id`` to its owner, 404-ing when the row doesn't exist.
 
-    Service-scoped tokens (internal callers) bypass ownership checks.
-    Returns ``(owner_user_id, None)`` on success.  The owner id is what
-    attachments should be filed under.
-
-    When ``mgr`` is provided and the workstream is live in the manager,
-    trust its cached ``user_id`` instead of round-tripping storage —
-    keeps in-memory-only handlers (approve / plan / cancel / command /
-    close / SSE / title) functional during transient DB outages and
-    trims the hot-path by one query.  Handlers that act on
-    persisted-but-not-loaded workstreams (``/delete``, ``/open``) omit
-    ``mgr`` and fall through to the storage path.
+    Thin shim over :func:`turnstone.core.web_helpers.resolve_workstream_owner` —
+    kept as a module-level alias for the many existing callers.
+    Both helpers preserve the same trusted-team semantics: any
+    authenticated caller resolves to the row's recorded owner (with
+    fallback to caller uid on unowned rows). The lifted version is
+    the canonical implementation post-P1.5.
     """
-    caller = _auth_user_id(request)
-    scopes = _auth_scopes(request)
-    is_service = "service" in scopes
+    from turnstone.core.web_helpers import resolve_workstream_owner
 
     if mgr is not None:
         ws_mem = mgr.get(ws_id)
@@ -4180,6 +3160,17 @@ async def auth_whoami(request: Request) -> Response:
     return await handle_auth_whoami(request)
 
 
+async def auth_refresh(request: Request) -> Response:
+    """POST /v1/api/auth/refresh — extend the auth cookie's expiry.
+
+    Requires a currently-valid cookie (auth middleware enforces).  Re-
+    resolves user permissions from storage so role changes propagate.
+    """
+    from turnstone.core.auth import handle_auth_refresh
+
+    return await handle_auth_refresh(request, JWT_AUD_SERVER)
+
+
 async def oidc_authorize(request: Request) -> Response:
     """GET /v1/api/auth/oidc/authorize — redirect to OIDC provider."""
     from turnstone.core.auth import handle_oidc_authorize
@@ -4609,7 +3600,7 @@ def _update_backend_metric(app_state: Any) -> None:
 
 
 def _aggregate_emitter_thread(
-    mgr: WorkstreamManager,
+    mgr: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
 ) -> None:
@@ -4652,19 +3643,24 @@ def _aggregate_emitter_thread(
 
 
 def _idle_cleanup_thread(
-    mgr: WorkstreamManager,
+    mgr: SessionManager,
     timeout_sec: float,
     global_queue: queue.Queue[dict[str, Any]],
     rate_limiter: Any = None,
 ) -> None:
-    """Periodically close IDLE workstreams and clean up rate limiter buckets."""
+    """Periodically close IDLE workstreams and clean up rate limiter buckets.
+
+    ``mgr.close_idle`` fires the adapter's ``emit_closed`` for each
+    victim, which pushes ``ws_closed`` onto ``global_queue`` with
+    ``reason="closed"``. The old manual emission here (``reason="idle"``)
+    is gone — the frontend didn't differentiate "idle" from "closed"
+    anyway and the duplicate event caused spurious UI flicker.
+    """
+    del global_queue  # adapter handles the emission
     check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
     while True:
         time.sleep(check_every)
-        closed = mgr.close_idle(timeout_sec)
-        for ws_id in closed:
-            with contextlib.suppress(queue.Full):
-                global_queue.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "idle"})
+        mgr.close_idle(timeout_sec)
         if rate_limiter is not None:
             rate_limiter.cleanup()
 
@@ -4732,6 +3728,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Start watch runner (periodic command polling)
     if app.state.watch_runner:
         app.state.watch_runner.start()
+    # Start the buffered state-writer flusher
+    state_writer = getattr(app.state, "state_writer", None)
+    if state_writer is not None:
+        state_writer.start()
 
     # Sweep stale attachment reservations left over from process crashes
     # between reserve_attachments and consume/unreserve.  Run once at
@@ -4807,12 +3807,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         _svc_storage.register_service("server", _svc_node_id, _svc_url)
         log.info("server.service_registered", node_id=_svc_node_id, url=_svc_url)
 
-        # Collect and store node metadata (auto + config)
+        # Collect and store node metadata (auto + config).
+        # ``collect_node_info`` runs synchronous probes (sysfs reads,
+        # /proc reads, IMDS HTTP requests).  Off-load to a worker
+        # thread so the IMDS path's worst-case latency (~1 s on a
+        # misidentified-cloud host) doesn't block the event loop
+        # during the rest of the lifespan startup work.
         try:
             from turnstone.core.config import load_config as _load_meta_config
             from turnstone.core.node_info import collect_node_info
 
-            _auto_info = collect_node_info()
+            _auto_info = await asyncio.to_thread(collect_node_info)
             _meta_entries: list[tuple[str, str, str]] = [
                 (k, json.dumps(v), "auto") for k, v in _auto_info.items()
             ]
@@ -4870,6 +3875,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_client.stop_renewal()
     if app.state.watch_runner:
         app.state.watch_runner.stop()
+    # Drain + stop the buffered state-writer. shutdown() joins a
+    # daemon thread and runs synchronous DB writes; offload to a
+    # worker thread so we don't block the lifespan event loop and
+    # delay other teardown tasks.
+    state_writer = getattr(app.state, "state_writer", None)
+    if state_writer is not None:
+        await asyncio.to_thread(state_writer.shutdown)
     # Stop the orphan-reservation sweep loop
     _orphan_sweep_stop.set()
     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4908,7 +3920,7 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
 
 def create_app(
     *,
-    workstreams: WorkstreamManager,
+    workstreams: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     global_listeners: list[queue.Queue[dict[str, Any]]],
     global_listeners_lock: threading.Lock,
@@ -4927,11 +3939,165 @@ def create_app(
     judge_config: Any = None,
     config_store: Any = None,
     advertise_url: str = "",
+    state_writer: Any = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
     _openapi_handler = make_openapi_handler(_spec)
     _docs_handler = make_docs_handler()
+
+    # Workstream HTTP tree — owned by the shared registrar in
+    # ``turnstone.core.session_routes`` so the console mounts the same
+    # shape against its coord manager. The lifted handler factories
+    # (``make_approve_handler``, ``make_close_handler``) capture the
+    # kind-specific ``SessionEndpointConfig`` via closure.
+    def _interactive_attachment_owner(
+        request: Request, ws_id: str, _mgr: SessionManager
+    ) -> tuple[str, JSONResponse | None]:
+        """Resolve attachment owner for interactive workstreams via
+        :func:`_require_ws_access`. Mirrors the pre-P1.5 inline logic
+        in ``send_message`` — uses the storage path (``mgr`` not
+        passed) so tests with MagicMock managers don't trip on a
+        magic-mocked ``ws.user_id``."""
+        return _require_ws_access(request, ws_id)
+
+    def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
+        """Per-conversation metrics fired once per send that spawns a
+        fresh worker. Coord wires its own
+        :func:`turnstone.console.server._coord_spawn_metrics` (the
+        Prometheus-free analog) post the rich ``ws_state`` payload
+        lift — both kinds need the per-UI counter writes so the
+        cluster broadcast renders the same per-turn shape.
+
+        The per-UI counters live on :class:`SessionUIBase`
+        (inherited by both :class:`WebUI` and
+        :class:`turnstone.console.coordinator_ui.ConsoleCoordinatorUI`),
+        so the ``hasattr`` guards survive only as defence against a
+        future ``SessionUI`` subclass that doesn't extend the base.
+        """
+        _metrics.record_message_sent()
+        if (
+            hasattr(ui, "_ws_lock")
+            and hasattr(ui, "_ws_messages")
+            and hasattr(ui, "_ws_turn_tool_calls")
+        ):
+            with ui._ws_lock:
+                ui._ws_messages += 1
+                ui._ws_turn_tool_calls = 0
+
+    from turnstone.core.attachments import (
+        classify_text_attachment as _classify_text_attachment,
+    )
+    from turnstone.core.attachments import (
+        sniff_image_mime as _sniff_image_mime,
+    )
+    from turnstone.core.attachments import (
+        upload_lock as _attachment_upload_lock,
+    )
+
+    interactive_attachment_helpers = AttachmentUploadHelpers(
+        sniff_image_mime=_sniff_image_mime,
+        classify_text_attachment=_classify_text_attachment,
+        upload_lock=_attachment_upload_lock,
+    )
+    from turnstone.core.memory import (
+        get_workstream_display_names as _get_ws_display_names,
+    )
+    from turnstone.core.memory import resolve_workstream as _resolve_workstream_alias
+
+    interactive_endpoint_config = SessionEndpointConfig(
+        permission_gate=None,  # interactive auth is enforced at the middleware layer
+        manager_lookup=_interactive_manager_lookup,
+        tenant_check=_interactive_tenant_check,
+        not_found_label="Workstream not found",
+        audit_action_prefix="workstream",
+        supports_attachments=True,
+        attachment_owner_resolver=_interactive_attachment_owner,
+        attachment_helpers=interactive_attachment_helpers,
+        spawn_metrics=_interactive_spawn_metrics,
+        emit_message_queued=True,
+        cancel_forensics=_capture_cancel_forensics,
+        open_resolve_alias=_resolve_workstream_alias,
+        open_post_load=_interactive_open_post_load,
+        events_replay=_interactive_events_replay,
+        # Pre-lift ``events_sse`` used the dedicated 200-thread
+        # ``sse_executor`` so SSE polling stayed isolated from
+        # every other ``asyncio.to_thread`` caller in the process
+        # (storage, router, audit). Restore that isolation under
+        # the lifted contract — coord wires ``None`` and falls
+        # back to the default executor.
+        sse_executor_lookup=lambda request: request.app.state.sse_executor,
+        create_supports_attachments=True,
+        create_supports_user_id_override=True,
+        create_validate_request=_interactive_create_validate_request,
+        create_build_kwargs=_interactive_create_build_kwargs,
+        create_post_install=_interactive_create_post_install,
+        # Bulk display-name resolution for the active list — one
+        # ``SELECT ... WHERE ws_id IN (...)`` for the whole snapshot
+        # instead of N per-row queries. Returns a {ws_id: title-or-None}
+        # dict; the lifted body falls back to ``ws.name`` per-row.
+        list_resolve_titles=_get_ws_display_names,
+        # Explicit kind classifier for the lifted list/saved factory's
+        # storage filter — required to avoid silently filtering for
+        # the wrong kind when a future kind is added.
+        list_kind=WorkstreamKind.INTERACTIVE,
+        # No state filter: the interactive saved sidebar shows every
+        # persisted workstream the storage layer doesn't already
+        # tombstone (deleted rows are excluded at the SQL level).
+        saved_state_filter=None,
+        # No in-memory exclusion: an interactive workstream that's
+        # both saved AND loaded is a normal display state.
+        saved_loaded_lookup=None,
+    )
+    approve_handler = make_approve_handler(interactive_endpoint_config)
+    close_handler = make_close_handler(
+        interactive_endpoint_config,
+        audit_emit=_audit_close_workstream,
+        supports_close_reason=True,
+    )
+    cancel_handler = make_cancel_handler(interactive_endpoint_config)
+    open_handler = make_open_handler(
+        interactive_endpoint_config,
+        audit_emit=_audit_workstream_opened,
+    )
+    events_handler = make_events_handler(interactive_endpoint_config)
+    send_handler = make_send_handler(interactive_endpoint_config)
+    dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
+    attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
+    create_handler = make_create_handler(
+        interactive_endpoint_config,
+        audit_emit=_audit_workstream_created,
+    )
+    list_handler = make_list_handler(interactive_endpoint_config)
+    saved_handler = make_saved_handler(interactive_endpoint_config)
+    history_handler = make_history_handler(interactive_endpoint_config)
+    detail_handler = make_detail_handler(interactive_endpoint_config)
+    v1_routes: list[Any] = [
+        Route("/api/events/global", global_events_sse),
+    ]
+    register_session_routes(
+        v1_routes,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(
+            list_workstreams=list_handler,  # lifted: shared body
+            list_saved=saved_handler,  # lifted: shared body
+            create=create_handler,  # lifted: shared body
+            delete=delete_workstream_endpoint,
+            detail=detail_handler,  # lifted: shared body (interactive feature gain)
+            open=open_handler,  # lifted: shared body
+            close=close_handler,  # lifted: shared body
+            refresh_title=refresh_workstream_title,
+            set_title=set_workstream_title,
+            send=send_handler,  # lifted: shared body (P1.5)
+            dequeue=dequeue_handler,  # lifted (P1.5) — DELETE /send
+            approve=approve_handler,  # lifted: shared body
+            cancel=cancel_handler,  # lifted: shared body
+            events=events_handler,  # lifted: shared body
+            history=history_handler,  # lifted: shared body (interactive feature gain)
+            attachments=attachment_handlers,  # lifted: shared body (P1.5)
+        ),
+    )
+    v1_routes.append(Route("/api/dashboard", dashboard))
 
     app = Starlette(
         routes=[
@@ -4995,7 +4161,6 @@ def create_app(
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
-                    Route("/api/cancel", cancel_generation, methods=["POST"]),
                     Route("/api/watches", list_watches),
                     Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),
                     Route("/api/memories", list_memories),
@@ -5007,6 +4172,7 @@ def create_app(
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/auth/whoami", auth_whoami),
+                    Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/admin/settings", list_interface_settings),
@@ -5037,6 +4203,7 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.workstreams = workstreams
+    app.state.state_writer = state_writer
     app.state.global_queue = global_queue
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock
@@ -5498,12 +4665,33 @@ def main() -> None:
     from turnstone.core.storage import get_storage as _get_storage
     from turnstone.core.watch import WatchRunner
 
-    # Create workstream manager first (watch restore_fn captures it)
-    manager = WorkstreamManager(
-        session_factory,
-        max_workstreams=config_store.get("server.max_workstreams"),
-        node_id=_node_id,
+    # Create session manager first (watch restore_fn captures it).
+    interactive_adapter = InteractiveAdapter(
+        global_queue=global_queue,
+        ui_factory=lambda ws: WebUI(
+            ws_id=ws.id,
+            user_id=ws.user_id,
+            kind=ws.kind,
+            parent_ws_id=ws.parent_ws_id,
+        ),
+        session_factory=session_factory,
     )
+    from turnstone.core.state_writer import StateWriter
+
+    state_writer = StateWriter(_get_storage())
+    manager = SessionManager(
+        interactive_adapter,
+        storage=_get_storage(),
+        max_active=config_store.get("server.max_workstreams"),
+        node_id=_node_id,
+        state_writer=state_writer,
+        # InteractiveAdapter satisfies SessionEventEmitter for the
+        # ``ws_closed`` transport path; emit_created / emit_state /
+        # emit_rehydrated are no-ops because those events fire from
+        # out-of-band paths (create handler + WebUI._broadcast_state).
+        event_emitter=interactive_adapter,
+    )
+    interactive_adapter.attach(manager)
     WebUI._workstream_mgr = manager
 
     def _watch_restore_fn(ws_id: str) -> Any:
@@ -5515,9 +4703,7 @@ def main() -> None:
         must start a worker thread directly — same pattern as send_message().
         """
         try:
-            ws = manager.create(
-                ui_factory=lambda wid, **kw: WebUI(ws_id=wid, **kw),
-            )
+            ws = manager.create(user_id="", name="watch-restore")
             # Restored workstreams run unattended — auto-approve tool calls
             # to avoid blocking forever on approval with no connected user.
             if isinstance(ws.ui, WebUI):
@@ -5537,20 +4723,11 @@ def main() -> None:
         tool_timeout=config_store.get("tools.timeout"),
         restore_fn=_watch_restore_fn,
     )
-    ws = manager.create(
-        name="default",
-        ui_factory=lambda wid, **kw: WebUI(ws_id=wid, **kw),
-    )
-    if not isinstance(ws.ui, WebUI):
-        raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
-    if config_store.get("tools.skip_permissions"):
-        ws.ui.auto_approve = True
 
-    # Handle --resume
-    assert ws.session is not None
-    ws.session.set_watch_runner(
-        _watch_runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
-    )
+    # ``--resume`` lazily creates a workstream scoped to the resumed
+    # content. Without ``--resume`` no default workstream is spawned;
+    # the web UI handles the 0-ws state and users create workstreams
+    # on demand via POST /v1/api/workstreams.
     if args.resume:
         from turnstone.core.memory import resolve_workstream
 
@@ -5558,6 +4735,15 @@ def main() -> None:
         if not target_id:
             log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
+        ws = manager.create(user_id="", name="resumed")
+        if not isinstance(ws.ui, WebUI):
+            raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")
+        if config_store.get("tools.skip_permissions"):
+            ws.ui.auto_approve = True
+        assert ws.session is not None
+        ws.session.set_watch_runner(
+            _watch_runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
+        )
         if not ws.session.resume(target_id):
             log.error("Workstream '%s' has no messages.", args.resume)
             sys.exit(1)
@@ -5611,6 +4797,7 @@ def main() -> None:
         judge_config=judge_config,
         config_store=config_store,
         advertise_url=_advertise_url,
+        state_writer=state_writer,
     )
 
     # Wire app ref so health callbacks can access app.state for metrics

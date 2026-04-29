@@ -162,21 +162,51 @@ export interface CreateWorkstreamResponse {
 }
 
 export interface CloseWorkstreamRequest {
-  ws_id: string;
+  /**
+   * Optional close reason persisted to `workstream_config` for
+   * postmortem. Capped at 512 UTF-8 bytes server-side; credential
+   * redaction is applied via the output guard.
+   */
+  reason?: string;
 }
 
 export interface WorkstreamInfo {
-  id: string;
+  // Renamed `id` → `ws_id` and added kind/parent_ws_id/user_id in
+  // the Stage 2 list-verb lift. Pre-1.5 readers branching on
+  // `row.id` should swap to `row.ws_id`.
+  ws_id: string;
   name: string;
   state: string;
+  kind: string;
+  parent_ws_id: string | null;
+  user_id: string;
 }
 
 export interface ListWorkstreamsResponse {
   workstreams: WorkstreamInfo[];
 }
 
+export interface WorkstreamDetailResponse {
+  // Lifted from coord-only into a shared verb in the Stage 2
+  // history/detail verb lift. Both kinds populate every field; SDK
+  // consumers don't branch on kind.
+  ws_id: string;
+  name: string;
+  state: string;
+  user_id: string;
+  kind: string;
+}
+
+export interface WorkstreamHistoryResponse {
+  ws_id: string;
+  // Tail of the workstream's reconstructed message history
+  // (provider-fidelity OpenAI-like shape). Bounded by the ?limit=
+  // query param (default 100, max 500).
+  messages: Record<string, unknown>[];
+}
+
 export interface DashboardWorkstream {
-  id: string;
+  ws_id: string;
   name: string;
   state: string;
   title?: string;

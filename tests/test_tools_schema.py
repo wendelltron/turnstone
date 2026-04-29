@@ -72,8 +72,8 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 19 interactive tools + 11 coordinator tools
-        assert len(TOOLS) == 30
+        # 19 interactive tools + 13 coordinator tools
+        assert len(TOOLS) == 32
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 10
@@ -84,9 +84,11 @@ class TestToolsMetadata:
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
 
-        assert len(COORDINATOR_TOOLS) == 11
+        assert len(COORDINATOR_TOOLS) == 14
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
+            "spawn_batch",
+            "close_all_children",
             "inspect_workstream",
             "send_to_workstream",
             "close_workstream",
@@ -95,8 +97,12 @@ class TestToolsMetadata:
             "list_workstreams",
             "list_nodes",
             "list_skills",
-            "task_list",
+            "tasks",
             "wait_for_workstream",
+            # ``memory`` is dual-kind (coordinator: true + interactive: true)
+            # so coords can persist orchestration context for their children
+            # via the new ``coordinator`` scope.
+            "memory",
         }
 
     def test_auto_approve_sets_match(self):
@@ -142,12 +148,14 @@ class TestToolsMetadata:
             "diff_file": "path_a",
             # Coordinator tools:
             "spawn_workstream": "initial_message",
+            "spawn_batch": "children",
+            "close_all_children": "reason",
             "inspect_workstream": "ws_id",
             "send_to_workstream": "message",
             "close_workstream": "ws_id",
             "cancel_workstream": "ws_id",
             "delete_workstream": "ws_id",
-            "task_list": "action",
+            "tasks": "action",
         }
         assert expected == PRIMARY_KEY_MAP
 

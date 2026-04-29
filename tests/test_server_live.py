@@ -605,7 +605,7 @@ _SERVER_AUTH_HEADERS = {"Authorization": f"Bearer {_server_jwt()}"}
 class TestServerHealthMetrics:
     """Verify /health and /metrics endpoints using a Starlette TestClient.
 
-    These tests create a Starlette app with a mock WorkstreamManager
+    These tests create a Starlette app with a mock SessionManager
     so no live LLM backend is required.  Run them independently with:
 
         pytest tests/test_server_live.py::TestServerHealthMetrics -v
@@ -644,7 +644,7 @@ class TestServerHealthMetrics:
 
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         app = srv_mod.create_app(
             workstreams=mock_mgr,
@@ -820,7 +820,7 @@ class TestServerRateLimiting:
 
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
 
         app = srv_mod.create_app(
             workstreams=mock_mgr,

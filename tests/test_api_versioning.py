@@ -49,7 +49,7 @@ class TestServerVersioning:
 
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = []
-        mock_mgr.max_workstreams = 10
+        mock_mgr.max_active = 10
         app = create_app(
             workstreams=mock_mgr,
             global_queue=queue.Queue(),
@@ -76,7 +76,7 @@ class TestServerVersioning:
         assert resp.status_code == 200
         spec = resp.json()
         assert spec["openapi"] == "3.1.0"
-        assert "/v1/api/send" in spec["paths"]
+        assert "/v1/api/workstreams/{ws_id}/send" in spec["paths"]
 
     def test_docs_page(self, client):
         resp = client.get("/docs")

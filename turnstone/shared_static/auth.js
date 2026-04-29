@@ -24,8 +24,14 @@ if (_authChannel) {
     if (e.data === "login") {
       hideLogin();
       if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
+      _scheduleRefreshFromWhoami();
     } else if (e.data === "logout") {
+      _cancelRefreshTimer();
       showLogin();
+    } else if (e.data === "refresh") {
+      // Another tab refreshed; reschedule based on the new exp so we
+      // don't redundantly hit /refresh ourselves.
+      _scheduleRefreshFromWhoami();
     }
   };
 }
@@ -45,6 +51,13 @@ async function authFetch(url, opts) {
       } catch (e) {
         if (e.message === "auth") throw e;
       }
+      // Reactive refresh — try once before falling through to login.
+      // Covers cases where the proactive refresh timer didn't fire
+      // (tab restored from disk-cache after expiry, system clock jump,
+      // page first-load with a stale cookie).
+      if (attempt === 0 && (await _tryRefresh())) {
+        continue; // retry the original request with the new cookie
+      }
       showLogin();
       throw new Error("auth");
     }
@@ -61,6 +74,221 @@ async function authFetch(url, opts) {
     if (_lb) _lb.style.display = "";
     if (typeof _ensureSSE === "function") _ensureSSE();
     return r;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cookie refresh — proactive timer + reactive on-401 fallback
+// ---------------------------------------------------------------------------
+
+// Pre-emptive refresh fires at REFRESH_AT_FRACTION of remaining cookie life
+// (90% by default).  Keeps the cookie fresh ahead of expiry without
+// hammering the server for every authFetch.  The reactive _tryRefresh()
+// path above covers cases where the timer didn't fire (tab restored from
+// disk cache after expiry, system clock jump, etc).
+var _REFRESH_AT_FRACTION = 0.9;
+// Floor so we don't spin on tiny lifetimes; ceil so very long-lived
+// cookies still refresh once a day for permission re-resolution.
+var _REFRESH_MIN_DELAY_MS = 30 * 1000;
+var _REFRESH_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
+var _refreshTimer = null;
+var _refreshInFlight = null;
+// Logout race guard: a refresh (or whoami) in flight when the user
+// clicks Logout can land AFTER /logout and re-populate state, silently
+// undoing the logout.  _loggedOut is set synchronously in logout() and
+// every fetch's .then bails on its post-fetch effects when it sees the
+// flag.  _refreshAbort / _whoamiAbort are the AbortControllers for any
+// in-flight /refresh and /whoami respectively.
+var _loggedOut = false;
+var _refreshAbort = null;
+var _whoamiAbort = null;
+
+// Permissions-ready: one-shot promise resolved after the initial whoami
+// completes (success OR failure).  Lets permission-gated UI await the
+// "have we tried to populate sessionStorage yet?" signal instead of
+// guessing a setTimeout duration.  Subsequent logins/logouts refresh
+// permissions through the existing onLoginSuccess / onLogout hooks, so
+// one-shot is sufficient for the page-load gate problem.
+var _permissionsReadyResolve = null;
+var _permissionsReady = new Promise(function (resolve) {
+  _permissionsReadyResolve = resolve;
+});
+function _markPermissionsReady() {
+  if (_permissionsReadyResolve) {
+    var r = _permissionsReadyResolve;
+    _permissionsReadyResolve = null;
+    r();
+  }
+}
+if (typeof window !== "undefined") {
+  window.permissionsReady = _permissionsReady;
+}
+
+async function _tryRefresh() {
+  // Don't start a refresh if logout already won the race.
+  if (_loggedOut) return false;
+  // De-dupe concurrent callers — many parallel authFetch'es hitting
+  // 401 at once should still only fire one /refresh request.
+  if (_refreshInFlight) {
+    try {
+      return await _refreshInFlight;
+    } catch (_e) {
+      return false;
+    }
+  }
+  _refreshAbort =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  _refreshInFlight = (async function () {
+    try {
+      var r = await fetch("/v1/api/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        signal: _refreshAbort ? _refreshAbort.signal : undefined,
+      });
+      if (!r.ok) return false;
+      var data = null;
+      try {
+        data = await r.json();
+      } catch (_e) {
+        /* refresh succeeded but body unreadable — fall back to whoami */
+      }
+      // If logout fired while the refresh was in flight, drop all
+      // post-fetch effects: don't store perms (already cleared), don't
+      // reschedule a timer, don't broadcast (would re-arm sibling tabs).
+      // The new cookie is harmless — logout's clear-cookie response
+      // already overwrote it on the way back from this fetch.
+      if (_loggedOut) return false;
+      // Consume the refresh response inline.  /refresh returns the same
+      // permissions + exp shape as /whoami (auth.py:handle_auth_refresh),
+      // so we can populate sessionStorage and reschedule the next refresh
+      // off this single round-trip — no follow-up whoami needed.  The
+      // caller (authFetch retry loop, refresh timer) sees fresh
+      // sessionStorage immediately on resume, so a permission re-resolve
+      // server-side is reflected in the UI on the very next
+      // permission-gated check.
+      if (data) {
+        _storePermissions(data);
+        if (typeof data.exp === "number") {
+          _scheduleRefreshAt(data.exp);
+        } else {
+          // Server didn't surface exp (older deployment) — fall back to
+          // the whoami round-trip so we still reschedule.
+          _scheduleRefreshFromWhoami();
+        }
+      } else {
+        _scheduleRefreshFromWhoami();
+      }
+      if (_authChannel) _authChannel.postMessage("refresh");
+      return true;
+    } catch (_e) {
+      return false;
+    } finally {
+      _refreshInFlight = null;
+      _refreshAbort = null;
+    }
+  })();
+  return await _refreshInFlight;
+}
+
+function _scheduleRefreshAt(epochSeconds) {
+  if (_refreshTimer) {
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
+  }
+  if (typeof epochSeconds !== "number" || !isFinite(epochSeconds)) return;
+  var nowMs = Date.now();
+  var expMs = epochSeconds * 1000;
+  var remaining = expMs - nowMs;
+  if (remaining <= 0) return; // already expired; reactive path handles it
+  var delay = Math.floor(remaining * _REFRESH_AT_FRACTION);
+  if (delay < _REFRESH_MIN_DELAY_MS) delay = _REFRESH_MIN_DELAY_MS;
+  if (delay > _REFRESH_MAX_DELAY_MS) delay = _REFRESH_MAX_DELAY_MS;
+  _refreshTimer = setTimeout(function () {
+    _refreshTimer = null;
+    _tryRefresh();
+  }, delay);
+}
+
+function _scheduleRefreshFromWhoami() {
+  // Best-effort — failure here just means no proactive refresh; the
+  // reactive on-401 path still works.  Uses fetch (not authFetch) to
+  // avoid recursion through the on-401 trap.
+  //
+  // Also rehydrates sessionStorage permissions when the cookie outlives
+  // the tab session: an existing valid cookie means the user is still
+  // authenticated, but sessionStorage was cleared on tab close, so
+  // permission-gated UI (e.g. the coordinator composer) hides until the
+  // user manually logs out + back in.  Populating from whoami here keeps
+  // the gate consistent with the actual auth state.
+  //
+  // Logout race: if logout() fires while this fetch is in flight, the
+  // .then must NOT call _storePermissions (would re-populate after
+  // logout cleared) or _scheduleRefreshAt (would re-arm the timer).
+  // _loggedOut guards the post-fetch effects; _whoamiAbort lets logout
+  // cancel the in-flight request directly so the network roundtrip
+  // doesn't even complete.
+  //
+  // Same-call superseding: this function is invoked from several places
+  // (initial page load, _onSuccess, BroadcastChannel "login"/"refresh",
+  // _tryRefresh fallback).  Two of those firing in quick succession —
+  // e.g. an old slow whoami still in flight when login completes and
+  // schedules a fresh one — could let the older response land last and
+  // clobber the newer one's effects (clearing permissions right after a
+  // successful login, or rescheduling off a stale exp).  We abort the
+  // prior in-flight whoami before starting a new one AND guard the
+  // post-fetch effects with `_whoamiAbort === ctrl` so a late arrival
+  // from a superseded call is fully neutralised.
+  var prior = _whoamiAbort;
+  if (prior) {
+    try {
+      prior.abort();
+    } catch (_e) {
+      /* AbortController not available; the equality check below covers it */
+    }
+  }
+  var ctrl =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  _whoamiAbort = ctrl;
+  fetch("/v1/api/auth/whoami", {
+    credentials: "same-origin",
+    signal: ctrl ? ctrl.signal : undefined,
+  })
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (_loggedOut) return;
+      // Bail if a newer call has superseded us — its eventual effects
+      // are the authoritative ones; ours would only clobber.
+      if (_whoamiAbort !== ctrl) return;
+      // Treat a non-OK whoami (data === null) as an explicit clear.
+      // _storePermissions(null) removes the key so stale UI gating
+      // disappears when the server-side identity is gone (user
+      // deleted, role stripped, token revoked between tab close and
+      // restore).  Per the documented threat model these permissions
+      // are cosmetic — but a stale "you're an admin" badge after
+      // server-side revocation is exactly the kind of thing that
+      // surprises an operator at the wrong moment.
+      _storePermissions(data);
+      if (data && typeof data.exp === "number") {
+        _scheduleRefreshAt(data.exp);
+      }
+    })
+    .catch(function () {
+      /* silent — proactive refresh is optional, abort is expected */
+    })
+    .finally(function () {
+      // Only clear if still ours — a newer call may have replaced it.
+      if (_whoamiAbort === ctrl) _whoamiAbort = null;
+      _markPermissionsReady();
+    });
+}
+
+function _cancelRefreshTimer() {
+  if (_refreshTimer) {
+    clearTimeout(_refreshTimer);
+    _refreshTimer = null;
   }
 }
 
@@ -506,18 +734,46 @@ function _onSuccess() {
     window.location.reload();
     return;
   }
+  // Successful re-login clears the logged-out latch so subsequent
+  // refreshes work again.
+  _loggedOut = false;
   hideLogin();
   var logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "";
   if (_authChannel) _authChannel.postMessage("login");
   if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
+  // Schedule pre-emptive cookie refresh based on the new token's exp.
+  _scheduleRefreshFromWhoami();
 }
 
 function logout() {
+  // Set flag + abort in-flight fetches BEFORE the network call so any
+  // concurrent _tryRefresh() / _scheduleRefreshFromWhoami() bails its
+  // post-fetch effects (see _loggedOut handling above).  Without this,
+  // a refresh or whoami already in flight can land after /logout and
+  // re-set the cookie or re-populate sessionStorage permissions.
+  _loggedOut = true;
+  _cancelRefreshTimer();
+  [_refreshAbort, _whoamiAbort].forEach(function (ctrl) {
+    if (!ctrl) return;
+    try {
+      ctrl.abort();
+    } catch (_e) {
+      /* AbortController not available; the _loggedOut flag handles it */
+    }
+  });
   fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
     sessionStorage.removeItem("turnstone_permissions");
     if (_authChannel) _authChannel.postMessage("logout");
     if (typeof window.onLogout === "function") window.onLogout();
     showLogin();
   });
+}
+
+// Schedule on initial load if already authenticated.  The whoami
+// request silently fails if the cookie is missing or expired, which
+// is the right behaviour — the first authFetch will trigger the
+// login overlay via the existing on-401 path.
+if (typeof window !== "undefined") {
+  _scheduleRefreshFromWhoami();
 }

@@ -682,7 +682,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "Must match an entry in the Models tab. Coordinator sessions create and "
             "drive child workstreams on your server nodes; point this at a capable "
             "model so the orchestration reasoning is solid. When empty, "
-            "POST /v1/api/coordinator/new returns 503 with a remediation message.",
+            "POST /v1/api/workstreams/new returns 503 with a remediation message.",
         ),
         SettingDef(
             "coordinator.reasoning_effort",
@@ -705,8 +705,8 @@ def _build_registry() -> dict[str, SettingDef]:
             min_value=1,
             max_value=100,
             help="Cap on how many coordinator workstreams can run at once on this "
-            "console. When the limit is reached, POST /v1/api/coordinator/new either "
-            "evicts the oldest idle coordinator (matching WorkstreamManager.close_idle "
+            "console. When the limit is reached, POST /v1/api/workstreams/new either "
+            "evicts the oldest idle coordinator (matching SessionManager.close_idle "
             "semantics) or returns 429 if every slot is non-idle.",
         ),
         SettingDef(

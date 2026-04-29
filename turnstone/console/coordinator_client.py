@@ -23,6 +23,7 @@ JWTs carrying the real user's identity + scopes.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import secrets
 import threading
@@ -35,6 +36,7 @@ import httpx
 
 from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
 from turnstone.core.log import get_logger
+from turnstone.core.memory import LAST_ERROR_CONFIG_KEY
 from turnstone.core.workstream import WorkstreamKind
 
 # ---------------------------------------------------------------------------
@@ -78,11 +80,40 @@ WAIT_MAX_TIMEOUT: float = 600.0
 # tool replaces.
 WAIT_POLL_INTERVAL: float = 0.5
 
+# Per-ws cap on the inline ``message`` field bundled into wait_for_workstream
+# results.  Sized so a fan-out of 32 children at the cap is ~192 KiB of
+# tool output — large but not catastrophic on commercial models, and
+# typical waits run with a handful of children.  Truncation is from the
+# END (the lead is usually more informative than the tail) and sets a
+# ``truncated=True`` flag so the model can opt into a follow-up read if
+# the trailing bytes matter.
+WAIT_MESSAGE_MAX_BYTES: int = 6 * 1024
+
+# How many tail messages ``wait_for_workstream`` reads when extracting a
+# child's last assistant turn.  The conversation tail almost always
+# contains the final assistant message within the last few rows
+# (assistant + a handful of tool results); 20 is generous head-room
+# without scanning the full history of a long-lived workstream.
+_WAIT_MESSAGE_TAIL_LIMIT: int = 20
+
+# Sentinel strings used when a terminal state has no usable assistant
+# content to return.  Pinned as constants so callers (and tests) can
+# rely on the exact text rather than a fuzzed message.  The
+# ``NO_RECENT_ASSISTANT`` sentinel is intentionally hedged ("recent")
+# rather than absolute — the message walk only looks at the
+# ``_WAIT_MESSAGE_TAIL_LIMIT`` row tail, so an assistant turn buried
+# beyond that window (e.g. a single burst of >18 parallel tool calls
+# followed by an error) would otherwise produce a sentinel that
+# falsely claims no output exists at all.
+_WAIT_SENTINEL_CLOSED = "(workstream closed)"
+_WAIT_SENTINEL_DENIED = "(workstream denied: not in coordinator subtree or does not exist)"
+_WAIT_SENTINEL_NO_RECENT_ASSISTANT = "(no recent assistant output)"
+
 _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # Hard cap on tasks per coordinator — the full list is read and re-serialized
 # on every mutation, so unbounded growth is both a storage and a tool-output-size
 # hazard.  Hitting the cap is an explicit signal to prune done/blocked rows.
-_TASK_LIST_MAX = 500
+_TASKS_MAX = 500
 # Max task title length.  Exceeded titles return an error rather than
 # silently truncating — mutating the coordinator's planning state
 # under its nose masks real planning bugs (the model may rely on the
@@ -104,8 +135,15 @@ _SKILL_TOOLS_PROJECTION_CAP = 20
 
 
 def _utc_now_iso() -> str:
-    """ISO-8601 UTC timestamp with seconds precision — used for task timestamps."""
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
+    """ISO-8601 UTC timestamp with seconds precision.
+
+    Format matches the storage row format used elsewhere in the codebase
+    (``YYYY-MM-DDTHH:MM:SS``, no trailing offset) — both sides are UTC by
+    convention, kept as bare ISO for visual consistency when an operator
+    grep-correlates a task envelope's ``created`` / ``updated`` against a
+    workstream row.  No code currently joins or sorts the two together.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
@@ -135,10 +173,10 @@ def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
     try:
         data = json.loads(payload)
     except (TypeError, ValueError):
-        log.warning("task_list.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
+        log.warning("tasks.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
         return empty, True
     if not (isinstance(data, dict) and isinstance(data.get("tasks"), list)):
-        log.warning("task_list.corrupt_envelope ws=%s (wrong shape)", ws_id)
+        log.warning("tasks.corrupt_envelope ws=%s (wrong shape)", ws_id)
         return empty, True
     return data, False
 
@@ -209,6 +247,16 @@ class CoordinatorTokenManager:
             extra_claims={"coord_ws_id": self._coord_ws_id},
         )
         self._expires_at = time.time() + self._ttl
+        # Observability — without this, mint races + premature-401
+        # diagnostics require ad-hoc logging.  Mirrors the pattern in
+        # ServiceTokenManager._mint (turnstone/core/auth.py).
+        log.debug(
+            "coordinator.token_mint coord_ws_id=%s user=%s ttl=%ds expires_at=%.1f",
+            self._coord_ws_id,
+            self._user_id,
+            self._ttl,
+            self._expires_at,
+        )
 
     @property
     def token(self) -> str:
@@ -224,15 +272,27 @@ class CoordinatorTokenManager:
 
 
 # URL paths on the console's routing proxy — must match the routes
-# registered in turnstone/console/server.py (_CONSOLE_ROUTES).  Tested
-# in test_coordinator_client.py against the live route table.
+# registered in turnstone/console/server.py.  Templates with
+# ``{ws_id}`` are formatted at call time in ``_post`` (path-keyed
+# shape post-#422 legacy URL adapter removal). The legacy body-keyed
+# variants (``/v1/api/route/{verb}`` with ws_id in the JSON body)
+# were deleted in the URL unification — keep this table aligned with
+# what's actually mounted, see ``test_coordinator_client_route_table``
+# for the live-route consistency check.
 _ROUTE_PATHS: dict[str, str] = {
     "spawn": "/v1/api/route/workstreams/new",
-    "send": "/v1/api/route/send",
-    "approve": "/v1/api/route/approve",
-    "cancel": "/v1/api/route/cancel",
-    "close": "/v1/api/route/workstreams/close",
+    "send": "/v1/api/route/workstreams/{ws_id}/send",
+    "approve": "/v1/api/route/workstreams/{ws_id}/approve",
+    "cancel": "/v1/api/route/workstreams/{ws_id}/cancel",
+    "close": "/v1/api/route/workstreams/{ws_id}/close",
+    # ``delete`` is the only surviving body-keyed routing proxy path
+    # — it has its own ``route_workstream_delete`` handler instead of
+    # going through the generic ``route_proxy``.
     "delete": "/v1/api/route/workstreams/delete",
+    # The cascade endpoints live on the console itself (not a node), so
+    # the path uses the coordinator ws_id in the URL rather than a
+    # routing-proxy prefix.
+    "close_all_children": "/v1/api/workstreams/{ws_id}/close_all_children",
 }
 
 
@@ -265,7 +325,7 @@ class CoordinatorClient:
         # with the coordinator session.
         self._http = http_client or httpx.Client(timeout=timeout)
         self._owns_http = http_client is None
-        # task_list per-ws lock cache — populated lazily by _task_lock().
+        # tasks per-ws lock cache — populated lazily by _task_lock().
         # Single-session so a plain dict behind a coarse lock is fine;
         # WeakValueDictionary isn't needed (entries live as long as the
         # CoordinatorClient instance).
@@ -301,13 +361,48 @@ class CoordinatorClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token_factory()}"}
 
-    def _post(self, path_key: str, body: dict[str, Any]) -> dict[str, Any]:
-        path = _ROUTE_PATHS[path_key]
-        url = f"{self._base_url}{path}"
+    def _post(
+        self,
+        path_key: str,
+        body: dict[str, Any],
+        *,
+        ws_id: str | None = None,
+    ) -> dict[str, Any]:
+        """POST to a routing-proxy path. ``ws_id`` is interpolated into
+        the path template when it has a ``{ws_id}`` slot (post-#422
+        path-keyed shape); body-keyed paths (delete, close_all_children
+        callsite) ignore the kwarg. ``log_path`` keeps the template
+        un-formatted so telemetry aggregates across sessions instead
+        of fragmenting on per-call ws_ids."""
+        template = _ROUTE_PATHS[path_key]
+        if "{ws_id}" in template:
+            if not ws_id:
+                raise ValueError(f"ws_id required for path key {path_key!r}")
+            path = template.format(ws_id=ws_id)
+        else:
+            path = template
+        return self._post_url(f"{self._base_url}{path}", body, log_path=template)
+
+    def _post_url(
+        self,
+        url: str,
+        body: dict[str, Any],
+        *,
+        log_path: str,
+    ) -> dict[str, Any]:
+        """POST a pre-built URL with the canonical error handling.
+
+        Split out so endpoints whose path slots in runtime data (e.g.
+        the coord's own ``ws_id`` for cascade ops) can reuse the same
+        transport-error / JSON-fallback / setdefault-status shape
+        without duplicating the body of ``_post``.  ``log_path`` is a
+        stable key for telemetry grouping — the URL itself embeds
+        per-session ids that would fragment log aggregation.
+        """
         try:
             resp = self._http.post(url, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
-            log.warning("coord_client.http_error path=%s err=%s", path, exc)
+            log.warning("coord_client.http_error path=%s err=%s", log_path, exc)
             return {"error": f"upstream unreachable: {exc}", "status": 0}
         try:
             data = resp.json() if resp.content else {}
@@ -385,7 +480,7 @@ class CoordinatorClient:
     def send(self, ws_id: str, message: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("send", {"ws_id": ws_id, "message": message})
+        return self._post("send", {"message": message}, ws_id=ws_id)
 
     def emit_audit(self, action: str, detail: dict[str, Any]) -> None:
         """Record an audit row attributed to this coordinator session.
@@ -409,10 +504,24 @@ class CoordinatorClient:
     def close_workstream(self, ws_id: str, reason: str = "") -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        body: dict[str, Any] = {"ws_id": ws_id}
+        body: dict[str, Any] = {}
         if reason:
             body["reason"] = reason
-        return self._post("close", body)
+        return self._post("close", body, ws_id=ws_id)
+
+    def close_all_children(self, reason: str = "") -> dict[str, Any]:
+        """Soft-close every direct child of this coordinator (console-side fan-out).
+
+        Returns ``{closed, failed, skipped}`` — mirrors ``stop_cascade``.
+        The console does the Semaphore-bounded gather so the model-side
+        tool call stays a single HTTP round-trip regardless of fan-out
+        size.  No tenant guard here: ownership is enforced on the
+        endpoint via ``_resolve_coord_session``.
+        """
+        body: dict[str, Any] = {}
+        if reason:
+            body["reason"] = reason
+        return self._post("close_all_children", body, ws_id=self._coord_ws_id)
 
     def delete(self, ws_id: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
@@ -431,18 +540,17 @@ class CoordinatorClient:
         always: bool = False,
     ) -> dict[str, Any]:
         body = {
-            "ws_id": ws_id,
             "call_id": call_id,
             "approved": approved,
             "feedback": feedback,
             "always": always,
         }
-        return self._post("approve", body)
+        return self._post("approve", body, ws_id=ws_id)
 
     def cancel(self, ws_id: str) -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
-        return self._post("cancel", {"ws_id": ws_id})
+        return self._post("cancel", {}, ws_id=ws_id)
 
     # -- model-invoked block-wait -----------------------------------------
 
@@ -474,11 +582,24 @@ class CoordinatorClient:
         stays in the set so a legacy / synthetic-test row carrying
         that state still counts).  ``mode='all'`` returns once every
         ws_id has settled (real terminal OR ``denied``).  Returns
-        ``{"results": {ws_id: {state, tokens, updated}},
+        ``{"results": {ws_id: {state, tokens, updated, message, truncated}},
         "elapsed": float, "complete": bool, "mode": mode}``.  ``complete``
         is True when the wait condition was met before the deadline,
         False when the timeout fired (results carry whatever last state
         was observed).
+
+        ``message`` carries the child's last assistant message text for
+        ``idle`` / ``error`` states, or a short status sentinel for
+        ``closed`` / ``denied``.  Non-terminal entries (e.g. ``running``
+        after a timeout) and ``deleted`` rows carry ``None`` — hard
+        deletes cascade rows out of storage so a real ``deleted`` state
+        is never observed; the legacy/synthetic-row path falls into the
+        same null-message shape as a still-running ws.  Capped at
+        ``WAIT_MESSAGE_MAX_BYTES`` UTF-8 bytes per ws — when the cap
+        triggers, ``truncated`` is ``True`` so the model can opt into a
+        follow-up ``inspect_workstream`` for the rest.  Bundled inline
+        so the coordinator LLM doesn't need an extra round-trip per
+        child to see what came back.
 
         ``since`` — optional prior snapshot (typically the ``results``
         dict from an earlier ``wait_for_workstream`` call).  When
@@ -687,8 +808,56 @@ class CoordinatorClient:
             if remaining <= 0:
                 break
             time.sleep(min(self._WAIT_POLL_INTERVAL, remaining))
+        # Bundle each terminal child's last assistant message inline so the
+        # coordinator LLM doesn't have to follow up with one
+        # ``inspect_workstream`` per ws.  Only ``idle`` / ``error`` ws_ids
+        # actually hit storage (``closed`` / ``denied`` return a sentinel
+        # without I/O), so split them and parallelize the storage-bound
+        # subset across a small thread pool — at the WAIT_MAX_WS_IDS=32
+        # cap, 8 workers cuts a worst-case all-idle fan-out from 32
+        # sequential storage round-trips down to 4 batches, which lands
+        # inside the WAIT_POLL_INTERVAL the model already tolerates
+        # between ticks.  Storage backends use SQLAlchemy with
+        # ``check_same_thread=False`` (SQLite) / a connection pool
+        # (Postgres), so concurrent reads from the worker pool are safe.
+        io_wids = [
+            wid
+            for wid, snap in last_results.items()
+            if str(snap.get("state") or "") in ("idle", "error")
+        ]
+        io_pairs: dict[str, tuple[str | None, bool]] = {}
+        if io_wids:
+
+            def _enrich(wid: str) -> tuple[str, str | None, bool]:
+                state = str(last_results[wid].get("state") or "")
+                msg, trunc = _wait_message_for(self._storage, wid, state)
+                return wid, msg, trunc
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(io_wids)),
+                thread_name_prefix="coord-wait-enrich",
+            ) as ex:
+                for wid, msg, trunc in ex.map(_enrich, io_wids):
+                    io_pairs[wid] = (msg, trunc)
+
+        # Build the final dict.  Fresh per-ws dicts (not in-place
+        # mutation) so any in-flight ``wait_progress`` SSE event still
+        # holds a reference to the tick's pre-enrichment snapshot — its
+        # shape is documented as separate from the returned tool result
+        # and must not silently grow new fields just because the wait
+        # completed.
+        enriched_results: dict[str, dict[str, Any]] = {}
+        for wid, snap in last_results.items():
+            state = str(snap.get("state") or "")
+            if wid in io_pairs:
+                msg, trunc = io_pairs[wid]
+            elif state in WAIT_TERMINAL_STATES:
+                msg, trunc = _wait_message_for(self._storage, wid, state)
+            else:
+                msg, trunc = None, False
+            enriched_results[wid] = {**snap, "message": msg, "truncated": trunc}
         return {
-            "results": last_results,
+            "results": enriched_results,
             "complete": complete,
             "elapsed": round(time.monotonic() - start, 3),
             "mode": mode,
@@ -992,10 +1161,10 @@ class CoordinatorClient:
         return {"skills": skills, "truncated": truncated}
 
     # ------------------------------------------------------------------
-    # task_list — coordinator-local planning state persisted on workstream_config
+    # tasks — coordinator-local planning state persisted on workstream_config
     # ------------------------------------------------------------------
 
-    def task_list_get(self, ws_id: str) -> dict[str, Any]:
+    def tasks_get(self, ws_id: str) -> dict[str, Any]:
         """Return the task envelope ``{"version": 1, "tasks": [...]}``.
 
         Corrupt / legacy config rows return an empty envelope rather than
@@ -1020,7 +1189,7 @@ class CoordinatorClient:
             return empty, False
         return load_task_envelope(self._storage, ws_id)
 
-    def _save_task_list(self, ws_id: str, envelope: dict[str, Any]) -> None:
+    def _save_tasks(self, ws_id: str, envelope: dict[str, Any]) -> None:
         # Save only the ``tasks`` key so concurrent writers to other
         # workstream_config keys (e.g. reasoning_effort from the admin UI)
         # aren't clobbered by a read-modify-write on the full row.
@@ -1043,7 +1212,7 @@ class CoordinatorClient:
                 self._task_lock_cache[ws_id] = lk
             return lk
 
-    def task_list_add(
+    def tasks_add(
         self,
         ws_id: str,
         *,
@@ -1052,7 +1221,7 @@ class CoordinatorClient:
         child_ws_id: str = "",
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         clean_title = (title or "").strip()
         if not clean_title:
             return {"error": "title is required"}
@@ -1075,15 +1244,15 @@ class CoordinatorClient:
             if corrupt:
                 return {
                     "error": (
-                        "task_list envelope is corrupt on disk; refusing to "
+                        "tasks envelope is corrupt on disk; refusing to "
                         "overwrite.  Inspect workstream_config.tasks manually "
                         "or clear it before retrying."
                     )
                 }
-            if len(envelope["tasks"]) >= _TASK_LIST_MAX:
+            if len(envelope["tasks"]) >= _TASKS_MAX:
                 return {
                     "error": (
-                        f"task_list capacity reached ({_TASK_LIST_MAX}).  "
+                        f"tasks capacity reached ({_TASKS_MAX}).  "
                         "Remove completed tasks before adding more."
                     )
                 }
@@ -1097,10 +1266,10 @@ class CoordinatorClient:
                 "updated": now,
             }
             envelope["tasks"].append(task)
-            self._save_task_list(ws_id, envelope)
+            self._save_tasks(ws_id, envelope)
             return task
 
-    def task_list_update(
+    def tasks_update(
         self,
         ws_id: str,
         *,
@@ -1110,13 +1279,13 @@ class CoordinatorClient:
         child_ws_id: str | None = None,
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         if status is not None and status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
-                return {"error": ("task_list envelope is corrupt on disk; refusing to overwrite.")}
+                return {"error": ("tasks envelope is corrupt on disk; refusing to overwrite.")}
             for t in envelope["tasks"]:
                 if t.get("id") == task_id:
                     if title is not None:
@@ -1136,14 +1305,14 @@ class CoordinatorClient:
                     if child_ws_id is not None:
                         t["child_ws_id"] = child_ws_id
                     t["updated"] = _utc_now_iso()
-                    self._save_task_list(ws_id, envelope)
+                    self._save_tasks(ws_id, envelope)
                     # t is a dict pulled out of a json-decoded list; mypy
                     # sees it as Any from the decode path.  Cast back to
                     # the annotated return type.
                     return dict(t)
             return {"error": f"task not found: {task_id}"}
 
-    def task_list_remove(self, ws_id: str, *, task_id: str) -> dict[str, Any]:
+    def tasks_remove(self, ws_id: str, *, task_id: str) -> dict[str, Any]:
         """Remove a task by id.  Returns a result dict shaped like the
         other mutators — the caller can then distinguish scope violation
         vs corrupt envelope vs genuine not-found rather than collapsing
@@ -1151,16 +1320,16 @@ class CoordinatorClient:
         as "task not found" to the coordinator LLM).
         """
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
-                return {"error": ("task_list envelope is corrupt on disk; refusing to overwrite.")}
+                return {"error": ("tasks envelope is corrupt on disk; refusing to overwrite.")}
             before = len(envelope["tasks"])
             envelope["tasks"] = [t for t in envelope["tasks"] if t.get("id") != task_id]
             if len(envelope["tasks"]) == before:
                 return {"error": f"task not found: {task_id}"}
-            self._save_task_list(ws_id, envelope)
+            self._save_tasks(ws_id, envelope)
             return {"ok": True, "task_id": task_id}
 
     def cleanup_dead_task_child_refs(self, ws_id: str) -> int:
@@ -1169,7 +1338,7 @@ class CoordinatorClient:
         links blanked (0 if nothing needed doing, envelope was corrupt,
         or the lookup failed).
 
-        Called by :meth:`CoordinatorManager.close` after the state
+        Called by :meth:`SessionManager.close` after the state
         transition — the task envelope is a per-coordinator planning
         structure, so cross-coord scope guards don't apply the same way
         they do for add/update/remove.  Held under the same per-ws
@@ -1212,7 +1381,7 @@ class CoordinatorClient:
             if not blanked:
                 return 0
             try:
-                self._save_task_list(ws_id, envelope)
+                self._save_tasks(ws_id, envelope)
             except Exception:
                 # Write-side divergence — the task envelope on disk
                 # now disagrees with what the close path intended.
@@ -1228,16 +1397,16 @@ class CoordinatorClient:
                 return 0
             return blanked
 
-    def task_list_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
+    def tasks_reorder(self, ws_id: str, *, task_ids: list[str]) -> dict[str, Any]:
         """Reject unless ``task_ids`` is an exact permutation of the
         current set — prevents silent task loss from a partial reorder.
         """
         if ws_id != self._coord_ws_id:
-            return {"error": f"task_list scope violation: {ws_id}"}
+            return {"error": f"tasks scope violation: {ws_id}"}
         with self._task_lock(ws_id):
             envelope, corrupt = self._load_task_envelope(ws_id)
             if corrupt:
-                return {"error": ("task_list envelope is corrupt on disk; refusing to overwrite.")}
+                return {"error": ("tasks envelope is corrupt on disk; refusing to overwrite.")}
             current = [t.get("id") for t in envelope["tasks"]]
             if set(task_ids) != set(current) or len(task_ids) != len(current):
                 return {
@@ -1248,7 +1417,7 @@ class CoordinatorClient:
                 }
             by_id = {t.get("id"): t for t in envelope["tasks"]}
             envelope["tasks"] = [by_id[tid] for tid in task_ids]
-            self._save_task_list(ws_id, envelope)
+            self._save_tasks(ws_id, envelope)
             return {"ok": True, "order": task_ids}
 
     def inspect(
@@ -1275,7 +1444,13 @@ class CoordinatorClient:
         calls get the trimmed shape.
         """
         full = self._storage.get_workstream(ws_id)
-        miss = {"error": f"workstream not found: {ws_id}", "ws_id": ws_id}
+        # Echoing the ws_id back inside the error STRING was a stylistic
+        # carry-over — the structured ``ws_id`` field already carries
+        # the value the caller asked about.  The bare error message
+        # ("workstream not found") is enough; the same shape is used
+        # for cross-tenant rows so the existence-leak guarantee is
+        # preserved either way.
+        miss = {"error": "workstream not found", "ws_id": ws_id}
         if full is None:
             return miss
         is_self = ws_id == self._coord_ws_id
@@ -1309,8 +1484,9 @@ class CoordinatorClient:
             "verdicts": _serialize_verdicts(verdicts),
         }
         # Surface the operator-supplied close reason (persisted via
-        # workstream_config by the server's close handler).  Only the
-        # terminal-state shapes can carry a close_reason — gating on
+        # workstream_config by the server's close handler) and any
+        # last-error text persisted by the worker-thread error path.
+        # Only the terminal-state shapes can carry these — gating on
         # state avoids a per-inspect DB read on the hot live-child path.
         if full.get("state") in {"closed", "error", "deleted"}:
             try:
@@ -1321,6 +1497,18 @@ class CoordinatorClient:
             close_reason = cfg.get("close_reason")
             if close_reason:
                 result["close_reason"] = close_reason
+            last_error = cfg.get(LAST_ERROR_CONFIG_KEY)
+            if last_error and full.get("state") == "error":
+                # Only attach on error rows — closed/deleted may carry a
+                # historic last_error from a prior failed turn that was
+                # later resolved, and surfacing it would mislead the
+                # coordinator into thinking the close was an error close.
+                # The result key is the public API surface read by the
+                # coord LLM via inspect_workstream — match the storage
+                # key for symmetry, but don't import a constant that
+                # would couple internal storage layout to the model
+                # contract.
+                result["last_error"] = last_error
         live = self._fetch_cluster_live(ws_id)
         if live is not None:
             result["live"] = live
@@ -1461,3 +1649,150 @@ def _serialize_verdicts(rows: list[Any]) -> list[dict[str, Any]]:
             except Exception:
                 out.append({"raw": str(r)})
     return out
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream — last-message extraction
+# ---------------------------------------------------------------------------
+
+
+def _truncate_wait_message(text: str, max_bytes: int) -> tuple[str, bool]:
+    """Cap ``text`` to ``max_bytes`` UTF-8 bytes, truncating from the END.
+
+    Returns ``(text, truncated)``.  Encodes to UTF-8 first so the cap is a
+    real wire-size cap rather than a character-count proxy.  ``errors='ignore'``
+    on the decode silently drops a trailing partial codepoint when the byte
+    cut lands mid-multi-byte-sequence — keeps the truncated string valid
+    UTF-8 (so JSON serialization can't fail) without an explicit boundary
+    walk.
+    """
+    if max_bytes <= 0:
+        return "", bool(text)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
+    """Walk the conversation tail backward and return the most recent
+    assistant message's text content.
+
+    Returns:
+    - The content string when the tail contains an assistant message
+      with a non-empty ``content`` field.
+    - Empty string when no qualifying assistant message exists in the
+      fetched tail (e.g. a workstream that errored before emitting any
+      assistant output, or one whose final assistant turn is buried
+      beyond the tail window).
+    - ``None`` when the storage read itself failed — distinct from the
+      empty-string case so callers can leave ``message: null`` instead
+      of substituting a sentinel.
+
+    The tail load is bounded by ``_WAIT_MESSAGE_TAIL_LIMIT`` so a
+    long-running workstream's full message log never has to be paged
+    in just to surface its final turn.
+    """
+    try:
+        rows = storage.load_messages(ws_id, limit=_WAIT_MESSAGE_TAIL_LIMIT)
+    except Exception:
+        log.debug("coord_client.wait.load_messages_failed ws=%s", ws_id, exc_info=True)
+        return None
+    for msg in reversed(rows):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    return ""
+
+
+def _load_last_error(storage: Any, ws_id: str) -> str:
+    """Return the persisted ``last_error`` for ``ws_id`` or empty string.
+
+    Worker threads write the (sanitized) exception text into
+    ``workstream_config`` when a child enters the ``error`` terminal
+    state (see :func:`turnstone.core.memory.persist_last_error`);
+    reading it back lets ``wait_for_workstream`` and
+    ``inspect_workstream`` surface the actual cause (provider 4xx/5xx
+    after retries, model misconfig, etc.) instead of the assistant-tail
+    sentinel.
+
+    Reads via the per-storage handle the client was constructed with
+    rather than ``turnstone.core.memory.load_last_error`` (which uses
+    the process-global ``get_storage()``) so the wait path participates
+    in the test harness's per-call storage isolation.  Storage failures
+    collapse to empty so the caller can fall through to the existing
+    assistant-tail / sentinel path.
+    """
+    try:
+        cfg = storage.load_workstream_config(ws_id) or {}
+    except Exception:
+        log.debug("coord_client.wait.load_last_error_failed ws=%s", ws_id, exc_info=True)
+        return ""
+    raw = cfg.get(LAST_ERROR_CONFIG_KEY)
+    return str(raw) if raw else ""
+
+
+def _wait_message_for(
+    storage: Any,
+    ws_id: str,
+    state: str,
+    *,
+    max_bytes: int = WAIT_MESSAGE_MAX_BYTES,
+) -> tuple[str | None, bool]:
+    """Return ``(message, truncated)`` for a wait_for_workstream result entry.
+
+    The returned tuple is appended to each per-ws snapshot as
+    ``message`` / ``truncated`` so the coordinator LLM doesn't need a
+    follow-up ``inspect_workstream`` round-trip to read what each child
+    actually produced.
+
+    Branching by ``state``:
+
+    - ``idle`` — last assistant message text from the conversation
+      tail, or a hedged sentinel when the tail has no assistant
+      content (covers both 'never emitted a turn' and 'last turn is
+      buried beyond the tail window' — the sentinel doesn't claim
+      either way).
+    - ``error`` — persisted ``last_error`` (provider exception after
+      retries, model misconfig, etc.) when present, falling back to
+      the assistant tail otherwise.  An API error after retry
+      exhaustion is more actionable than the prior assistant turn,
+      and the prior shape's "(no recent assistant output)" sentinel
+      hid that signal entirely.
+    - ``closed`` / ``denied`` — short status sentinel.  No
+      message-history read because there's nothing meaningful to
+      return — a partial last message could be misleading mid-thought.
+    - any other state (e.g. ``running``, or a ``deleted`` synthetic /
+      legacy row) — ``(None, False)`` so the coordinator sees null
+      inline and knows to keep waiting / inspect explicitly.  Hard
+      deletes cascade rows out of storage, so the wait poll never
+      observes a real ``deleted`` state in normal operation.
+
+    Storage failures during the message read collapse to ``(None, False)``
+    so a transient read error degrades gracefully (the wait itself
+    already completed; the model just gets ``message: null`` for the
+    affected ws and can fall back to inspect).
+    """
+    if state == "denied":
+        return _WAIT_SENTINEL_DENIED, False
+    if state == "closed":
+        return _WAIT_SENTINEL_CLOSED, False
+    if state == "error":
+        last_error = _load_last_error(storage, ws_id)
+        if last_error:
+            return _truncate_wait_message(last_error, max_bytes)
+        # No persisted error — fall through to the assistant-tail walk
+        # below so a legacy / pre-fix error row still surfaces SOMETHING
+        # (the last assistant turn before the failure, if any).
+    if state in ("idle", "error"):
+        text = _last_assistant_text(storage, ws_id)
+        if text is None:
+            return None, False
+        if not text:
+            return _WAIT_SENTINEL_NO_RECENT_ASSISTANT, False
+        return _truncate_wait_message(text, max_bytes)
+    return None, False

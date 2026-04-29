@@ -12,14 +12,34 @@ list differs per file.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from turnstone.console.coordinator import CoordinatorManager
+from turnstone.console.collector import ClusterCollector
+from turnstone.console.coordinator_adapter import CoordinatorAdapter
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.core.auth import AuthResult
+from turnstone.core.session_manager import SessionManager
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+def _seed_children(
+    adapter: CoordinatorAdapter, coord_ws_id: str, child_ws_ids: Iterable[str]
+) -> None:
+    """Seed the coordinator adapter's children registry directly.
+
+    The production path populates the registry via the cluster-event
+    fan-out thread observing ``ws_created`` events. These tests just
+    need a known-children set for the endpoint handlers to iterate —
+    inject directly under ``_children_lock`` rather than spinning up
+    the collector + fan-out plumbing.
+    """
+    with adapter._children_lock:
+        adapter._merge_child_ids_locked(coord_ws_id, child_ws_ids)
 
 
 class _AuthMiddleware(BaseHTTPMiddleware):
@@ -59,17 +79,52 @@ def _fake_registry() -> MagicMock:
     return reg
 
 
-def _build_mgr(storage: Any) -> CoordinatorManager:
-    """Build a CoordinatorManager with stub factories (test default)."""
+def _build_mgr_with_factory(storage: Any, session_factory: Any) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) with a caller-supplied factory.
+
+    Used by tests that need to capture or assert factory kwargs (e.g.
+    per-call ``model`` / ``judge_model`` overrides). Plain :func:`_build_mgr`
+    is the right entry point when the test doesn't care about the
+    factory.
+    """
+    adapter = CoordinatorAdapter(
+        collector=MagicMock(),
+        ui_factory=lambda ws: ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or ""),
+        session_factory=session_factory,
+    )
+    mgr = SessionManager(
+        adapter,
+        storage=storage,
+        max_active=3,
+        node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+        event_emitter=adapter,
+    )
+    adapter.attach(mgr)
+    return mgr
+
+
+def _build_mgr(storage: Any) -> SessionManager:
+    """Build a SessionManager(CoordinatorAdapter) with stub factories (test default)."""
 
     def _sf(ui, model_alias=None, ws_id=None, **kw):  # type: ignore[no-untyped-def]
         s = MagicMock()
         s.send.return_value = None
         return s
 
-    return CoordinatorManager(
-        session_factory=_sf,
-        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
-        storage=storage,
-        max_active=3,
-    )
+    return _build_mgr_with_factory(storage, _sf)
+
+
+class MockStorage:
+    """Minimal storage mock that implements ``list_services``.
+
+    Used by the collector tests + the console route-walk tests. The
+    collector calls ``list_services("turnstone-server", ...)`` to
+    discover nodes; tests that don't care about discovery push an
+    empty list (the default).
+    """
+
+    def __init__(self) -> None:
+        self.services: list[dict[str, str]] = []
+
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
+        return list(self.services)

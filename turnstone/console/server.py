@@ -46,25 +46,45 @@ from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
-    DENY_EMPTY_SUB,
     JWT_AUD_CONSOLE,
     JWT_AUD_SERVER,
     AuthMiddleware,
-    _DenyFilter,
     create_jwt,
     jwt_version_slot,
     require_permission,
 )
 from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_routes import (
+    AttachmentUploadHelpers,
+    CoordOnlyVerbHandlers,
+    SessionEndpointConfig,
+    SharedSessionVerbHandlers,
+    make_approve_handler,
+    make_attachment_handlers,
+    make_cancel_handler,
+    make_close_handler,
+    make_create_handler,
+    make_dequeue_handler,
+    make_detail_handler,
+    make_events_handler,
+    make_history_handler,
+    make_list_handler,
+    make_open_handler,
+    make_saved_handler,
+    make_send_handler,
+    register_coord_verbs,
+    register_session_routes,
+)
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.web_helpers import (
     read_json_or_400,
     require_storage_or_503,
 )
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import Workstream, WorkstreamKind
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable, Iterable
 
     from starlette.requests import Request
 
@@ -122,8 +142,9 @@ def _parse_int(
 # ---------------------------------------------------------------------------
 
 # JS shim injected into proxied HTML when served through the console.
-# Overrides fetch() and EventSource() so root-relative URLs (/v1/api/send etc.)
-# route through the console proxy at /node/{node_id}/v1/api/... instead.
+# Overrides fetch() and EventSource() so root-relative URLs
+# (e.g. /v1/api/workstreams/{ws_id}/send) route through the console
+# proxy at /node/{node_id}/v1/api/... instead.
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx="PREFIX_PLACEHOLDER";
@@ -290,6 +311,7 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
 # module docstring for the canonical action-namespace registry.
 _ROUTE_PROXY_AUDIT_ACTIONS: dict[str, str] = {
     "send": "route.workstream.send",
+    "dequeue": "route.workstream.dequeue",
     "approve": "route.approve",
     "cancel": "route.cancel",
     "command": "route.command",
@@ -439,9 +461,9 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
 
     Sources two lanes and merges by ws_id:
 
-    - **In-memory** via :meth:`CoordinatorManager.list_for_user` /
-      ``list_all`` — carries live session state (model / model_alias /
-      current workstream state) for currently-loaded coordinators.
+    - **In-memory** via :meth:`SessionManager.list_all` — carries live
+      session state (model / model_alias / current workstream state)
+      for currently-loaded coordinators.
     - **Persisted** via ``storage.list_workstreams(kind=COORDINATOR)``
       — includes closed / error / soft-deleted rows the manager has
       evicted from memory.  Without this, closed coordinators
@@ -450,21 +472,15 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     In-memory wins on ws_id conflict so live state stays authoritative
     for active sessions.
 
-    Ownership filter: non-admin callers must not see other tenants'
-    coordinator rows.  Admins (``admin.users`` / ``admin.roles``) get
-    the full set.  Unauthenticated callers shouldn't reach this path
-    — the endpoint sits behind global auth — but the filter defaults
-    to empty on a missing ``user_id`` rather than leaking.
+    Trusted-team visibility (post-#400): the cluster dashboard shows
+    every coordinator regardless of caller identity; ``user_id`` is
+    surfaced on each row as display metadata.
     """
     coord_mgr = getattr(request.app.state, "coord_mgr", None)
     if coord_mgr is None:
         return []
-    filt = _effective_user_filter(request)
-    if filt is DENY_EMPTY_SUB:
-        return []
-    # filt is now ``None`` (admin / service) or a non-empty caller uid.
     try:
-        wss = coord_mgr.list_all() if filt is None else coord_mgr.list_for_user(filt)
+        wss = coord_mgr.list_all()
     except Exception:
         log.debug("cluster_workstreams.coord_list_failed", exc_info=True)
         return []
@@ -501,16 +517,15 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
 
     # Second lane — persisted coordinator rows, used to surface
     # closed / error / deleted coordinators the manager has already
-    # evicted from ``self._workstreams``.  ``filt`` carries the same
-    # tenant decision as the in-memory lane above (None = admin /
-    # service; str = scoped caller).
+    # evicted from ``self._workstreams``.  Cluster-wide (trusted-team
+    # visibility).
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
         return rows
     try:
         persisted = storage.list_workstreams(
             kind=WorkstreamKind.COORDINATOR,
-            user_id=filt,
+            user_id=None,
             limit=200,
         )
     except Exception:
@@ -529,12 +544,6 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         if not row_id or row_id in seen:
             continue
         row_owner = m.get("user_id") or ""
-        # Defense-in-depth empty-string tenancy check.  The SQL user_id
-        # filter above already enforces the match when ``filt`` is set;
-        # drop any rows whose owner still lands empty (migration
-        # artifacts) for non-admin callers.
-        if filt is not None and (not row_owner or row_owner != filt):
-            continue
         rows.append(
             {
                 "id": row_id,
@@ -600,6 +609,19 @@ _CLUSTER_WS_LIVE_KEYS = (
     "model_alias",
     "title",
     "name",
+    # Carries the inline approve/deny payload (items + judge_verdict)
+    # so coord live-bulk callers can render row-level UI without a
+    # per-child round-trip. ``None`` when no approval is pending.
+    # Cross-tenant exposure follows the trusted-team posture documented
+    # on ``SessionUIBase.serialize_pending_approval_detail``.
+    "pending_approval_detail",
+    # Ring buffer of the child's recent auto-approves (last 10) for
+    # the coord-tree's "auto-approved by skill X" pill.  Without this
+    # the operator has no surface to see WHICH tool calls bypassed
+    # the gate or WHY (skill allowlist / blanket / admin policy /
+    # explicit "Always" click) — the SSE ``tool_info`` event fires
+    # only on the per-ws stream the coord doesn't subscribe to.
+    "recent_auto_approvals",
 )
 
 
@@ -710,6 +732,18 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         val = getattr(obj, name, "") if obj else ""
         return val if isinstance(val, str) else ""
 
+    # Coord rows synthesize the same ``pending_approval_detail`` shape
+    # the node-side dashboard produces — single source of truth via
+    # ``SessionUIBase.serialize_pending_approval_detail``. The console
+    # coord LLM judge isn't wired today (``coordinator_ui.py:138``
+    # hardcodes ``judge_pending=False``), so ``judge_verdict`` will
+    # always be ``None`` for these rows; the coord-self stretch in
+    # the plan covers that follow-up. ``ui`` may be ``None`` in
+    # transient states (newly-created ws before activation); every
+    # active coord UI is a ``SessionUIBase`` and supports the method.
+    pending_approval_detail = ui.serialize_pending_approval_detail() if ui is not None else None
+    recent_auto_approvals = ui.serialize_recent_auto_approvals() if ui is not None else []
+
     return {
         "state": ws.state.value if hasattr(ws.state, "value") else str(ws.state),
         "tokens": 0,
@@ -722,6 +756,8 @@ def _coordinator_live_snapshot(ws: Any) -> dict[str, Any]:
         "title": "",
         "name": getattr(ws, "name", "") or "",
         "pending_approval": pending_approval,
+        "pending_approval_detail": pending_approval_detail,
+        "recent_auto_approvals": recent_auto_approvals,
     }
 
 
@@ -731,9 +767,10 @@ async def _fetch_live_block(
     """Fetch the per-workstream ``live`` block for cluster-inspect.
 
     For coordinator-hosted workstreams, read live state from the
-    in-process :class:`CoordinatorManager`.  For node-backed
-    workstreams, issue a short-timeout HTTP GET against the owning
-    node's ``/v1/api/dashboard`` and project the matching entry.
+    in-process :class:`SessionManager` (coordinator kind).  For
+    node-backed workstreams, issue a short-timeout HTTP GET against
+    the owning node's ``/v1/api/dashboard`` and project the matching
+    entry.
 
     Always returns ``None`` on coordinator-not-loaded, node unreachable,
     wrong status, un-parseable payload, or no matching entry — the
@@ -746,9 +783,9 @@ async def _fetch_live_block(
 
     # Kind is the authoritative discriminator; the `"console"` node_id
     # sentinel is paired with coordinator rows only (see
-    # ``CoordinatorManager.NODE_ID``).  Branching purely on kind avoids
-    # a subtle collision if a real node ever registers with
-    # ``node_id="console"``.
+    # ``ClusterCollector.CONSOLE_PSEUDO_NODE_ID``).  Branching purely
+    # on kind avoids a subtle collision if a real node ever registers
+    # with ``node_id="console"``.
     if row_kind == WorkstreamKind.COORDINATOR:
         coord_mgr = getattr(request.app.state, "coord_mgr", None)
         if coord_mgr is None:
@@ -803,7 +840,7 @@ async def _fetch_live_block(
     if payload is None:
         return None
     for entry in payload.get("workstreams", []) or []:
-        if isinstance(entry, dict) and entry.get("id") == ws_id:
+        if isinstance(entry, dict) and entry.get("ws_id") == ws_id:
             live = {k: entry.get(k) for k in _CLUSTER_WS_LIVE_KEYS if k in entry}
             # Derived field — kept in lockstep with
             # _coordinator_live_snapshot so both origins produce the
@@ -818,7 +855,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
 
     Gated on ``admin.cluster.inspect``.  Aggregates the workstream's stored
     row with its live state from the owning node's ``/v1/api/dashboard``
-    (for node-backed workstreams) or the in-process :class:`CoordinatorManager`
+    (for node-backed workstreams) or the in-process :class:`SessionManager`
     (for ``kind="coordinator"`` rows).
 
     Behavior:
@@ -831,7 +868,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
       ``live=null`` rather than an error status.
     - ``messages`` — tail-N conversation messages, default 20, capped at 200.
 
-    404 masks ownership failures (match ``coordinator_detail``).
+    404 masks ownership failures (match :func:`make_detail_handler`).
     Correlation-id masks unexpected exceptions in the merge path.
     """
     from turnstone.core.auth import require_permission
@@ -849,7 +886,7 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid ws_id"}, status_code=400)
 
     # Accept either ``?limit=`` (the canonical name used by
-    # coordinator_history and the list_workstreams tool) or the
+    # the lifted history factory and the list_workstreams tool) or the
     # transitional ``?message_limit=`` from earlier phase-3 drafts.
     # ``?limit`` wins when both are set so callers migrating from the
     # older name can overlap without surprise.
@@ -888,15 +925,6 @@ async def cluster_ws_detail(request: Request) -> JSONResponse:
 
     if row is None:
         return JSONResponse({"error": "workstream not found"}, status_code=404)
-
-    user_id = _auth_user_id(request)
-    err404 = _check_row_owner_or_404(
-        request,
-        row.get("user_id") or "",
-        user_id,
-    )
-    if err404 is not None:
-        return err404
 
     try:
         live = await _fetch_live_block(request, row, ws_id)
@@ -986,14 +1014,6 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     if not cleaned:
         return JSONResponse({"results": {}, "denied": [], "truncated": False})
 
-    filt = _effective_user_filter(request)
-    if filt is DENY_EMPTY_SUB:
-        # Non-admin, non-service caller with a blank sub — every row
-        # is denied by the empty-string rule.  Skip the batch fetch
-        # entirely and route all ids to ``denied`` (no existence
-        # oracle).
-        return JSONResponse({"results": {}, "denied": cleaned, "truncated": truncated})
-
     try:
         rows = await asyncio.to_thread(storage.get_workstreams_batch, cleaned)
     except Exception:
@@ -1015,14 +1035,9 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     for wid in cleaned:
         row = rows.get(wid)
         if row is None:
-            denied.append(wid)
-            continue
-        # Tenant check — admin / service (``filt is None``) sees all
-        # rows; scoped callers (``filt`` is a uid) see only matching
-        # rows.  An orphan / migration-artifact row with ``user_id=""``
-        # is denied for scoped callers by the ``not row_owner`` guard.
-        row_owner = row.get("user_id") or ""
-        if filt is not None and (not row_owner or row_owner != filt):
+            # Missing rows route to ``denied`` rather than ``results``
+            # so the endpoint can't be used as an existence oracle for
+            # ids outside the caller's knowledge.
             denied.append(wid)
             continue
         owned_rows.append((wid, row))
@@ -1195,6 +1210,17 @@ async def auth_whoami(request: Request) -> Response:
     from turnstone.core.auth import handle_auth_whoami
 
     return await handle_auth_whoami(request)
+
+
+async def auth_refresh(request: Request) -> Response:
+    """POST /v1/api/auth/refresh — extend the auth cookie's expiry.
+
+    Requires a currently-valid cookie (auth middleware enforces).  Re-
+    resolves user permissions from storage so role changes propagate.
+    """
+    from turnstone.core.auth import handle_auth_refresh
+
+    return await handle_auth_refresh(request, JWT_AUD_CONSOLE)
 
 
 async def oidc_authorize(request: Request) -> Response:
@@ -1791,12 +1817,19 @@ async def route_attachment_proxy(request: Request) -> Response:
 
 
 async def route_proxy(request: Request) -> Response:
-    """Generic routing proxy for send/approve/cancel/command/close."""
+    """Generic routing proxy for send/approve/cancel/command/close.
+
+    Path-keyed shape: ``POST/DELETE /v1/api/route/workstreams/{ws_id}/<verb>``
+    (or ``POST /v1/api/route/<verb>`` for the body-keyed plan/command
+    legacies still in scope). ``verb`` drives the audit action lookup;
+    DELETE on ``/send`` is treated as dequeue for audit attribution.
+    """
     t0 = time.monotonic()
-    # Extract method name from path: /v1/api/route/send -> "send"
-    method = request.url.path.rsplit("/", 1)[-1]
-    if method == "close":
-        method = "close"  # /route/workstreams/close
+    # Extract verb name from URL tail: /v1/api/route/.../send -> "send".
+    # DELETE on /send is the dequeue path — audit attribution diverges.
+    verb = request.url.path.rsplit("/", 1)[-1]
+    if verb == "send" and request.method == "DELETE":
+        verb = "dequeue"
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
     if not ring_ready:
@@ -1806,7 +1839,7 @@ async def route_proxy(request: Request) -> Response:
         if not ring_ready:
             return _record_route(
                 request,
-                method,
+                verb,
                 503,
                 t0,
                 JSONResponse(
@@ -1821,7 +1854,7 @@ async def route_proxy(request: Request) -> Response:
     except Exception:
         return _record_route(
             request,
-            method,
+            verb,
             400,
             t0,
             JSONResponse(
@@ -1830,11 +1863,14 @@ async def route_proxy(request: Request) -> Response:
             ),
         )
 
-    ws_id = body.get("ws_id", "")
+    # Path-keyed shape (post-1.5) carries ws_id in the URL; the
+    # legacy plan/command routes still mount at body-keyed URLs and
+    # supply ws_id via the JSON body. Try path first, fall back to body.
+    ws_id = request.path_params.get("ws_id", "") or str(body.get("ws_id") or "")
     if not ws_id:
         return _record_route(
             request,
-            method,
+            verb,
             400,
             t0,
             JSONResponse(
@@ -1847,7 +1883,7 @@ async def route_proxy(request: Request) -> Response:
     except (NoAvailableNodeError, ValueError):
         return _record_route(
             request,
-            method,
+            verb,
             503,
             t0,
             JSONResponse(
@@ -1862,12 +1898,15 @@ async def route_proxy(request: Request) -> Response:
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
+    http_method = request.method
     try:
-        resp = await client.post(f"{ref.url}{upstream_path}", json=body, headers=headers)
+        resp = await client.request(
+            http_method, f"{ref.url}{upstream_path}", json=body, headers=headers
+        )
     except httpx.HTTPError:
         return _record_route(
             request,
-            method,
+            verb,
             502,
             t0,
             JSONResponse(
@@ -1894,13 +1933,16 @@ async def route_proxy(request: Request) -> Response:
             new_ref = ref
         if new_ref.node_id != ref.node_id:
             try:
-                resp = await client.post(
-                    f"{new_ref.url}{upstream_path}", json=body, headers=headers
+                resp = await client.request(
+                    http_method,
+                    f"{new_ref.url}{upstream_path}",
+                    json=body,
+                    headers=headers,
                 )
             except httpx.HTTPError:
                 return _record_route(
                     request,
-                    method,
+                    verb,
                     502,
                     t0,
                     JSONResponse(
@@ -1911,12 +1953,12 @@ async def route_proxy(request: Request) -> Response:
             ref = new_ref  # retried node — used for audit attribution (only emits on 2xx via the next block).
 
     if 200 <= resp.status_code < 300:
-        action = _ROUTE_PROXY_AUDIT_ACTIONS.get(method)
+        action = _ROUTE_PROXY_AUDIT_ACTIONS.get(verb)
         if action:
             _emit_route_audit(request, action, ws_id, ref.node_id)
     return _record_route(
         request,
-        method,
+        verb,
         resp.status_code,
         t0,
         Response(
@@ -2188,9 +2230,30 @@ async def proxy_api(request: Request) -> Response:
     if request.url.path.startswith(f"/node/{safe_node}/v1/api/"):
         api_prefix = "v1/api"
 
-    # SSE detection: GET requests to events endpoints
-    if request.method == "GET" and path in ("events", "events/global"):
-        return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
+    # SSE detection: GET requests to events endpoints. The bare
+    # ``events`` / ``events/global`` paths are the legacy / global
+    # streams; ``workstreams/{ws_id}/events`` is the per-workstream
+    # stream the interactive WebUI subscribes to. Without matching
+    # the per-ws shape, the EventSource API can't consume the
+    # response (gets a one-shot GET instead of text/event-stream)
+    # and Firefox surfaces it as "can't establish a connection".
+    is_sse = path in ("events", "events/global") or (
+        path.startswith("workstreams/") and path.endswith("/events")
+    )
+    if request.method == "GET" and is_sse:
+        # ``events/global`` requires service scope on the upstream
+        # (carries cluster-wide cross-tenant inventory by design);
+        # end-user JWTs don't have it, so proxy as the console's
+        # service identity instead. Per-ws + bare events stay on
+        # the user's identity for upstream audit attribution.
+        use_service = path == "events/global"
+        return await _proxy_sse(
+            request,
+            server_url,
+            path,
+            api_prefix=api_prefix,
+            use_service_auth=use_service,
+        )
 
     if request.method in ("POST", "PUT", "DELETE"):
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
@@ -2256,19 +2319,54 @@ async def _proxy_post(
 
 
 async def _proxy_sse(
-    request: Request, server_url: str, path: str, *, api_prefix: str = "api"
+    request: Request,
+    server_url: str,
+    path: str,
+    *,
+    api_prefix: str = "api",
+    use_service_auth: bool = False,
 ) -> Response:
     """Proxy an SSE stream from the target server to the browser.
 
     Relays raw bytes verbatim so server-side ping comments, event framing,
     and keepalives all pass through unchanged.
+
+    ``use_service_auth=True`` swaps the user's re-minted JWT for the
+    console's service token. The ``events/global`` upstream
+    (``server.py``'s ``global_events_sse``) requires ``service`` scope
+    by design — end-user JWTs lack it, so a user-scoped proxy call
+    would 403-loop forever as the browser's EventSource auto-retries.
+    Treating it as a service-to-service call mirrors how the cluster
+    collector itself subscribes; the user identity stays with the
+    console-side gate (the ``/node/{node_id}/v1/api/`` route is
+    already gated by the console's ``AuthMiddleware``).
     """
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
 
     sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
-    sse_auth = _proxy_auth_headers(request)
+    sse_auth: dict[str, str]
+    if use_service_auth:
+        proxy_token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
+        if proxy_token_mgr is None:
+            # Fail fast on misconfig — without a service token the
+            # upstream 401/403s on every request and the browser's
+            # EventSource auto-retries forever, filling logs.
+            # Surface as 503 so the operator sees a single clear
+            # signal instead of a retry storm.
+            log.error(
+                "proxy.sse.no_service_token url=%s — proxy_token_mgr "
+                "not configured; events/global proxy unavailable",
+                target,
+            )
+            return JSONResponse(
+                {"error": "console service token unavailable"},
+                status_code=503,
+            )
+        sse_auth = dict(proxy_token_mgr.bearer_header)
+    else:
+        sse_auth = _proxy_auth_headers(request)
 
     async def raw_stream() -> AsyncGenerator[bytes, None]:
         try:
@@ -2313,7 +2411,10 @@ async def _proxy_sse(
 
 
 # ---------------------------------------------------------------------------
-# Coordinator workstream endpoints — POST /v1/api/coordinator/*
+# Coordinator workstream endpoints — mounted under /v1/api/workstreams/*
+# via register_session_routes + register_coord_verbs. Handler bodies stay
+# named ``coordinator_*`` for now; the body-convergence follow-on lifts
+# them into turnstone.core.session_routes with kind branching.
 # ---------------------------------------------------------------------------
 
 
@@ -2382,28 +2483,6 @@ def _require_admin_coordinator(
     )
 
 
-def _check_row_owner_or_404(
-    request: Request,
-    row_owner: str,
-    user_id: str,
-    *,
-    error_msg: str = "workstream not found",
-) -> JSONResponse | None:
-    """Ownership gate with the empty-string defense.
-
-    Non-admin callers need BOTH ``user_id`` and ``row_owner`` to be
-    non-empty AND equal.  Either side being empty is a 404 — otherwise
-    an orphan / migration-artifact / system-owned row with
-    ``user_id=""`` would leak to a (hypothetical) caller whose JWT
-    carries an empty ``sub`` claim.  Admin bypass honoured.
-    """
-    if _is_admin(request):
-        return None
-    if not user_id or not row_owner or row_owner != user_id:
-        return JSONResponse({"error": error_msg}, status_code=404)
-    return None
-
-
 def _resolve_coordinator_or_404(
     request: Request,
     coord_mgr: Any,
@@ -2411,21 +2490,24 @@ def _resolve_coordinator_or_404(
     ws_id: str,
     user_id: str,
 ) -> tuple[Any, JSONResponse | None]:
-    """Resolve a coordinator workstream and check ownership.
+    """Resolve a coordinator workstream by id.
 
     Returns ``(ws, None)`` on success — ``ws`` is the in-memory
     ``Workstream`` when present, ``None`` when the coordinator is
     persisted but not loaded (callers may then fall through to
     ``storage`` directly or trigger lazy rehydration).  Returns
-    ``(None, 404)`` on missing row / wrong kind / storage unavailable
-    / ownership mismatch.
+    ``(None, 404)`` on missing row / wrong kind / storage unavailable.
 
     Centralises the manager-first, storage-fallback, 404-mask ladder
-    previously duplicated across ``coordinator_children`` /
-    ``coordinator_tasks`` / ``coordinator_history``.  Ownership uses
-    :func:`_check_row_owner_or_404` so the empty-string defense
-    applies uniformly.
+    used by the coord-only verbs (``coordinator_children`` /
+    ``coordinator_tasks``).  The shared verbs (history, detail, ...)
+    inline the same ladder via :func:`make_history_handler` /
+    :func:`make_detail_handler`.  Turnstone is a
+    trusted-team tool — ``user_id`` is metadata, not an access
+    boundary, so this helper no longer gates on row ownership; scope
+    auth (``admin.coordinator``) upstream is the gate.
     """
+    del user_id  # retained in signature for caller-site clarity; not consulted here
     miss = JSONResponse({"error": "coordinator not found"}, status_code=404)
     ws = coord_mgr.get(ws_id) if coord_mgr is not None else None
     if ws is None:
@@ -2438,29 +2520,20 @@ def _resolve_coordinator_or_404(
             return None, miss
         if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
             return None, miss
-        err = _check_row_owner_or_404(
-            request,
-            row.get("user_id") or "",
-            user_id,
-            error_msg="coordinator not found",
-        )
-        if err is not None:
-            return None, err
         return None, None
-    err = _check_row_owner_or_404(
-        request,
-        ws.user_id or "",
-        user_id,
-        error_msg="coordinator not found",
-    )
-    if err is not None:
-        return None, err
     return ws, None
 
 
 def _auth_user_id(request: Request) -> str:
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    return getattr(auth, "user_id", "") or ""
+    """Thin shim over :func:`turnstone.core.web_helpers.auth_user_id`.
+
+    Kept as a module-level alias so existing call sites don't need a
+    sweeping rename; the lifted helper is the canonical version
+    (shared with the node side since P1.5).
+    """
+    from turnstone.core.web_helpers import auth_user_id
+
+    return auth_user_id(request)
 
 
 def _auth_scopes(request: Request) -> set[str]:
@@ -2468,388 +2541,311 @@ def _auth_scopes(request: Request) -> set[str]:
     return set(getattr(auth, "scopes", []) or [])
 
 
-def _is_admin(request: Request) -> bool:
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    perms: frozenset[str] = getattr(auth, "permissions", frozenset())
-    return "admin.users" in perms or "admin.roles" in perms
+def _audit_close_coordinator(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — coord audit detail doesn't use it yet
+    reason: str,  # noqa: ARG001 — coord doesn't expose close_reason yet
+) -> None:
+    """Record the ``coordinator.close`` audit event.
 
-
-def _effective_user_filter(request: Request) -> str | None | _DenyFilter:
-    """Resolve the effective ``user_id`` filter for a tenant-scoped aggregate.
-
-    Returns one of:
-
-    - ``None`` — admin (``admin.users`` / ``admin.roles``) or
-      service-scoped caller; no tenant filter — storage helpers see
-      cluster-wide rows.
-    - ``str`` — non-admin, non-service caller with a resolved uid;
-      storage helpers MUST receive ``user_id=<uid>`` and push the
-      filter into SQL.
-    - :data:`DENY_EMPTY_SUB` — non-admin, non-service caller whose
-      ``sub`` claim is blank.  Callers MUST short-circuit with their
-      endpoint's empty-shape response; passing ``None`` through to
-      storage would be a service-escape and passing ``""`` would
-      accidentally match legacy orphan rows with empty ``user_id``.
-
-    .. note::
-       The service-scope bypass is end-to-end only on endpoints that
-       do NOT first gate on :func:`_check_row_owner_or_404` (which
-       currently bypasses for ``admin.*`` permissions but not for
-       service scope).  A service-scoped non-admin caller to
-       ``coordinator_children`` / ``coordinator_metrics`` is 404'd
-       before the filter runs; the bypass there is reachable only by
-       admin callers.  ``_coordinator_rows`` and
-       ``cluster_ws_live_bulk`` honour the full three-way return.
-
-    See the class-level tenancy contract on
-    :class:`~turnstone.core.storage._protocol.StorageBackend` for the
-    storage-side requirement.
+    Passed to :func:`make_close_handler` as the ``audit_emit``
+    callable. ``storage`` is guaranteed non-``None`` by the lifted
+    handler's upstream gate; the ``getattr`` fallback is defensive
+    consistency with the rest of the storage access pattern.
     """
-    if _is_admin(request):
-        return None
-    if "service" in _auth_scopes(request):
-        return None
-    uid = _auth_user_id(request)
-    if not uid:
-        return DENY_EMPTY_SUB
-    return uid
-
-
-async def coordinator_create(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/new — create a new coordinator session."""
-    from turnstone.core.audit import record_audit
-    from turnstone.core.web_helpers import read_json_or_400
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    user_id = _auth_user_id(request)
-    if not user_id:
-        return JSONResponse({"error": "authentication required"}, status_code=401)
-    name = (body.get("name") or "").strip()
-    skill = (body.get("skill") or "").strip() or None
-    initial_message = (body.get("initial_message") or "").strip()
-    try:
-        # Offload to a worker thread — coord_mgr.create runs blocking
-        # storage calls (register_workstream, get_skill_by_name,
-        # count_skill_versions) and the session-factory invocation.
-        # Running inline on the async event loop stalled the SSE
-        # manager + every other async handler for the duration of the
-        # create (#perf-4).
-        ws = await asyncio.to_thread(
-            coord_mgr.create,
-            user_id=user_id,
-            name=name,
-            skill=skill,
-            initial_message=initial_message,
-        )
-    except RuntimeError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=429)
-    except ValueError as exc:
-        # Session factory raises ValueError on misconfigured alias —
-        # surface as 503 with the factory's remediation text.
-        return JSONResponse({"error": str(exc)}, status_code=503)
-    except Exception:
-        # Don't echo the exception text to the caller — it can leak
-        # internals (stack frame names, file paths, etc.).  Log with a
-        # short correlation id and return that to the client so support
-        # can match a user report to the log line.
-        correlation_id = secrets.token_hex(4)
-        log.warning(
-            "coordinator_create.failed correlation_id=%s",
-            correlation_id,
-            exc_info=True,
-        )
-        return JSONResponse(
-            {
-                "error": (
-                    "failed to create coordinator (internal error). "
-                    f"correlation_id={correlation_id}"
-                )
-            },
-            status_code=500,
-        )
     storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None:
-        try:
-            record_audit(
-                storage,
-                user_id,
-                "coordinator.create",
-                "workstream",
-                ws.id,
-                {"coord_ws_id": ws.id, "src": "coordinator", "name": ws.name},
-                request.client.host if request.client else "",
-            )
-        except Exception:
-            log.debug("coordinator_create.audit_failed", exc_info=True)
-    return JSONResponse({"ws_id": ws.id, "name": ws.name}, status_code=201)
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "coordinator.close",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator"},
+        request.client.host if request.client else "",
+    )
 
 
-async def coordinator_send(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/send — queue a user message."""
-    from turnstone.core.web_helpers import read_json_or_400
+def _audit_cancel_coordinator(
+    request: Request,
+    ws_id: str,
+    ws_before: Workstream,  # noqa: ARG001 — coord audit detail doesn't use it yet
+    force: bool,
+) -> None:
+    """Record the ``coordinator.cancel`` audit event.
 
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    message = (body.get("message") or "").strip()
-    if not message:
-        return JSONResponse({"error": "message is required"}, status_code=400)
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality (not short-circuit on empty ws.user_id) —
-        # empty-owner rows would otherwise leak ws_id/state/history
-        # across tenants to anyone with admin.coordinator.  404 (not
-        # 403) to avoid leaking existence.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if not coord_mgr.send(ws_id, message):
-        # Distinguish "worker busy + queue full" from "ws not loaded".
-        # If ws is loaded and session exists, the worker queue is full —
-        # tell the client to back off rather than retry blindly.
-        ws_now = coord_mgr.get(ws_id)
-        if ws_now is not None and ws_now.session is not None:
-            return JSONResponse({"error": "worker queue full; retry shortly"}, status_code=429)
-        return JSONResponse({"error": "send failed"}, status_code=500)
-    return JSONResponse({"status": "ok"})
-
-
-async def coordinator_approve(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/approve — unblock pending approval."""
-    from turnstone.core.web_helpers import read_json_or_400
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    approved = bool(body.get("approved", False))
-    feedback = body.get("feedback")
-    always = bool(body.get("always", False))
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    ui = ws.ui
-    if ui is None or not hasattr(ui, "resolve_approval"):
-        return JSONResponse(
-            {"error": "coordinator UI does not support approval"},
-            status_code=409,
-        )
-    if always and approved and getattr(ui, "_pending_approval", None):
-        tool_names = {
-            it.get("approval_label", "") or it.get("func_name", "")
-            for it in ui._pending_approval.get("items", [])
-            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-        }
-        tool_names.discard("")
-        ui.auto_approve_tools.update(tool_names)
-    ui.resolve_approval(approved, feedback)
-    return JSONResponse({"status": "ok"})
-
-
-async def coordinator_cancel(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/cancel — cancel in-flight generation."""
-    from turnstone.core.audit import record_audit
-
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    coord_mgr.cancel(ws_id)
+    Passed to :func:`make_cancel_handler` as the ``audit_emit``
+    callable. Mirrors :func:`_audit_close_coordinator`. The ``force``
+    flag rides into the audit detail so an operator-driven recovery
+    is distinguishable from a routine cancel.
+    """
     storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None:
-        try:
-            record_audit(
-                storage,
-                user_id,
-                "coordinator.cancel",
-                "workstream",
-                ws_id,
-                {"coord_ws_id": ws_id, "src": "coordinator"},
-                request.client.host if request.client else "",
-            )
-        except Exception:
-            log.debug("coordinator_cancel.audit_failed", exc_info=True)
-    return JSONResponse({"status": "ok"})
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        _auth_user_id(request),
+        "coordinator.cancel",
+        "workstream",
+        ws_id,
+        {"coord_ws_id": ws_id, "src": "coordinator", "force": force},
+        request.client.host if request.client else "",
+    )
 
 
-async def coordinator_close(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/close — unload the session."""
-    from turnstone.core.audit import record_audit
+def _coord_events_replay(
+    ws: Workstream,
+    ui: Any,
+    request: Request,  # noqa: ARG001 — coord replay doesn't need request context
+) -> Iterable[dict[str, Any]]:
+    """Initial SSE replay payload for coord ``events`` connections.
 
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if not coord_mgr.close(ws_id):
-        return JSONResponse({"error": "close failed"}, status_code=500)
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is not None:
-        try:
-            record_audit(
-                storage,
-                user_id,
-                "coordinator.close",
-                "workstream",
-                ws_id,
-                {"coord_ws_id": ws_id, "src": "coordinator"},
-                request.client.host if request.client else "",
-            )
-        except Exception:
-            log.debug("coordinator_close.audit_failed", exc_info=True)
-    return JSONResponse({"status": "ok"})
+    Yields, in order:
 
+    1. ``connected`` + optional ``status`` via the shared
+       :func:`turnstone.core.session_replay.session_replay_preamble`
+       so the dashboard's status bar populates before any live tick.
+       Same payload shape interactive uses.
+    2. Pending approval prompt (if any) and the cached LLM verdicts
+       that fired since it surfaced.  Without this replay a refresh
+       loses the judge chip on the pending approval until the
+       operator re-invokes the action.
+    3. Pending plan-review (if any).
 
-async def coordinator_events(request: Request) -> Response:
-    """GET /v1/api/coordinator/{ws_id}/events — SSE event stream."""
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    ui = ws.ui
-    if ui is None or not hasattr(ui, "_register_listener"):
-        return JSONResponse({"error": "coordinator has no UI"}, status_code=409)
+    Coord still skips conversation history — the dashboard fetches it
+    via a separate ``GET /history`` endpoint and doesn't want a
+    multi-MB inline replay on every reconnect.
 
-    client_queue = ui._register_listener()
-    # Replay any pending approval so a reconnecting tab sees the prompt.
-    pending = getattr(ui, "_pending_approval", None)
-    if pending is not None:
-        with contextlib.suppress(queue.Full):
-            client_queue.put_nowait(pending)
+    Pure read — never mutates ``ui`` / ``ws`` / ``session``.
+    """
+    yield from session_replay_preamble(ws.session, ui)
+
+    pending_approval = getattr(ui, "_pending_approval", None)
+    if pending_approval is not None:
+        yield pending_approval
+        # Cached LLM verdicts that fired since the approval prompt
+        # — without this replay, a reconnecting / refreshing tab
+        # sees the approve_request prompt but no judge chip, and
+        # since intent_verdict only fires once per call_id (no
+        # push to a late subscriber), the chip would never appear
+        # until the operator re-invokes the action. Mirrors the
+        # interactive path at ``turnstone/server.py:875-878``.
+        llm_verdicts = getattr(ui, "_llm_verdicts", None)
+        ws_lock = getattr(ui, "_ws_lock", None)
+        if llm_verdicts and ws_lock is not None:
+            with ws_lock:
+                cached_verdicts = list(llm_verdicts.values())
+            for v in cached_verdicts:
+                yield {"type": "intent_verdict", **v}
     pending_plan = getattr(ui, "_pending_plan_review", None)
     if pending_plan is not None:
-        with contextlib.suppress(queue.Full):
-            client_queue.put_nowait(pending_plan)
-
-    async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
-        try:
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    event = await asyncio.to_thread(client_queue.get, True, 1.0)
-                    yield {"data": json.dumps(event)}
-                except queue.Empty:
-                    pass  # ping keeps the connection alive
-        finally:
-            ui._unregister_listener(client_queue)
-
-    return EventSourceResponse(event_generator(), ping=5)
+        yield pending_plan
 
 
-async def coordinator_history(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/history — message history for page load.
+async def _coord_create_validate_request(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    uploaded_files: list[tuple[str, str, bytes]],
+) -> JSONResponse | None:
+    """Per-kind pre-create gate for coord.
 
-    Supports a ``?limit=`` query param (default 100, max 500) bounding
-    how many conversation rows are fetched from storage.  Long-lived
-    coordinators can accumulate thousands of messages — the page load
-    only needs the tail.
+    Wired onto :attr:`SessionEndpointConfig.create_validate_request`
+    and called by :func:`make_create_handler` after body parsing
+    but before skill resolution / ``mgr.create``. The single gate is
+    a 401 when the auth result resolved to an empty user id —
+    coord's ``admin.coordinator`` scope check at the
+    ``permission_gate`` is the primary access boundary, but a token
+    that passes the scope check with ``sub=""`` would still land
+    here, and ``mgr.create`` requires a non-empty ``user_id``.
     """
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
+    if not uid:
+        return JSONResponse({"error": "authentication required"}, status_code=401)
+    return None
+
+
+def _coord_create_build_kwargs(
+    request: Request,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    skill_id: str,
+    applied_skill_version: int,
+) -> dict[str, Any]:
+    """Build kwargs for ``coord_mgr.create`` from a parsed coord create body.
+
+    Coord's create still takes a smaller set than interactive's
+    (no ``client_type`` / ``parent_ws_id`` / ``ws_id`` — coord ws_id
+    is always server-generated and coord has no parent), but
+    per-call ``model`` and ``judge_model`` overrides flow through
+    here onto the coord session factory the same way they flow
+    through interactive's: ConfigStore (``coordinator.model_alias``
+    / ``judge.model``) sets the default; this body field overrides
+    for one session.
+    """
+    # Use the canonical skill name from the resolved row when one was
+    # found; falls back to the stripped body value (which is what the
+    # validator already normalised) so the persisted skill name stays
+    # whitespace-clean regardless of how the request shape changes.
+    canonical_skill: str | None
+    if skill_data and skill_data.get("name"):
+        canonical_skill = str(skill_data["name"])
+    else:
+        canonical_skill = (body.get("skill") or "").strip() or None
+    name = (body.get("name") or "").strip()
+    # Empty / non-string / whitespace-only body fields collapse to None
+    # so the factory falls back to ConfigStore defaults rather than
+    # treating "" (or a hostile dict / list) as a request to override
+    # with the empty alias.  The isinstance guard also keeps a
+    # truthy-non-string body (e.g. ``{"model": {"url": "x"}}``) from
+    # reaching ``.strip()`` and crashing into the lifted handler's
+    # generic 500 path.
+    model_raw = body.get("model")
+    judge_raw = body.get("judge_model")
+    model = (model_raw.strip() if isinstance(model_raw, str) else "") or None
+    judge_model = (judge_raw.strip() if isinstance(judge_raw, str) else "") or None
+    return {
+        "user_id": uid,
+        "name": name,
+        "skill": canonical_skill,
+        "skill_id": skill_id,
+        "skill_version": applied_skill_version,
+        "model": model,
+        "judge_model": judge_model,
+    }
+
+
+async def _coord_create_post_install(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+    skill_data: dict[str, Any] | None,
+    applied_skill_version: int,
+    attachment_ids: list[str],
+) -> dict[str, Any]:
+    """Tail end of coord create: dispatch the initial message.
+
+    Wired onto :attr:`SessionEndpointConfig.create_post_install`. When
+    an ``initial_message`` is provided, dispatches via
+    :meth:`CoordinatorAdapter.send`; any uploaded ``attachment_ids``
+    are reserved onto the same ``send_id`` token so the worker's
+    first turn picks them up exactly the way interactive's
+    ``post_install`` worker thread does.
+
+    Returns ``{}`` — coord's response carries only the always-include
+    parity fields populated by the factory.
+    """
+    import uuid as _uuid
+
+    from turnstone.core.attachments import reserve_and_resolve_attachments
+
+    initial_message = (body.get("initial_message") or "").strip()
+    if not initial_message:
+        return {}
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
+    if coord_adapter is None:
+        return {}
+
+    # Mirror interactive's reservation pattern: same send_id token
+    # scopes the soft-lock and the eventual consume. Coord's
+    # ``CoordinatorAdapter.send`` worker passes both through to
+    # ``ChatSession.send(..., send_id=...)``; on worker failure the
+    # adapter's exception path unreserves so the rows return to
+    # pending.
+    send_id = _uuid.uuid4().hex
+    resolved_atts: list[Any] = []
+    if attachment_ids:
+        resolved_atts, _ord, _drop = reserve_and_resolve_attachments(
+            attachment_ids, send_id, ws.id, uid
+        )
+    coord_adapter.send(
+        ws.id,
+        initial_message,
+        attachments=resolved_atts or None,
+        send_id=send_id if resolved_atts else None,
+    )
+    return {}
+
+
+def _audit_coordinator_create(
+    request: Request,
+    ws: Workstream,
+    body: dict[str, Any],
+    uid: str,
+) -> None:
+    """Audit emitter for the coord ``coordinator.create`` event.
+
+    Wired onto :func:`make_create_handler` as ``audit_emit``. Failures
+    are caught + logged at ``warning`` by the factory.
+    """
+    from turnstone.core.audit import record_audit
+
     storage = getattr(request.app.state, "auth_storage", None)
-    _ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
-    if err404 is not None:
-        return err404
-
-    try:
-        limit = int(request.query_params.get("limit", "100"))
-    except (TypeError, ValueError):
-        limit = 100
-    limit = max(1, min(limit, 500))
-
-    messages: list[dict[str, Any]] = []
-    if storage is not None:
-        try:
-            messages = storage.load_messages(ws_id, limit=limit)
-        except Exception:
-            log.debug("coordinator_history.load_failed ws=%s", ws_id[:8], exc_info=True)
-    return JSONResponse({"ws_id": ws_id, "messages": messages})
+    if storage is None:
+        return
+    record_audit(
+        storage,
+        uid,
+        "coordinator.create",
+        "workstream",
+        ws.id,
+        {"coord_ws_id": ws.id, "src": "coordinator", "name": ws.name},
+        request.client.host if request.client else "",
+    )
 
 
-async def coordinator_list(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator — list active coordinator sessions for the caller."""
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    user_id = _auth_user_id(request)
-    rows = coord_mgr.list_all() if _is_admin(request) else coord_mgr.list_for_user(user_id)
-    return JSONResponse(
-        {
-            "coordinators": [
-                {
-                    "ws_id": r.id,
-                    "name": r.name,
-                    "state": r.state.value,
-                    "user_id": r.user_id,
-                }
-                for r in rows
-            ]
-        }
+def _coord_spawn_metrics(_request: Request, ui: Any) -> None:
+    """Per-spawn counter writes for coord — mirrors interactive's pattern.
+
+    Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments
+    ``_ws_messages`` and resets ``_ws_turn_tool_calls`` so the rich
+    ``ws_state`` cluster broadcast renders the same per-turn shape
+    coord rows on the dashboard need. Console-side Prometheus runs
+    through :class:`ConsoleMetrics` (lighter than the per-node collector
+    — judge verdicts and routing/membership only); the interactive
+    analog ``_metrics.record_message_sent()`` has no console counterpart
+    yet, so this hook only owns the per-UI counter writes.
+    """
+    if (
+        hasattr(ui, "_ws_lock")
+        and hasattr(ui, "_ws_messages")
+        and hasattr(ui, "_ws_turn_tool_calls")
+    ):
+        with ui._ws_lock:
+            ui._ws_messages += 1
+            ui._ws_turn_tool_calls = 0
+
+
+async def _coord_saved_loaded_lookup(request: Request) -> set[str]:
+    """Return ws_ids currently held in ``coord_mgr``'s warm pool.
+
+    Wired onto :attr:`SessionEndpointConfig.saved_loaded_lookup`.
+    Defence-in-depth filter for the saved-coordinators list — a row
+    can be ``state='closed'`` on disk for a few seconds while the
+    close-emit sequence races the in-memory pop, and we don't want
+    the saved card grid showing a coord that's still loaded.
+
+    Empty set when ``coord_mgr`` isn't attached (subsystem unavailable)
+    or empty (zero-element snapshot — skip the executor hop too).
+    Errors are swallowed by the lifted body's outer ``try/except``;
+    returning ``set()`` here on a missing manager keeps the caller
+    happy without trampling the lifted body's error log.
+    """
+    coord_mgr = getattr(request.app.state, "coord_mgr", None)
+    if coord_mgr is None:
+        return set()
+    # Cheap probe: an empty pool can answer without paying the
+    # ``asyncio.to_thread`` round-trip. ``count`` reads under the
+    # manager lock but doesn't block; if the manager isn't empty we
+    # still need ``list_all`` under to_thread because the snapshot
+    # itself acquires the same lock.
+    if coord_mgr.count == 0:
+        return set()
+    return await asyncio.to_thread(
+        lambda: {ws.id for ws in coord_mgr.list_all()},
     )
 
 
@@ -2876,114 +2872,6 @@ async def coordinator_page(request: Request) -> Response:
     # to HTML-escape; leave the replacement simple.
     body = body.replace("{{WS_ID}}", ws_id)
     return Response(body, media_type="text/html; charset=utf-8")
-
-
-async def coordinator_detail(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id} — detail + lazy rehydrate on miss."""
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is None:
-        # Lazy rehydration goes through the session factory, which can
-        # raise the same exceptions coordinator_create handles — match
-        # the correlation-id mask so stack traces don't leak through
-        # the detail endpoint either.
-        try:
-            ws = (
-                coord_mgr.open_admin(ws_id)
-                if _is_admin(request)
-                else coord_mgr.open(ws_id, user_id)
-            )
-        except ValueError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=503)
-        except Exception:
-            correlation_id = secrets.token_hex(4)
-            log.warning(
-                "coordinator_detail.rehydrate_failed correlation_id=%s ws_id=%s",
-                correlation_id,
-                ws_id[:8],
-                exc_info=True,
-            )
-            return JSONResponse(
-                {
-                    "error": (
-                        "failed to rehydrate coordinator (internal error). "
-                        f"correlation_id={correlation_id}"
-                    )
-                },
-                status_code=500,
-            )
-        if ws is None:
-            return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        # Strict equality — empty-owner rows must not leak across tenants.
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    return JSONResponse(
-        {
-            "ws_id": ws.id,
-            "name": ws.name,
-            "state": ws.state.value,
-            "user_id": ws.user_id,
-            "kind": ws.kind,
-        }
-    )
-
-
-async def coordinator_open(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/open — explicit rehydration.
-
-    Parity with the server's ``POST /v1/api/workstreams/{ws_id}/open``.
-    ``coordinator_detail`` already rehydrates lazily on a GET miss; this
-    endpoint gives SDK callers and operators a way to warm a coordinator
-    without browsing to it.  Same ownership / 404-on-mismatch /
-    correlation-id-masked error semantics as ``coordinator_detail``.
-    """
-    err = _require_admin_coordinator(request)
-    if err is not None:
-        return err
-    coord_mgr, err503 = _require_coord_mgr(request)
-    if err503 is not None:
-        return err503
-    ws_id = request.path_params.get("ws_id", "")
-    if not ws_id:
-        return JSONResponse({"error": "ws_id is required"}, status_code=400)
-    user_id = _auth_user_id(request)
-    ws = coord_mgr.get(ws_id)
-    if ws is not None:
-        if ws.user_id != user_id and not _is_admin(request):
-            return JSONResponse({"error": "coordinator not found"}, status_code=404)
-        return JSONResponse({"ws_id": ws.id, "name": ws.name, "already_loaded": True})
-    try:
-        ws = coord_mgr.open_admin(ws_id) if _is_admin(request) else coord_mgr.open(ws_id, user_id)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=503)
-    except Exception:
-        correlation_id = secrets.token_hex(4)
-        log.warning(
-            "coordinator_open.rehydrate_failed correlation_id=%s ws_id=%s",
-            correlation_id,
-            ws_id[:8],
-            exc_info=True,
-        )
-        return JSONResponse(
-            {
-                "error": (
-                    f"failed to open coordinator (internal error). correlation_id={correlation_id}"
-                )
-            },
-            status_code=500,
-        )
-    if ws is None:
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    if ws.user_id != user_id and not _is_admin(request):
-        return JSONResponse({"error": "coordinator not found"}, status_code=404)
-    return JSONResponse({"ws_id": ws.id, "name": ws.name})
 
 
 _CHILDREN_PAGE_LIMIT = 200
@@ -3026,7 +2914,7 @@ def _coord_children_row(row: Any) -> dict[str, Any]:
 
 
 async def coordinator_children(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/children — list direct children.
+    """GET /v1/api/workstreams/{ws_id}/children — list direct children.
 
     Returns ``{items, truncated}`` with one row per interactive workstream
     whose ``parent_ws_id`` is the coordinator.  Matches the shape of the
@@ -3034,7 +2922,7 @@ async def coordinator_children(request: Request) -> JSONResponse:
     the same rows.
 
     Same ownership / 404-on-mismatch / admin-bypass semantics as
-    ``coordinator_detail``.  Reads don't audit.
+    :func:`make_detail_handler`.  Reads don't audit.
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -3056,21 +2944,15 @@ async def coordinator_children(request: Request) -> JSONResponse:
     if err404 is not None:
         return err404
 
-    # Tenant filter: push the caller's user_id into SQL so forged /
-    # migration-era rows with the same parent_ws_id but a different
-    # owner can't leak through.  Admins / service scope bypass the
-    # filter (they're expected to see the full subtree).  The prior
-    # _resolve_coordinator_or_404 already rejected non-admin callers
-    # with a blank sub, so DENY here is defense-in-depth.
-    filter_user_id = _effective_user_filter(request)
-    if filter_user_id is DENY_EMPTY_SUB:
-        return JSONResponse({"items": [], "truncated": False})
+    # Trusted-team visibility: any caller with admin.coordinator sees
+    # the full child subtree.  ``user_id`` stays on each row as
+    # metadata, not a filter.
     try:
         raw = storage.list_workstreams(
             limit=_CHILDREN_PAGE_LIMIT + 1,
             parent_ws_id=ws_id,
             kind=None,
-            user_id=filter_user_id,
+            user_id=None,
         )
     except Exception:
         correlation_id = secrets.token_hex(4)
@@ -3094,9 +2976,9 @@ async def coordinator_children(request: Request) -> JSONResponse:
     for row in raw:
         serialized = _coord_children_row(row)
         # Drop nested coordinators defensively — current schema can't
-        # produce them (WorkstreamManager rejects kind!=interactive), but
-        # the filter keeps the tree UI contract stable across schema
-        # changes.
+        # produce them (the interactive-side SessionManager rejects
+        # kind!=interactive), but the filter keeps the tree UI contract
+        # stable across schema changes.
         if serialized.get("kind") == WorkstreamKind.COORDINATOR:
             continue
         items.append(serialized)
@@ -3136,7 +3018,7 @@ def _coordinator_metrics_payload(
 
 
 async def coordinator_metrics(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/metrics — per-coordinator health snapshot.
+    """GET /v1/api/workstreams/{ws_id}/metrics — per-coordinator health snapshot.
 
     Aggregates cheap, already-persisted signals into a one-shot "is
     this coordinator healthy?" answer for operators (#16).  No new
@@ -3162,8 +3044,8 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
       wait-tool instrumentation (future work — the SSE events from
       #14 carry the data live but aren't persisted yet).
 
-    Ownership / authz: same gate as ``coordinator_detail`` — 404-mask
-    rows the caller doesn't own (no existence-oracle leak).
+    Ownership / authz: same gate as :func:`make_detail_handler` —
+    404-mask rows the caller doesn't own (no existence-oracle leak).
     """
     from turnstone.core.web_helpers import require_storage_or_503
 
@@ -3190,27 +3072,17 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     # (#perf-1).  Two cheap queries instead of a ``list_workstreams``
     # scan up to 10k rows.
     #
-    # Tenant filter on the aggregates — push user_id into SQL so a
-    # non-admin caller can't observe cross-tenant counts via forged /
-    # migration-era rows sharing parent_ws_id.  The 404-mask above
-    # already rejected foreign coord_ws_id, so the filter here is
-    # defense-in-depth against child rows with drifted user_id.
+    # Trusted-team visibility: aggregates run cluster-wide per the
+    # unified ownership model; ``user_id`` is not a filter here.
     from datetime import UTC, datetime
 
-    filter_user_id = _effective_user_filter(request)
-    if filter_user_id is DENY_EMPTY_SUB:
-        # Prior _resolve_coordinator_or_404 already rejected this
-        # shape, but belt-and-braces: never fall through to storage
-        # with ``user_id=""`` (matches legacy orphans) or ``None``
-        # (service escape).
-        return JSONResponse(_coordinator_metrics_payload(ws_id=ws_id))
     now_epoch = time.time()
     hour_ago_iso = datetime.fromtimestamp(now_epoch - 3600, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
     try:
         state_counts = await asyncio.to_thread(
             storage.count_workstreams_by_state,
             parent_ws_id=ws_id,
-            user_id=filter_user_id,
+            user_id=None,
         )
     except Exception:
         log.debug("coordinator_metrics.state_counts_failed ws=%s", ws_id[:8], exc_info=True)
@@ -3221,7 +3093,7 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
             storage.count_workstreams_since,
             hour_ago_iso,
             parent_ws_id=ws_id,
-            user_id=filter_user_id,
+            user_id=None,
         )
     except Exception:
         log.debug(
@@ -3269,10 +3141,86 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
 
 _RESTRICT_MAX_TOOLS = 256
 _RESTRICT_MAX_TOOL_NAME_LEN = 128
-# Bounded concurrency on the cascade dispatch.  Upstream coord_client
-# cancels have a 30s timeout; a 100-child cascade at this cap finishes
-# in ~200s worst case, comfortably inside typical 300s proxy limits.
-_STOP_CASCADE_MAX_CONCURRENCY = 16
+# Bounded concurrency on bulk coordinator fan-out (stop_cascade,
+# close_all_children).  Upstream coord_client calls have a 30s timeout;
+# a 100-child cascade at this cap finishes in ~200s worst case,
+# comfortably inside typical 300s proxy limits.
+_COORD_FANOUT_MAX_CONCURRENCY = 16
+
+
+async def _fanout_on_children(
+    child_ids: list[str],
+    coord_client: Any,
+    action: Callable[[str], Any],
+    *,
+    log_tag: str,
+    concurrency: int = _COORD_FANOUT_MAX_CONCURRENCY,
+) -> tuple[list[str], list[str], list[str]]:
+    """Bounded-concurrency fan-out over a coordinator's children.
+
+    Returns ``(ok, failed, skipped)`` — ``ok`` = action succeeded,
+    ``skipped`` = upstream 404 (already gone), ``failed`` = everything
+    else (dispatch errors, exceptions, non-dict returns).  Routes all
+    ids to ``failed`` when ``coord_client`` is None so the operator
+    sees the unexpected state rather than a silent no-op.  Callers map
+    the three buckets to endpoint-specific response keys (cancelled /
+    closed / ...).
+    """
+    ok: list[str] = []
+    failed: list[str] = []
+    skipped: list[str] = []
+    if not child_ids:
+        return ok, failed, skipped
+    if coord_client is None:
+        return ok, list(child_ids), skipped
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(cid: str) -> tuple[str, str]:
+        async with sem:
+            try:
+                result = await asyncio.to_thread(action, cid)
+                if not isinstance(result, dict):
+                    return cid, "failed"
+                if not result.get("error"):
+                    return cid, "ok"
+                # Stale registry entry (child row deleted) or upstream
+                # 404 both mean "already gone".  Route to skipped so
+                # operators can distinguish from dispatch failures.
+                if result.get("status") == 404:
+                    return cid, "skipped"
+                # Lifted ``cancel`` returns 400 with "No session" for
+                # placeholder / build-failed workstreams (the in-memory
+                # row exists but its ChatSession was never constructed,
+                # so there's nothing to cancel). Treat the same as
+                # 404 — the child has no work to stop, not a dispatch
+                # failure that should fire alerts. Pre-lift coord
+                # silently no-op'd on placeholders; this keeps cascade
+                # behaviour parity with the pre-lift outcome.
+                # NOTE: this branch is reachable from the cancel-cascade
+                # caller (``stop_cascade``) but unreachable from the
+                # close-cascade caller (``close_all_children``); the
+                # close handler at ``session_routes.py:852-854`` 404s
+                # for both missing and already-closed-evicted rows and
+                # never emits a 400 "No session". Kept as shared code
+                # rather than gated by caller — the branch is cheap and
+                # the symmetry makes future cascade verbs easier to add.
+                if result.get("status") == 400 and result.get("error") == "No session":
+                    return cid, "skipped"
+                return cid, "failed"
+            except Exception:
+                log.debug("%s.child_failed ws=%s", log_tag, cid[:8], exc_info=True)
+                return cid, "failed"
+
+    outcomes = await asyncio.gather(*(_one(cid) for cid in child_ids), return_exceptions=False)
+    for cid, bucket in outcomes:
+        if bucket == "ok":
+            ok.append(cid)
+        elif bucket == "skipped":
+            skipped.append(cid)
+        else:
+            failed.append(cid)
+    return ok, failed, skipped
 
 
 async def _require_json_object(request: Request) -> dict[str, Any] | JSONResponse:
@@ -3383,7 +3331,7 @@ def _set_audit_executor(executor: ThreadPoolExecutor | None) -> None:
 
 
 async def coordinator_trust(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/trust — toggle trusted-session mode."""
+    """POST /v1/api/workstreams/{ws_id}/trust — toggle trusted-session mode."""
     trust_err = require_permission(request, "coordinator.trust.send", allow_service_bypass=False)
     if trust_err is not None:
         return trust_err
@@ -3413,7 +3361,7 @@ async def coordinator_trust(request: Request) -> JSONResponse:
 
 
 async def coordinator_restrict(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/restrict — revoke tool access mid-session."""
+    """POST /v1/api/workstreams/{ws_id}/restrict — revoke tool access mid-session."""
     resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -3457,7 +3405,7 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
 
 
 async def coordinator_stop_cascade(request: Request) -> JSONResponse:
-    """POST /v1/api/coordinator/{ws_id}/stop_cascade — cancel the subtree."""
+    """POST /v1/api/workstreams/{ws_id}/stop_cascade — cancel the subtree."""
     resolved = await _resolve_coord_session(request, allow_service_bypass=False)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -3466,55 +3414,20 @@ async def coordinator_stop_cascade(request: Request) -> JSONResponse:
     coord_mgr, err503 = _require_coord_mgr(request)
     if err503 is not None:
         return err503  # pragma: no cover — _resolve_coord_session already gated this
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
-    child_ids = list(coord_mgr.children_snapshot(ws_id))
+    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
     coord_mgr.cancel(ws_id)
 
-    coord_client = getattr(session, "_coord_client", None)
-    cancelled: list[str] = []
-    failed: list[str] = []
-    skipped: list[str] = []
-
-    if not child_ids:
-        pass
-    elif coord_client is None:
-        failed = list(child_ids)
-    else:
-        sem = asyncio.Semaphore(_STOP_CASCADE_MAX_CONCURRENCY)
-
-        async def _cancel_one(cid: str) -> tuple[str, str]:
-            async with sem:
-                try:
-                    result = await asyncio.to_thread(coord_client.cancel, cid)
-                    if not isinstance(result, dict):
-                        return cid, "failed"
-                    if not result.get("error"):
-                        return cid, "cancelled"
-                    # A subtree-miss (stale _children entry after the
-                    # child's storage row was deleted) and an upstream
-                    # 404 both mean "already gone".  Route to skipped so
-                    # operators can distinguish from dispatch failures.
-                    if result.get("status") == 404:
-                        return cid, "skipped"
-                    return cid, "failed"
-                except Exception:
-                    log.debug(
-                        "coordinator_stop_cascade.child_failed ws=%s",
-                        cid[:8],
-                        exc_info=True,
-                    )
-                    return cid, "failed"
-
-        outcomes = await asyncio.gather(
-            *(_cancel_one(cid) for cid in child_ids), return_exceptions=False
-        )
-        for cid, bucket in outcomes:
-            if bucket == "cancelled":
-                cancelled.append(cid)
-            elif bucket == "skipped":
-                skipped.append(cid)
-            else:
-                failed.append(cid)
+    coord_client: Any = getattr(session, "_coord_client", None)
+    # ``action`` is only called when coord_client is live — the helper
+    # short-circuits on None before invoking it.
+    cancelled, failed, skipped = await _fanout_on_children(
+        child_ids,
+        coord_client,
+        lambda cid: coord_client.cancel(cid),
+        log_tag="coordinator_stop_cascade",
+    )
 
     await _emit_coord_audit(
         storage,
@@ -3539,15 +3452,89 @@ async def coordinator_stop_cascade(request: Request) -> JSONResponse:
     )
 
 
+_CLOSE_ALL_CHILDREN_MAX_REASON_LEN = 512
+
+
+async def coordinator_close_all_children(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/close_all_children — soft-close the direct children.
+
+    Near-twin of ``coordinator_stop_cascade`` — both fan out over
+    ``children_snapshot`` via ``_fanout_on_children``.  Returns
+    ``{closed, failed, skipped}``.  Unlike ``stop_cascade``, this does
+    NOT recurse into grandchildren (the coordinator's model tool asks
+    for a bounded teardown of its own fan-out; operator-level cascade
+    stays behind ``stop_cascade``).
+    """
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    session, storage, user_id, ws_id = resolved
+
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503  # pragma: no cover — _resolve_coord_session already gated this
+    del coord_mgr  # children_snapshot moved to the adapter
+    coord_adapter = getattr(request.app.state, "coord_adapter", None)
+
+    body = await _require_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    raw_reason = body.get("reason", "")
+    if raw_reason is not None and not isinstance(raw_reason, str):
+        return JSONResponse(
+            {"error": "reason must be a string"},
+            status_code=400,
+        )
+    reason = (raw_reason or "").strip()
+    if len(reason) > _CLOSE_ALL_CHILDREN_MAX_REASON_LEN:
+        return JSONResponse(
+            {"error": f"reason exceeds {_CLOSE_ALL_CHILDREN_MAX_REASON_LEN} chars"},
+            status_code=400,
+        )
+
+    child_ids = list(coord_adapter.children_snapshot(ws_id)) if coord_adapter is not None else []
+
+    coord_client: Any = getattr(session, "_coord_client", None)
+    closed, failed, skipped = await _fanout_on_children(
+        child_ids,
+        coord_client,
+        lambda cid: coord_client.close_workstream(cid, reason),
+        log_tag="coordinator_close_all_children",
+    )
+
+    await _emit_coord_audit(
+        storage,
+        user_id,
+        "coordinator.closed_all_children",
+        ws_id,
+        {
+            "src": "coordinator",
+            "reason": reason,
+            "closed": closed,
+            "failed": failed,
+            "skipped": skipped,
+        },
+        request.client.host if request.client else "",
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "closed": closed,
+            "failed": failed,
+            "skipped": skipped,
+        }
+    )
+
+
 async def coordinator_tasks(request: Request) -> JSONResponse:
-    """GET /v1/api/coordinator/{ws_id}/tasks — read task list envelope.
+    """GET /v1/api/workstreams/{ws_id}/tasks — read task list envelope.
 
     Returns ``{"version": 1, "tasks": [...]}`` — the same shape the
-    ``task_list(action="list")`` tool returns (less the list-tool's
+    ``tasks(action="list")`` tool returns (less the list-tool's
     client-side 200-row slice; the UI handles its own pagination).
 
     Corrupt envelopes return an empty list for UI resilience.  The
-    ``task_list`` tool remains the authoritative write path and surfaces
+    ``tasks`` tool remains the authoritative write path and surfaces
     corruption errors to the model on mutation attempts.
     """
     from turnstone.core.web_helpers import require_storage_or_503
@@ -3909,6 +3896,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # the coordinator endpoints return 503 with a remediation message
     # when coord_mgr is None, so the rest of the console still works.
     app.state.coord_mgr = None
+    app.state.coord_adapter = None
     app.state.coord_registry = None
     app.state.coord_registry_error = ""
     if storage and config_store:
@@ -3925,7 +3913,8 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 coord_registry = None
 
             if coord_registry is not None:
-                from turnstone.console.coordinator import CoordinatorManager
+                from turnstone.console.collector import ClusterCollector
+                from turnstone.console.coordinator_adapter import CoordinatorAdapter
                 from turnstone.console.coordinator_client import (
                     CoordinatorClient,
                     CoordinatorTokenManager,
@@ -3934,14 +3923,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 from turnstone.console.session_factory import (
                     build_console_session_factory,
                 )
+                from turnstone.core.session_manager import SessionManager
 
                 jwt_secret: str = getattr(app.state, "jwt_secret", "")
                 console_bind_url: str = getattr(app.state, "console_url", "") or (
                     "http://127.0.0.1:8001"
                 )
 
-                def _ui_factory(ws_id: str, user_id: str) -> ConsoleCoordinatorUI:
-                    return ConsoleCoordinatorUI(ws_id=ws_id, user_id=user_id)
+                def _ui_factory(ws: Workstream) -> ConsoleCoordinatorUI:
+                    return ConsoleCoordinatorUI(ws_id=ws.id, user_id=ws.user_id or "")
 
                 def _coord_client_factory(ws_id: str, user_id: str) -> CoordinatorClient:
                     ttl = int(config_store.get("coordinator.session_jwt_ttl_seconds"))
@@ -3971,18 +3961,48 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     node_id="console",
                     coord_client_factory=_coord_client_factory,
                 )
-                app.state.coord_mgr = CoordinatorManager(
-                    session_factory=coord_factory,
+                coord_adapter = CoordinatorAdapter(
+                    collector=app.state.collector,
                     ui_factory=_ui_factory,
+                    session_factory=coord_factory,
+                )
+                from turnstone.core.state_writer import StateWriter
+
+                coord_state_writer = StateWriter(storage)
+                coord_state_writer.start()
+                coord_mgr = SessionManager(
+                    coord_adapter,
                     storage=storage,
                     max_active=int(config_store.get("coordinator.max_active")),
+                    node_id=ClusterCollector.CONSOLE_PSEUDO_NODE_ID,
+                    state_writer=coord_state_writer,
+                    # CoordinatorAdapter implements SessionEventEmitter
+                    # in full — every lifecycle transition fans out to
+                    # the cluster collector's pseudo-node so the
+                    # dashboard tree mirrors child state.
+                    event_emitter=coord_adapter,
                 )
+                # Late-bind the manager onto the adapter so
+                # ``_rebuild_children_registry`` / ``send`` /
+                # fan-out dispatch can call ``mgr.get(ws_id)``.
+                coord_adapter.attach(coord_mgr)
+                app.state.coord_state_writer = coord_state_writer
+                # Shared refs so ConsoleCoordinatorUI.on_state_change
+                # flows state transitions through the unified manager,
+                # on_rename fans out to the cluster dashboard, and
+                # _record_judge_metric / on_intent_verdict feed the
+                # console's /metrics endpoint with coord verdicts.
+                ConsoleCoordinatorUI._coord_mgr = coord_mgr
+                ConsoleCoordinatorUI._collector = app.state.collector
+                ConsoleCoordinatorUI._console_metrics = app.state.console_metrics
+                app.state.coord_mgr = coord_mgr
+                app.state.coord_adapter = coord_adapter
                 # Wire the cluster-event subscription so the coordinator's
                 # SSE stream fans out filtered child_ws_* events.  Safe to
                 # call even when the collector has no nodes yet — the
                 # subscription just sits idle until the first node event.
                 try:
-                    app.state.coord_mgr.start_child_event_fanout(app.state.collector)
+                    coord_adapter.start_child_event_fanout(app.state.collector)
                 except Exception:
                     log.warning("console.coordinator_child_fanout_init_failed", exc_info=True)
                 log.info(
@@ -4007,12 +4027,31 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
-    coord_mgr_shutdown = getattr(app.state, "coord_mgr", None)
-    if coord_mgr_shutdown is not None:
+    coord_adapter_shutdown = getattr(app.state, "coord_adapter", None)
+    if coord_adapter_shutdown is not None:
         try:
-            coord_mgr_shutdown.shutdown()
+            coord_adapter_shutdown.shutdown()
         except Exception:
-            log.debug("console.coord_mgr_shutdown_failed", exc_info=True)
+            log.debug("console.coord_adapter_shutdown_failed", exc_info=True)
+    coord_state_writer_shutdown = getattr(app.state, "coord_state_writer", None)
+    if coord_state_writer_shutdown is not None:
+        try:
+            # shutdown() joins a daemon thread + runs sync DB writes;
+            # offload to keep the console lifespan event loop moving.
+            await asyncio.to_thread(coord_state_writer_shutdown.shutdown)
+        except Exception:
+            log.debug("console.coord_state_writer_shutdown_failed", exc_info=True)
+    # Drop the shared ConsoleCoordinatorUI refs on teardown so tests
+    # that spin up multiple lifespan instances don't carry stale
+    # manager/collector references across them.
+    try:
+        from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+
+        ConsoleCoordinatorUI._coord_mgr = None
+        ConsoleCoordinatorUI._collector = None
+        ConsoleCoordinatorUI._console_metrics = None
+    except Exception:
+        log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()
@@ -5380,6 +5419,11 @@ async def admin_create_policy(request: Request) -> JSONResponse:
         enabled=enabled,
         created_by=audit_uid,
     )
+    # Drop the cached policy snapshot so the next ``approve_tools`` read
+    # picks up this rule without waiting for the TTL window to expire.
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache(org_id)
 
     record_audit(
         storage,
@@ -5438,6 +5482,12 @@ async def admin_update_policy(request: Request) -> JSONResponse:
         updates["enabled"] = bool(body["enabled"])
 
     storage.update_tool_policy(policy_id, **updates)
+    # Drop the cached policy snapshot so the next ``approve_tools`` read
+    # picks up this update without waiting for the TTL window. Use the
+    # existing row's org_id so the right slot is invalidated.
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache(existing.get("org_id", "") if isinstance(existing, dict) else None)
 
     audit_uid, ip = _audit_context(request)
     record_audit(storage, audit_uid, "policy.update", "policy", policy_id, updates, ip)
@@ -5465,6 +5515,11 @@ async def admin_delete_policy(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Policy not found"}, status_code=404)
 
     storage.delete_tool_policy(policy_id)
+    # Drop the cached policy snapshot so the next ``approve_tools`` read
+    # stops applying the deleted rule. Use the existing row's org_id.
+    from turnstone.core.policy import invalidate_policy_cache
+
+    invalidate_policy_cache(existing.get("org_id", "") if isinstance(existing, dict) else None)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -5621,7 +5676,6 @@ def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], J
 
 def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, Any]:
     """Convert a storage skill dict to a JSON-safe response dict."""
-    import contextlib
     import json as _json
 
     tags: list[str] = []
@@ -6021,7 +6075,6 @@ async def admin_list_skill_versions(request: Request) -> JSONResponse:
 
 async def list_skills_summary(request: Request) -> JSONResponse:
     """GET /v1/api/skills — list available skills (summary)."""
-    import contextlib
     import json as _json
 
     from turnstone.core.web_helpers import require_storage_or_503
@@ -10089,12 +10142,144 @@ def create_app(
     _openapi_handler = make_openapi_handler(_spec)
     _docs_handler = make_docs_handler()
 
+    # Coord workstream HTTP tree mounts under the unified
+    # ``/api/workstreams/`` shape. Lifted handlers (e.g. ``approve``,
+    # ``close``) capture the kind-specific ``SessionEndpointConfig``
+    # via the factory closure. Per-kind handlers (``coordinator_*``)
+    # still look the coord manager up via ``request.app.state.coord_mgr``
+    # at request time because the manager is built in the lifespan,
+    # after this app construction; future verb lifts carry that lookup
+    # into the config callable.
+    def _coord_attachment_owner(
+        request: Request, ws_id: str, mgr: Any
+    ) -> tuple[str, JSONResponse | None]:
+        """Resolve the attachment owner for a coord ws_id.
+
+        Kind-strict — only resolves through ``coord_mgr.get(ws_id)``
+        and DOES NOT fall back to storage. This keeps an
+        ``admin.coordinator``-scoped caller from reading or mutating
+        attachments on **interactive** workstreams via the coord
+        attachment endpoints: the storage row for an interactive ws
+        would otherwise resolve cleanly through the generic
+        ``get_workstream_owner`` storage call (which doesn't filter
+        by kind), granting cross-kind access. Persisted-but-not-loaded
+        coordinators must be ``open``ed before they can accept
+        attachment operations.
+        """
+        from turnstone.core.web_helpers import auth_user_id
+
+        ws = mgr.get(ws_id)
+        if ws is None:
+            return "", JSONResponse({"error": "coordinator not found"}, status_code=404)
+        return ws.user_id or auth_user_id(request), None
+
+    from turnstone.core.attachments import (
+        classify_text_attachment as _coord_classify_text,
+    )
+    from turnstone.core.attachments import (
+        sniff_image_mime as _coord_sniff_image,
+    )
+    from turnstone.core.attachments import (
+        upload_lock as _coord_upload_lock,
+    )
+
+    coord_attachment_helpers = AttachmentUploadHelpers(
+        sniff_image_mime=_coord_sniff_image,
+        classify_text_attachment=_coord_classify_text,
+        upload_lock=_coord_upload_lock,
+    )
+    coord_endpoint_config = SessionEndpointConfig(
+        permission_gate=_require_admin_coordinator,
+        manager_lookup=_require_coord_mgr,
+        tenant_check=None,  # cluster-wide admin.coordinator gate covers it
+        not_found_label="coordinator not found",
+        audit_action_prefix="coordinator",
+        supports_attachments=True,
+        attachment_owner_resolver=_coord_attachment_owner,
+        attachment_helpers=coord_attachment_helpers,
+        # Per-spawn counter writes — the rich ``ws_state`` payload
+        # cluster broadcast (PR #420) reads ``_ws_messages`` and
+        # resets ``_ws_turn_tool_calls`` per turn so coord rows render
+        # the same activity / per-turn counts interactive rows do.
+        # Judge verdicts on coord feed the console's /metrics endpoint
+        # via :class:`ConsoleCoordinatorUI._record_judge_metric` /
+        # ``on_intent_verdict``; this hook only owns the per-UI counter
+        # writes that match interactive's pattern.
+        spawn_metrics=_coord_spawn_metrics,
+        emit_message_queued=True,
+        events_replay=_coord_events_replay,
+        create_supports_attachments=True,
+        create_supports_user_id_override=False,
+        create_validate_request=_coord_create_validate_request,
+        create_build_kwargs=_coord_create_build_kwargs,
+        create_post_install=_coord_create_post_install,
+        # No alias surface on coord today — the lifted body falls
+        # back to ``ws.name`` when ``list_resolve_titles`` is None.
+        list_resolve_titles=None,
+        # Explicit kind classifier for the lifted list/saved factory's
+        # storage filter (drops the pre-fix ``audit_action_prefix``
+        # string compare that would have silently leaked interactive
+        # rows for any future kind).
+        list_kind=WorkstreamKind.COORDINATOR,
+        # Coord saved cards show only explicitly-closed coordinators —
+        # active / in-flight rows live in the active list and
+        # tombstones are non-resurrectable.
+        saved_state_filter="closed",
+        saved_loaded_lookup=_coord_saved_loaded_lookup,
+    )
+    coord_workstream_routes: list[Any] = []
+    register_session_routes(
+        coord_workstream_routes,
+        prefix="/api/workstreams",
+        handlers=SharedSessionVerbHandlers(
+            list_workstreams=make_list_handler(coord_endpoint_config),  # lifted: shared body
+            list_saved=make_saved_handler(coord_endpoint_config),  # lifted: shared body
+            create=make_create_handler(  # lifted: shared body
+                coord_endpoint_config,
+                audit_emit=_audit_coordinator_create,
+            ),
+            detail=make_detail_handler(coord_endpoint_config),  # lifted: shared body
+            open=make_open_handler(coord_endpoint_config),  # lifted: shared body
+            close=make_close_handler(  # lifted: shared body
+                coord_endpoint_config,
+                audit_emit=_audit_close_coordinator,
+                supports_close_reason=False,
+            ),
+            send=make_send_handler(coord_endpoint_config),  # lifted: shared body (P1.5)
+            dequeue=make_dequeue_handler(coord_endpoint_config),  # lifted: shared body
+            approve=make_approve_handler(coord_endpoint_config),  # lifted: shared body
+            cancel=make_cancel_handler(  # lifted: shared body
+                coord_endpoint_config,
+                audit_emit=_audit_cancel_coordinator,
+            ),
+            events=make_events_handler(coord_endpoint_config),  # lifted: shared body
+            history=make_history_handler(coord_endpoint_config),  # lifted: shared body
+            attachments=make_attachment_handlers(
+                coord_endpoint_config
+            ),  # lifted: shared body (P1.5)
+        ),
+    )
+    register_coord_verbs(
+        coord_workstream_routes,
+        prefix="/api/workstreams",
+        handlers=CoordOnlyVerbHandlers(
+            children=coordinator_children,
+            tasks=coordinator_tasks,
+            metrics=coordinator_metrics,
+            trust=coordinator_trust,
+            restrict=coordinator_restrict,
+            stop_cascade=coordinator_stop_cascade,
+            close_all_children=coordinator_close_all_children,
+        ),
+    )
+
     app = Starlette(
         routes=[
             Route("/", index),
             Mount(
                 "/v1",
                 routes=[
+                    *coord_workstream_routes,
                     Route("/api/cluster/overview", cluster_overview),
                     Route("/api/cluster/nodes", cluster_nodes),
                     Route("/api/cluster/workstreams", cluster_workstreams),
@@ -10106,12 +10291,28 @@ def create_app(
                     Route("/api/cluster/events", cluster_events_sse),
                     # Workstream routing (rendezvous proxy to server nodes)
                     Route("/api/route/workstreams/new", route_create, methods=["POST"]),
-                    Route("/api/route/send", route_proxy, methods=["POST"]),
-                    Route("/api/route/approve", route_proxy, methods=["POST"]),
-                    Route("/api/route/cancel", route_proxy, methods=["POST"]),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/send",
+                        route_proxy,
+                        methods=["POST", "DELETE"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/approve",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/cancel",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
                     Route("/api/route/command", route_proxy, methods=["POST"]),
                     Route("/api/route/plan", route_proxy, methods=["POST"]),
-                    Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/close",
+                        route_proxy,
+                        methods=["POST"],
+                    ),
                     # Coordinator-only hard delete — forwards to the server's
                     # path-parameter form at /v1/api/workstreams/{ws_id}/delete.
                     Route(
@@ -10135,84 +10336,6 @@ def create_app(
                         methods=["GET"],
                     ),
                     Route("/api/route", route_lookup, methods=["GET"]),
-                    # Coordinator workstream API — console-hosted sessions.
-                    # All require admin.coordinator permission.
-                    Route(
-                        "/api/coordinator/new",
-                        coordinator_create,
-                        methods=["POST"],
-                    ),
-                    Route("/api/coordinator", coordinator_list, methods=["GET"]),
-                    Route(
-                        "/api/coordinator/{ws_id}/send",
-                        coordinator_send,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/approve",
-                        coordinator_approve,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/cancel",
-                        coordinator_cancel,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/close",
-                        coordinator_close,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/open",
-                        coordinator_open,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/events",
-                        coordinator_events,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/history",
-                        coordinator_history,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/children",
-                        coordinator_children,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/tasks",
-                        coordinator_tasks,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/metrics",
-                        coordinator_metrics,
-                        methods=["GET"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/trust",
-                        coordinator_trust,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/restrict",
-                        coordinator_restrict,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}/stop_cascade",
-                        coordinator_stop_cascade,
-                        methods=["POST"],
-                    ),
-                    Route(
-                        "/api/coordinator/{ws_id}",
-                        coordinator_detail,
-                        methods=["GET"],
-                    ),
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
@@ -10220,6 +10343,7 @@ def create_app(
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/auth/whoami", auth_whoami),
+                    Route("/api/auth/refresh", auth_refresh, methods=["POST"]),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/admin/users", admin_list_users),
@@ -10738,14 +10862,8 @@ def main() -> None:
     from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
 
     # ``service`` scope is REQUIRED — ``/v1/api/events/global`` on every
-    # upstream node hard-gates on it (server.py global_events_sse), and
-    # ``/v1/api/dashboard`` / ``/v1/api/workstreams`` silently tenant-
-    # filter away all rows for non-service callers (server.py
-    # _visible_workstreams).  Without ``service`` here, every
-    # console→upstream SSE connect 403s, no dashboard rows flow, the
-    # browser's cluster-view is empty, and the failure surfaces only
-    # as DEBUG-level log lines in the collector (#sev-0).  ``read`` is
-    # kept for legacy read-path compatibility.
+    # upstream node hard-gates on it (server.py global_events_sse).
+    # ``read`` is kept for legacy read-path compatibility.
     collector_token_mgr = ServiceTokenManager(
         user_id="console-collector",
         scopes=frozenset({"read", "service"}),

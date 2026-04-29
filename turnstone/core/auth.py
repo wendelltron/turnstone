@@ -178,12 +178,9 @@ PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/", "/acme/")
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {
-        "/api/send",
         "/api/plan",
         "/api/command",
-        "/api/cancel",
         "/api/workstreams/new",
-        "/api/workstreams/close",
         "/api/cluster/workstreams/new",
         "/api/memories",
         "/api/tts",
@@ -192,7 +189,6 @@ WRITE_PATHS: frozenset[str] = frozenset(
 
 APPROVE_PATHS: frozenset[str] = frozenset(
     {
-        "/api/approve",
         "/api/_internal/config-reload",
         "/api/_internal/mcp-reload",
         "/api/_internal/model-reload",
@@ -445,12 +441,17 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
     if not audience:
         decode_opts = {"verify_aud": False}
     try:
+        # leeway=30 absorbs small clock skew between hosts (multi-replica
+        # console deployments) and minor drift between mint-time and
+        # validate-time within the same process.  Standard tolerance for
+        # short-lived tokens; revisit if clocks are NTP-drift-prone.
         payload = jwt.decode(
             token,
             secret,
             algorithms=["HS256"],
             audience=audience if audience else None,
             options=decode_opts,
+            leeway=30,
         )
     except jwt.InvalidTokenError:
         return None
@@ -534,7 +535,9 @@ def required_scope(method: str, path: str) -> str:
     # Workstream sub-resource mutations: /api/workstreams/{ws_id}/{action}.
     # The entries here denote write actions OR write-requiring collection
     # endpoints (e.g. `attachments` is a collection with a POST that
-    # uploads a file — not a verb, but semantically a write).
+    # uploads a file — not a verb, but semantically a write). `events`
+    # falls through to the GET-default `read` and is intentionally not
+    # listed here.
     if (
         method == "POST"
         and normalized.startswith("/api/workstreams/")
@@ -569,11 +572,20 @@ def required_scope(method: str, path: str) -> str:
                 "speech-to-text",
             }:
                 return "write"
+            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] == "approve":
+                return "approve"
 
     # Proxied attachment deletion: /node/.../api/workstreams/{ws}/attachments/{id}
     if method == "DELETE" and normalized.startswith("/node/"):
         proxied = _extract_proxied_path(normalized)
         if proxied and _ATTACHMENT_DELETE_RE.match(proxied):
+            return "write"
+        # Proxied path-keyed dequeue: DELETE /node/.../api/workstreams/{ws}/send.
+        if (
+            proxied
+            and proxied.startswith("/api/workstreams/")
+            and proxied.rsplit("/", 1)[-1] == "send"
+        ):
             return "write"
 
     return "read"
@@ -1214,19 +1226,139 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
 
 
 async def handle_auth_whoami(request: Request) -> Response:
-    """Shared ``GET /api/auth/whoami`` handler — return authenticated user info."""
+    """Shared ``GET /api/auth/whoami`` handler — return authenticated user info.
+
+    Includes the JWT ``exp`` claim (epoch seconds) so the frontend can
+    schedule a pre-emptive refresh before the cookie expires.  HttpOnly
+    on the cookie itself means JS can't read the JWT body directly; the
+    server has to surface ``exp`` separately.
+    """
     from starlette.responses import JSONResponse
 
     auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
     if not auth_result or not auth_result.user_id:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
-    resp: dict[str, str] = {
+    resp: dict[str, Any] = {
         "user_id": auth_result.user_id,
     }
     if auth_result.permissions:
         resp["permissions"] = ",".join(sorted(auth_result.permissions))
+    # Surface the cookie/JWT expiry so the client can schedule refresh.
+    # Decoded without re-validating (auth middleware already validated).
+    cookie_token = request.cookies.get(AUTH_COOKIE, "")
+    if cookie_token:
+        try:
+            import jwt as _jwt
+
+            unverified = _jwt.decode(cookie_token, options={"verify_signature": False})
+            exp_value = unverified.get("exp")
+            if isinstance(exp_value, int | float):
+                resp["exp"] = int(exp_value)
+        except Exception:
+            # Best-effort surfacing; absence just disables proactive refresh.
+            pass
     return JSONResponse(resp)
+
+
+async def handle_auth_refresh(request: Request, audience: str) -> Response:
+    """Shared ``POST /api/auth/refresh`` handler — re-mint the auth cookie.
+
+    Requires a currently-valid auth cookie (auth middleware enforces).
+    Re-resolves the user's permissions from storage so a role change
+    propagates within one refresh cycle (rather than persisting until
+    the original token's natural expiry).  Returns the same JSON shape
+    as ``/api/auth/login`` so clients can reuse the success-path code,
+    and sets a fresh ``Set-Cookie`` header.
+
+    Sliding-window: each successful refresh extends the session by the
+    full default TTL.  An attacker who steals the cookie can keep
+    extending it as long as the user record exists — same exposure as
+    a stolen long-lived cookie, just with the refresh hop.  Mitigated
+    by short-lived original cookies + standard cookie hygiene
+    (HttpOnly, Secure, SameSite=Lax) which we already set.
+    """
+    from starlette.responses import JSONResponse
+
+    auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
+    if not auth_result or not auth_result.user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+    storage = getattr(request.app.state, "auth_storage", None)
+
+    # Re-resolve permissions so revoked / promoted users see the change
+    # within one refresh cycle.  Call storage.get_user_permissions
+    # directly (not _load_user_permissions) so we can distinguish a
+    # genuine empty result (user deleted / role-stripped → 403) from a
+    # transient storage failure (fall back to in-token claims, better
+    # than logging the session out mid-flight).
+    user_id = auth_result.user_id
+    perms: frozenset[str] = auth_result.permissions
+    scopes: frozenset[str] = auth_result.scopes
+    if storage is not None:
+        try:
+            fresh_perms = storage.get_user_permissions(user_id)
+        except Exception:
+            log.warning(
+                "Refresh: storage unavailable for permission re-resolve; "
+                "falling back to in-token claims for %s",
+                user_id,
+                exc_info=True,
+            )
+        else:
+            if not fresh_perms and not auth_result.has_scope("service"):
+                return JSONResponse(
+                    {"error": "User has no active permissions"},
+                    status_code=403,
+                )
+            perms = frozenset(fresh_perms)
+            scopes = _permissions_to_scopes(set(perms))
+
+    if not jwt_secret:
+        return JSONResponse({"error": "JWT signing not configured"}, status_code=503)
+
+    new_token = create_jwt(
+        user_id=user_id,
+        scopes=scopes,
+        source=auth_result.token_source or "refresh",
+        secret=jwt_secret,
+        audience=audience,
+        permissions=perms,
+        version=jwt_version_slot(),
+    )
+
+    role = "full" if "write" in scopes else "read"
+    resp_body: dict[str, Any] = {
+        "status": "ok",
+        "role": role,
+        "scopes": ",".join(sorted(scopes)),
+        "user_id": user_id,
+        "jwt": new_token,
+    }
+    if perms:
+        resp_body["permissions"] = ",".join(sorted(perms))
+    # Surface the new cookie's exp (epoch seconds) so the frontend can
+    # populate sessionStorage permissions AND schedule the next refresh
+    # off the refresh response itself, without a follow-up /whoami round
+    # trip.  Decoded without re-validating — we just minted it.  Mirrors
+    # the same pattern handle_auth_whoami uses for the cookie's exp.
+    try:
+        import jwt as _jwt
+
+        unverified = _jwt.decode(new_token, options={"verify_signature": False})
+        exp_value = unverified.get("exp")
+        if isinstance(exp_value, int | float):
+            resp_body["exp"] = int(exp_value)
+    except Exception:
+        # Best-effort surfacing; absence falls the client back to its
+        # whoami-based reschedule path.
+        pass
+
+    response = JSONResponse(resp_body)
+    secure = is_secure_request(dict(request.headers), request.url.scheme)
+    response.headers["Set-Cookie"] = make_set_cookie(new_token, secure=secure)
+    return response
 
 
 def _build_oidc_redirect_uri(request: Request, oidc_config: OIDCConfig) -> str:

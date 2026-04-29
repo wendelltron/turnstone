@@ -321,6 +321,7 @@ def list_workstreams_with_history(
     *,
     kind: WorkstreamKind | str | None = None,
     user_id: str | None = None,
+    state: str | None = None,
 ) -> list[Any]:
     """List workstreams that have conversation messages.
 
@@ -334,12 +335,17 @@ def list_workstreams_with_history(
     authenticated caller's uid from any tenant-visible endpoint;
     leaving it as ``None`` means cluster-wide (service-scoped
     callers only).
+
+    ``state`` filters by lifecycle state — pass ``"closed"`` from the
+    coordinator-saved surface so deleted / currently-active rows don't
+    end up in the saved cards.  Default ``None`` preserves all-states.
     """
     try:
         return get_storage().list_workstreams_with_history(
             limit,
             kind=kind,
             user_id=user_id,
+            state=state,
         )
     except Exception:
         log.warning("Failed to list workstreams with history", exc_info=True)
@@ -408,6 +414,115 @@ def load_workstream_config(ws_id: str) -> dict[str, str]:
         return {}
 
 
+# -- Workstream last_error ---------------------------------------------------
+#
+# Worker-thread exception text persisted under workstream_config so the
+# coordinator's ``inspect_workstream`` and ``wait_for_workstream`` tools
+# can surface the actual cause (provider 4xx/5xx after retries, model
+# misconfig, MCP outage, etc.) instead of falling back to the
+# assistant-tail "(no recent assistant output)" sentinel.
+
+# Single source of truth for the workstream_config key — readers in
+# ``turnstone.console.coordinator_client`` import this so a future rename
+# can't desync writer and readers.
+LAST_ERROR_CONFIG_KEY = "last_error"
+
+# Hard cap on persisted error text. Provider error bodies are sometimes
+# multi-KiB JSON blobs (full request echo + headers); without a cap one
+# such error per workstream would bloat workstream_config and the model
+# prompt the coord LLM ingests on inspect.  1024 chars matches the
+# practical "useful for triage" length while staying well under the
+# WAIT_MESSAGE_MAX_BYTES (6 KiB) cap so the truncate happens here at
+# write time, not later at the wait surface.
+LAST_ERROR_MAX_LEN = 1024
+
+
+def sanitize_error_text(text: str, *, max_len: int = LAST_ERROR_MAX_LEN) -> str:
+    """Strip credentials and cap length on a worker-thread fatal-error
+    string before it flows into storage / UI broadcasts / the coord
+    LLM's prompt.
+
+    Credential redaction delegates to
+    :func:`turnstone.core.output_guard.redact_credentials` — the same
+    pattern set the audit log + post-tool guard use.  Reusing it keeps
+    a single source of truth for "what counts as a secret" instead of
+    drifting two parallel regex lists.  Length capping then trims the
+    output to ``max_len`` chars (truncation from the START — the lead
+    is usually more informative than the tail).
+
+    Sanitisation is best-effort defence-in-depth — pairs with redaction
+    at the provider boundary, doesn't replace it.  Operators who care
+    deeply should also configure their provider SDKs to redact at log
+    time.
+    """
+    if not text:
+        return text
+    # Local import — the output_guard module pulls in a moderate set of
+    # regex tables we don't want to load at module-import time for
+    # every consumer of ``turnstone.core.memory``.  The fatal-error
+    # path is cold enough that import-on-first-call is fine.
+    from turnstone.core.output_guard import redact_credentials
+
+    cleaned = redact_credentials(text)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[: max_len - 3] + "..."
+    return cleaned
+
+
+def persist_last_error(ws_id: str, err_msg: str) -> None:
+    """Persist (sanitized) exception text so the coordinator's inspect /
+    wait_for_workstream can surface it on the next poll.
+
+    Best-effort: storage failures log + swallow.  No-op when ``ws_id``
+    or ``err_msg`` are empty.  Sanitization is applied unconditionally —
+    no caller currently has a use for the raw text in storage, and a
+    bug in a future caller that forgot to sanitize would silently leak
+    credentials.
+    """
+    if not ws_id or not err_msg:
+        return
+    sanitized = sanitize_error_text(err_msg)
+    try:
+        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: sanitized})
+    except Exception:
+        log.warning("Failed to persist last_error ws=%s", ws_id, exc_info=True)
+
+
+def clear_last_error(ws_id: str) -> None:
+    """Clear the persisted ``last_error`` row.
+
+    Called on successful recovery (state transitions from ``error`` back
+    to ``running`` or ``idle``) so a once-leaked exception body doesn't
+    persist for the workstream lifetime.  Writes an empty string rather
+    than deleting the row so the upsert idiom matches every other
+    workstream_config writer (``close_reason``, ``tasks``); other keys
+    on the row survive.
+    """
+    if not ws_id:
+        return
+    try:
+        get_storage().save_workstream_config(ws_id, {LAST_ERROR_CONFIG_KEY: ""})
+    except Exception:
+        log.warning("Failed to clear last_error ws=%s", ws_id, exc_info=True)
+
+
+def load_last_error(ws_id: str) -> str:
+    """Return the persisted ``last_error`` for ``ws_id`` or empty string.
+
+    Storage failures and missing rows both collapse to ``""`` so callers
+    can treat empty as "no error to surface".
+    """
+    if not ws_id:
+        return ""
+    try:
+        cfg = get_storage().load_workstream_config(ws_id) or {}
+    except Exception:
+        log.warning("Failed to load last_error ws=%s", ws_id, exc_info=True)
+        return ""
+    raw = cfg.get(LAST_ERROR_CONFIG_KEY)
+    return str(raw) if raw else ""
+
+
 # -- Skills -------------------------------------------------------------------
 
 
@@ -464,6 +579,25 @@ def get_workstream_display_name(ws_id: str) -> str | None:
     except Exception:
         log.warning("Failed to get display name ws=%s", ws_id, exc_info=True)
         return None
+
+
+def get_workstream_display_names(ws_ids: list[str]) -> dict[str, str | None]:
+    """Bulk variant of :func:`get_workstream_display_name`.
+
+    One ``SELECT ... WHERE ws_id IN (...)`` instead of N. Used by the
+    lifted ``list`` verb to resolve aliases for every active row in a
+    single round-trip. Returns a dict with every requested ws_id —
+    missing rows map to ``None``; the caller falls back to ``ws.name``
+    per-row. Errors return an empty dict so the caller falls back to
+    ``ws.name`` on every row.
+    """
+    if not ws_ids:
+        return {}
+    try:
+        return get_storage().get_workstream_display_names(ws_ids)
+    except Exception:
+        log.warning("Failed to get display names count=%d", len(ws_ids), exc_info=True)
+        return {}
 
 
 def get_workstream_metadata(ws_id: str) -> dict[str, Any] | None:

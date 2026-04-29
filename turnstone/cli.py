@@ -15,12 +15,13 @@ import textwrap
 import threading
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.judge import JudgeConfig
 from turnstone.core.session import ChatSession, SessionUI
+from turnstone.core.session_manager import SessionManager
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
-    WorkstreamManager,
     WorkstreamState,
 )
 from turnstone.ui.colors import (
@@ -366,7 +367,7 @@ class WorkstreamTerminalUI(TerminalUI):
     """TerminalUI with workstream awareness: buffers output when in background,
     blocks on approval until foregrounded."""
 
-    def __init__(self, ws_id: str, manager: WorkstreamManager) -> None:
+    def __init__(self, ws_id: str, manager: SessionManager) -> None:
         super().__init__()
         self.ws_id = ws_id
         self.manager = manager
@@ -514,7 +515,7 @@ class WorkstreamTerminalUI(TerminalUI):
 # ─── Workstream commands ──────────────────────────────────────────────────
 
 
-def _print_ws_status_line(manager: WorkstreamManager) -> None:
+def _print_ws_status_line(manager: SessionManager) -> None:
     """Print a one-line status of background workstreams that are active."""
     active_id = manager.active_id
     parts = []
@@ -532,7 +533,7 @@ def _print_ws_status_line(manager: WorkstreamManager) -> None:
 
 
 def _handle_ws_command(
-    manager: WorkstreamManager,
+    manager: SessionManager,
     cmd_line: str,
     skip_permissions: bool,
 ) -> bool:
@@ -555,10 +556,7 @@ def _handle_ws_command(
     elif sub == "new":
         name = parts[2] if len(parts) > 2 else ""
         try:
-            ws = manager.create(
-                name=name,
-                ui_factory=lambda wid: WorkstreamTerminalUI(wid, manager),
-            )
+            ws = manager.create(user_id="", name=name)
         except RuntimeError as e:
             print(red(str(e)))
             return False
@@ -610,14 +608,16 @@ def _handle_ws_command(
         ws_name = ws_obj.name if ws_obj else "?"
         if manager.close(ws_id):
             print(f"Closed workstream {ws_name}")
-            # Ensure new active is foregrounded
+            # Ensure new active is foregrounded if any remain.
             new_active = manager.get_active()
             if new_active and isinstance(new_active.ui, WorkstreamTerminalUI):
                 new_active.ui.set_foreground(True)
             return True
-        else:
-            print(red("Cannot close the last workstream"))
-            return False
+        # close() returned False — the ws was already closed or
+        # unknown. The old "last workstream" guard went away with the
+        # default-startup workstream.
+        print(red(f"Workstream {ws_name} not found or already closed"))
+        return False
 
     elif sub == "rename":
         new_name = " ".join(parts[2:]) if len(parts) > 2 else ""
@@ -1167,11 +1167,26 @@ def main() -> None:
             parent_ws_id=parent_ws_id,
         )
 
-    # Create workstream manager and initial workstream
-    manager = WorkstreamManager(session_factory)
-    ws = manager.create(
-        ui_factory=lambda wid: WorkstreamTerminalUI(wid, manager),
+    # Create session manager and initial workstream. The InteractiveAdapter
+    # ui_factory needs the manager to build its terminal UI, but the
+    # manager's ctor takes the adapter — break the cycle via
+    # ``InteractiveAdapter.attach`` (mirrors the coord-side pattern).
+    import queue as _queue_mod
+
+    cli_adapter = InteractiveAdapter(
+        # CLI doesn't consume SSE events; drain into a tiny queue and let
+        # emit_* drop silently on Full (the adapter already suppresses).
+        global_queue=_queue_mod.Queue(maxsize=1),
+        ui_factory=lambda ws: WorkstreamTerminalUI(ws.id, cli_adapter.manager),
+        session_factory=session_factory,
     )
+    manager = SessionManager(
+        cli_adapter,
+        storage=_get_storage(),
+        max_active=50,
+    )
+    cli_adapter.attach(manager)
+    ws = manager.create(user_id="")
     if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True
 
