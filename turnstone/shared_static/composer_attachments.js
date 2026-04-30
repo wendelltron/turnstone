@@ -53,6 +53,8 @@
    *   authFetch: optional override (default window.authFetch).
    *   onError: optional (msg, err) => void — replaces the default toast
    *     for upload failures.
+   *   onChange: optional () => void — fired whenever pending attachments
+   *     may have changed (upload success/remove/rehydrate/clear).
    */
   function createAttachmentController(opts) {
     if (!opts || !opts.chipsEl)
@@ -62,6 +64,7 @@
     var chipsEl = opts.chipsEl;
     var getWsId = opts.getWsId;
     var onError = opts.onError || _toastError;
+    var onChange = opts.onChange || function () {};
     // Lazy authFetch lookup — shared/auth.js is loaded before this
     // module in production, but being lazy avoids surprising
     // construction-order failures and keeps the test stub (which
@@ -81,7 +84,14 @@
       var icon = document.createElement("span");
       icon.className = "composer-chip-icon";
       icon.setAttribute("aria-hidden", "true");
-      icon.textContent = info.kind === "image" ? "🖼" : "📄";
+      icon.textContent =
+        info.kind === "image"
+          ? "🖼"
+          : info.kind === "audio"
+            ? "🎵"
+            : info.kind === "video"
+              ? "🎞"
+              : "📄";
       chip.appendChild(icon);
 
       var name = document.createElement("span");
@@ -175,7 +185,14 @@
         filename: file.name,
         size_bytes: file.size,
         mime_type: file.type || "",
-        kind: (file.type || "").indexOf("image/") === 0 ? "image" : "text",
+        kind:
+          (file.type || "").indexOf("image/") === 0
+            ? "image"
+            : (file.type || "").indexOf("audio/") === 0
+              ? "audio"
+              : (file.type || "").indexOf("video/") === 0
+                ? "video"
+                : "text",
         uploading: true,
       };
       pending.set(placeholderId, placeholder);
@@ -198,6 +215,7 @@
             return;
           }
           _swapPlaceholder(placeholderId, res.body);
+          onChange();
         })
         .catch(function (e) {
           _removeChipDom(placeholderId);
@@ -211,6 +229,7 @@
       if (!info) return;
       _removeChipDom(attachmentId);
       pending.delete(attachmentId);
+      onChange();
       if (info.uploading) return; // no server-side row yet
       var wsId = getWsId();
       if (!wsId) return;
@@ -229,6 +248,7 @@
     function clearChips() {
       pending.clear();
       chipsEl.textContent = "";
+      onChange();
     }
 
     function rehydrate() {
@@ -252,6 +272,7 @@
             pending.set(a.attachment_id, a);
             renderChip(a);
           });
+          onChange();
         })
         .catch(function () {
           /* non-fatal */
@@ -276,6 +297,7 @@
           _removeChipDom(id);
           pending.delete(id);
         });
+        onChange();
         if (Array.isArray(droppedIds) && droppedIds.length) {
           onError(
             "Some attachments couldn’t be included (" +

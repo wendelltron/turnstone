@@ -2540,10 +2540,22 @@ async def speech_to_text(request: Request) -> JSONResponse:
         async def _fake_body() -> bytes:
             return body_bytes
 
+        send_req = Request(
+            {
+                **request.scope,
+                "method": "POST",
+                "path": f"/v1/api/workstreams/{ws_id}/send",
+                "raw_path": f"/v1/api/workstreams/{ws_id}/send".encode("utf-8"),
+                "path_params": {**request.path_params, "ws_id": ws_id},
+            },
+            request.receive,
+        )
         request.json = _fake_json  # type: ignore[method-assign]
         request.body = _fake_body  # type: ignore[method-assign]
+        send_req.json = _fake_json  # type: ignore[method-assign]
+        send_req.body = _fake_body  # type: ignore[method-assign]
         try:
-            send_resp = await send_message(request)
+            send_resp = await request.app.state._interactive_send_handler(send_req)
         finally:
             if orig_json is not None:
                 request.json = orig_json  # type: ignore[method-assign]
@@ -4043,6 +4055,7 @@ def create_app(
     )
     events_handler = make_events_handler(interactive_endpoint_config)
     send_handler = make_send_handler(interactive_endpoint_config)
+    app_send_handler = send_handler
     dequeue_handler = make_dequeue_handler(interactive_endpoint_config)
     attachment_handlers = make_attachment_handlers(interactive_endpoint_config)
     create_handler = make_create_handler(
@@ -4183,6 +4196,7 @@ def create_app(
     app.state.idle_timeout = idle_timeout
     app.state.node_id = node_id
     app.state.watch_runner = watch_runner
+    app.state._interactive_send_handler = app_send_handler
     app.state.judge_config = judge_config
     app.state.config_store = config_store
     app.state.advertise_url = advertise_url

@@ -33,52 +33,25 @@ function Pane(wsId) {
   this._cancelTimeout = null;
   this._forceTimeout = null;
   this._pendingEditSend = null;
-  // Map<attachment_id, {filename, size_bytes, mime_type, kind}>
-  this.pendingAttachments = new Map();
-  this.attachChipsEl = null;
   this.mediaRecorder = null;
   this.recordedAudioChunks = [];
   this.isRecording = false;
   this._recordingStream = null;
   this._recordingMimeType = "";
   this._discardRecording = false;
-  this._ttsEnabled = true;
   this._ttsBusy = false;
   this._ttsAudio = null;
   this._ttsLastText = "";
-  this._ttsBtn = null;
   this._micBtn = null;
   this._cameraBtn = null;
   this._videoBtn = null;
   this._observeBtn = null;
   this._intentBtn = null;
-  this._facilitatorToggleBtn = null;
+  this._ttsBtn = null;
   this._clipRecorder = null;
   this._clipStream = null;
   this._clipChunks = [];
   this._isRecordingClip = false;
-  this._facilitatorState = {
-    mode: "off",
-    mic: "idle",
-    camera: "idle",
-    observation: "",
-    intent: "",
-    lastSeen: "never",
-    wakeRelevant: "unknown",
-    action: "observe only",
-  };
-  this._lastFacilitatorPromotionHash = "";
-  this._facilitatorTimer = null;
-  this._facilitatorPanelEl = null;
-  this._facilitatorModeEl = null;
-  this._facilitatorMicEl = null;
-  this._facilitatorCameraEl = null;
-  this._facilitatorObservationEl = null;
-  this._facilitatorIntentEl = null;
-  this._facilitatorPromptInputEl = null;
-  this._facilitatorLastSeenEl = null;
-  this._facilitatorWakeEl = null;
-  this._facilitatorActionEl = null;
   this._createDOM();
 }
 
@@ -211,43 +184,6 @@ Pane.prototype._createDOM = function () {
   this.statusBarEl.appendChild(this._sbTurns);
   this.el.appendChild(this.statusBarEl);
 
-  this._facilitatorPanelEl = document.createElement("div");
-  this._facilitatorPanelEl.className = "ws-facilitator-panel";
-  this._facilitatorPanelEl.setAttribute("role", "status");
-  this._facilitatorPanelEl.setAttribute("aria-live", "polite");
-  this._facilitatorModeEl = document.createElement("div");
-  this._facilitatorModeEl.className = "ws-facilitator-row";
-  this._facilitatorMicEl = document.createElement("div");
-  this._facilitatorMicEl.className = "ws-facilitator-row";
-  this._facilitatorCameraEl = document.createElement("div");
-  this._facilitatorCameraEl.className = "ws-facilitator-row";
-  this._facilitatorObservationEl = document.createElement("div");
-  this._facilitatorObservationEl.className = "ws-facilitator-row";
-  this._facilitatorIntentEl = document.createElement("div");
-  this._facilitatorIntentEl.className = "ws-facilitator-row";
-  this._facilitatorPromptInputEl = document.createElement("input");
-  this._facilitatorPromptInputEl.type = "text";
-  this._facilitatorPromptInputEl.className = "ws-facilitator-prompt";
-  this._facilitatorPromptInputEl.placeholder = "Optional AV instruction (e.g. Did I address the computer?)";
-  this._facilitatorPromptInputEl.setAttribute("aria-label", "Facilitator evaluator instruction");
-  this._facilitatorLastSeenEl = document.createElement("div");
-  this._facilitatorLastSeenEl.className = "ws-facilitator-row";
-  this._facilitatorWakeEl = document.createElement("div");
-  this._facilitatorWakeEl.className = "ws-facilitator-row";
-  this._facilitatorActionEl = document.createElement("div");
-  this._facilitatorActionEl.className = "ws-facilitator-row";
-  this._facilitatorPanelEl.appendChild(this._facilitatorModeEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorMicEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorCameraEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorObservationEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorIntentEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorPromptInputEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorLastSeenEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorWakeEl);
-  this._facilitatorPanelEl.appendChild(this._facilitatorActionEl);
-  this.el.appendChild(this._facilitatorPanelEl);
-  this._renderFacilitatorState();
-
   // Input area — DOM + behavior comes from shared/composer.js.  The
   // pane keeps the attachment-upload pipeline (because attachments are
   // pane-specific state) and routes file events through the composer's
@@ -272,35 +208,47 @@ Pane.prototype._createDOM = function () {
   this.inputEl = this.composer.inputEl;
   this.sendBtn = this.composer.sendBtn;
   this.stopBtn = this.composer.stopBtn;
+  // Lazy wsId read \u2014 a tab swap (Pane re-bound to a new workstream)
+  // changes the closure target without re-instantiating the controllers.
+  this.attachments = createAttachmentController({
+    chipsEl: this.composer.chipsEl,
+    getWsId: function () {
+      return self.wsId;
+    },
+    onError: function (msg) {
+      showToast(msg);
+    },
+    onChange: function () {
+      self._syncMediaButtons();
+    },
+  });
+  this.queue = createQueueController({
+    messagesEl: this.messagesEl,
+    getWsId: function () {
+      return self.wsId;
+    },
+    onAfterDequeue: function () {
+      self.attachments.rehydrate();
+      self._syncMediaButtons();
+    },
+    // Idle-edge cleanup of the cancel/force-stop timers — without
+    // this they fire on the *next* busy turn, relabel Stop to "Force
+    // Stop", and surface a misleading "Cancel didn't complete in
+    // time" toast about a turn the user already moved past.
+    onIdle: function () {
+      if (self._cancelTimeout) {
+        clearTimeout(self._cancelTimeout);
+        self._cancelTimeout = null;
+      }
+      if (self._forceTimeout) {
+        clearTimeout(self._forceTimeout);
+        self._forceTimeout = null;
+      }
+    },
+  });
 
   this._buildMediaControls();
   this._syncMediaButtons();
-};
-
-Pane.prototype._renderFacilitatorState = function () {
-  if (!this._facilitatorPanelEl) return;
-  var s = this._facilitatorState || {};
-  this._facilitatorModeEl.textContent = "Mode: " + (s.mode || "off");
-  this._facilitatorMicEl.textContent = "Mic: " + (s.mic || "idle");
-  this._facilitatorCameraEl.textContent = "Camera: " + (s.camera || "idle");
-  this._facilitatorObservationEl.textContent = s.observation
-    ? "Observation: " + s.observation
-    : "Observation: none";
-  this._facilitatorIntentEl.textContent = s.intent
-    ? "Intent: " + s.intent
-    : "Intent: unknown";
-  this._facilitatorLastSeenEl.textContent = "Last sample: " + (s.lastSeen || "never");
-  this._facilitatorWakeEl.textContent = "Wake-relevant: " + (s.wakeRelevant || "unknown");
-  this._facilitatorActionEl.textContent = "Action: " + (s.action || "observe only");
-};
-
-Pane.prototype._setFacilitatorState = function (patch) {
-  for (var k in patch) {
-    if (Object.prototype.hasOwnProperty.call(patch, k)) {
-      this._facilitatorState[k] = patch[k];
-    }
-  }
-  this._renderFacilitatorState();
 };
 
 Pane.prototype.reset = function () {
@@ -308,238 +256,16 @@ Pane.prototype.reset = function () {
   this.currentReasoningEl = null;
   this.contentBuffer = "";
   this._ttsLastText = "";
-  this._stopFacilitatorLoop();
-  this._setFacilitatorState({
-    mode: "off",
-    mic: "idle",
-    camera: "idle",
-    observation: "",
-    intent: "",
-    lastSeen: "never",
-    wakeRelevant: "unknown",
-    action: "observe only",
-  });
   this.setBusy(false);
   this.pendingApproval = false;
   this.approvalBlockEl = null;
   this._pendingEditSend = null;
   this.inputEl.disabled = false;
-  this.clearAttachmentChips();
+  this.attachments.clearChips();
   this.stopTTSPlayback();
   this.stopRecording(true);
+  this._stopClipCapture();
   this._syncMediaButtons();
-};
-
-// ---------------------------------------------------------------------------
-// Attachment handling
-// ---------------------------------------------------------------------------
-
-Pane.prototype.clearAttachmentChips = function () {
-  if (this.pendingAttachments) this.pendingAttachments.clear();
-  if (this.attachChipsEl) this.attachChipsEl.textContent = "";
-};
-
-function _formatAttachSize(n) {
-  if (n < 1024) return n + " B";
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
-  return (n / (1024 * 1024)).toFixed(1) + " MB";
-}
-
-Pane.prototype._renderAttachmentChip = function (info) {
-  var self = this;
-  var chip = document.createElement("span");
-  chip.className =
-    "ts-composer-chip ts-composer-chip-" + (info.kind || "other");
-  chip.setAttribute("role", "listitem");
-  chip.dataset.attachmentId = info.attachment_id;
-
-  var icon = document.createElement("span");
-  icon.className = "ts-composer-chip-icon";
-  icon.setAttribute("aria-hidden", "true");
-  icon.textContent =
-    info.kind === "image"
-      ? "\ud83d\uddbc"
-      : info.kind === "audio"
-        ? "\ud83c\udfb5"
-        : info.kind === "video"
-          ? "\ud83c\udf9e"
-          : "\ud83d\udcc4";
-  chip.appendChild(icon);
-
-  var label = document.createElement("span");
-  label.className = "ts-composer-chip-name";
-  label.textContent = info.filename || "(unnamed)";
-  label.title = info.filename || "";
-  chip.appendChild(label);
-
-  var size = document.createElement("span");
-  size.className = "ts-composer-chip-size";
-  size.textContent = _formatAttachSize(info.size_bytes || 0);
-  chip.appendChild(size);
-
-  var remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "ts-composer-chip-remove";
-  remove.setAttribute(
-    "aria-label",
-    "Remove attachment " + (info.filename || ""),
-  );
-  remove.title = "Remove";
-  remove.textContent = "\u00d7";
-  remove.onclick = function () {
-    self.removeAttachment(info.attachment_id);
-  };
-  chip.appendChild(remove);
-
-  this.attachChipsEl.appendChild(chip);
-};
-
-Pane.prototype.uploadAttachment = function (file) {
-  if (!this.wsId || !file) return Promise.resolve(null);
-  var self = this;
-  var wsId = this.wsId;
-  var fd = new FormData();
-  fd.append("file", file, file.name);
-
-  // Placeholder chip with upload-in-flight state
-  var placeholderId = "__uploading_" + Date.now() + "_" + Math.random();
-  this.pendingAttachments.set(placeholderId, {
-    attachment_id: placeholderId,
-    filename: file.name,
-    size_bytes: file.size,
-    mime_type: file.type || "",
-    kind: (file.type || "").indexOf("image/") === 0 ? "image" : "text",
-    uploading: true,
-  });
-  this._renderAttachmentChip(this.pendingAttachments.get(placeholderId));
-
-  return authFetch(
-    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
-    { method: "POST", body: fd },
-  )
-    .then(function (r) {
-      return r.json().then(function (body) {
-        return { ok: r.ok, status: r.status, body: body };
-      });
-    })
-    .then(function (res) {
-      if (!res.ok) {
-        // Drop the placeholder; nothing to swap in.
-        self._removeAttachmentChip(placeholderId);
-        showToast((res.body && res.body.error) || "Upload failed");
-        return null;
-      }
-      // Swap placeholder → real id in place so chip and pending-Map
-      // ordering reflect user selection, not upload-completion order.
-      var finalInfo = Object.assign({}, res.body || {});
-      if (file._tsContainsAudio) finalInfo.contains_audio = true;
-      self._swapPlaceholderChip(placeholderId, finalInfo);
-      self._syncMediaButtons();
-      return finalInfo;
-    })
-    .catch(function (e) {
-      // Always clean up the placeholder (including auth failures) so
-      // an "uploading…" chip can't get stuck across re-auth.
-      self._removeAttachmentChip(placeholderId);
-      if ((e && e.message) !== "auth") {
-        showToast("Upload failed");
-      }
-      return null;
-    });
-};
-
-Pane.prototype._removeAttachmentChip = function (id) {
-  var chip = this.attachChipsEl.querySelector(
-    '[data-attachment-id="' + id + '"]',
-  );
-  if (chip) chip.remove();
-  this.pendingAttachments.delete(id);
-};
-
-Pane.prototype._swapPlaceholderChip = function (placeholderId, info) {
-  // Rebuild pendingAttachments preserving insertion order, swapping
-  // the placeholder key for the real attachment_id.  JS Map iteration
-  // is insertion-ordered, so naïve delete+set would move the entry to
-  // the end and reorder send().
-  var rebuilt = new Map();
-  this.pendingAttachments.forEach(function (val, key) {
-    if (key === placeholderId) {
-      rebuilt.set(info.attachment_id, info);
-    } else {
-      rebuilt.set(key, val);
-    }
-  });
-  this.pendingAttachments = rebuilt;
-
-  // Update the existing chip DOM in place so visual order matches.
-  var chip = this.attachChipsEl.querySelector(
-    '[data-attachment-id="' + placeholderId + '"]',
-  );
-  if (chip) {
-    chip.dataset.attachmentId = info.attachment_id;
-    var name = chip.querySelector(".ts-composer-chip-name");
-    if (name) {
-      name.textContent = info.filename || "(unnamed)";
-      name.title = info.filename || "";
-    }
-    var size = chip.querySelector(".ts-composer-chip-size");
-    if (size) size.textContent = _formatAttachSize(info.size_bytes || 0);
-  } else {
-    // Chip missing (user removed it mid-upload?); render fresh.
-    this._renderAttachmentChip(info);
-  }
-};
-
-Pane.prototype.removeAttachment = function (attachmentId) {
-  var wsId = this.wsId;
-  var info = this.pendingAttachments.get(attachmentId);
-  if (!info) return;
-  var chip = this.attachChipsEl.querySelector(
-    '[data-attachment-id="' + attachmentId + '"]',
-  );
-
-  // Optimistic remove
-  if (chip) chip.remove();
-  this.pendingAttachments.delete(attachmentId);
-
-  // In-flight placeholders have no server-side row yet
-  if (info.uploading) return;
-
-  authFetch(
-    "/v1/api/workstreams/" +
-      encodeURIComponent(wsId) +
-      "/attachments/" +
-      encodeURIComponent(attachmentId),
-    { method: "DELETE" },
-  ).catch(function (e) {
-    if ((e && e.message) !== "auth") {
-      showToast("Failed to remove attachment");
-    }
-  });
-};
-
-Pane.prototype.rehydrateAttachments = function () {
-  if (!this.wsId) return;
-  var self = this;
-  var wsId = this.wsId;
-  authFetch(
-    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
-    { method: "GET" },
-  )
-    .then(function (r) {
-      if (!r.ok) return null;
-      return r.json();
-    })
-    .then(function (body) {
-      // Tab may have switched between fire and response
-      if (!body || self.wsId !== wsId) return;
-      self.clearAttachmentChips();
-      (body.attachments || []).forEach(function (a) {
-        self.pendingAttachments.set(a.attachment_id, a);
-        self._renderAttachmentChip(a);
-      });
-    })
-    .catch(function () {});
 };
 
 Pane.prototype.updateWsName = function () {
@@ -565,9 +291,9 @@ Pane.prototype.disconnectSSE = function () {
     this.evtSource.close();
     this.evtSource = null;
   }
-  this._stopFacilitatorLoop();
   this.stopRecording(true);
   this.stopTTSPlayback();
+  this._stopClipCapture();
 };
 
 // composer.setBusy runs unconditionally so the Stop button label /
@@ -583,6 +309,422 @@ Pane.prototype.setBusy = function (b) {
   var edge = next !== this.busy;
   this.busy = next;
   if (edge && !next) this.queue.onIdleEdge();
+};
+
+Pane.prototype._buildMediaControls = function () {
+  if (!this.composer || !this.composer.actionsRowEl) return;
+  var self = this;
+
+  this._micBtn = document.createElement("button");
+  this._micBtn.type = "button";
+  this._micBtn.className = "composer-media-btn composer-mic-btn";
+  this._micBtn.title = "Record speech to text";
+  this._micBtn.setAttribute("aria-label", "Record speech to text");
+  this._micBtn.textContent = "🎙";
+  this._micBtn.addEventListener("click", function () {
+    self.toggleRecording();
+  });
+  this.composer.actionsRowEl.insertBefore(this._micBtn, this.sendBtn || this.stopBtn || null);
+
+  this._cameraBtn = document.createElement("button");
+  this._cameraBtn.type = "button";
+  this._cameraBtn.className = "composer-media-btn composer-camera-btn";
+  this._cameraBtn.title = "Capture webcam snapshot";
+  this._cameraBtn.setAttribute("aria-label", "Capture webcam snapshot");
+  this._cameraBtn.textContent = "📷";
+  this._cameraBtn.addEventListener("click", function () {
+    self.captureSnapshot();
+  });
+  this.composer.actionsRowEl.insertBefore(this._cameraBtn, this.sendBtn || this.stopBtn || null);
+
+  this._videoBtn = document.createElement("button");
+  this._videoBtn.type = "button";
+  this._videoBtn.className = "composer-media-btn composer-video-btn";
+  this._videoBtn.title = "Capture short AV clip";
+  this._videoBtn.setAttribute("aria-label", "Capture short audio and video clip");
+  this._videoBtn.textContent = "🎥";
+  this._videoBtn.addEventListener("click", function () {
+    self.captureVideoClip();
+  });
+  this.composer.actionsRowEl.insertBefore(this._videoBtn, this.sendBtn || this.stopBtn || null);
+
+  this._observeBtn = document.createElement("button");
+  this._observeBtn.type = "button";
+  this._observeBtn.className = "composer-media-btn composer-observe-btn";
+  this._observeBtn.title = "Evaluate latest media attachment";
+  this._observeBtn.setAttribute("aria-label", "Evaluate latest media attachment");
+  this._observeBtn.textContent = "👁";
+  this._observeBtn.addEventListener("click", function () {
+    self.evaluateLatestAttachment("vision_eval");
+  });
+  this.composer.actionsRowEl.insertBefore(this._observeBtn, this.sendBtn || this.stopBtn || null);
+
+  this._intentBtn = document.createElement("button");
+  this._intentBtn.type = "button";
+  this._intentBtn.className = "composer-media-btn composer-intent-btn";
+  this._intentBtn.title = "Check whether latest media suggests user intent";
+  this._intentBtn.setAttribute("aria-label", "Check whether latest media suggests user intent");
+  this._intentBtn.textContent = "🧭";
+  this._intentBtn.addEventListener("click", function () {
+    self.evaluateLatestAttachment("intent_eval");
+  });
+  this.composer.actionsRowEl.insertBefore(this._intentBtn, this.sendBtn || this.stopBtn || null);
+
+  this._ttsBtn = document.createElement("button");
+  this._ttsBtn.type = "button";
+  this._ttsBtn.className = "composer-media-btn composer-tts-btn";
+  this._ttsBtn.title = "Play last assistant response";
+  this._ttsBtn.setAttribute("aria-label", "Play last assistant response");
+  this._ttsBtn.textContent = "🔊";
+  this._ttsBtn.addEventListener("click", function () {
+    self.playLastAssistantTTS();
+  });
+  this.composer.actionsRowEl.insertBefore(this._ttsBtn, this.sendBtn || this.stopBtn || null);
+};
+
+Pane.prototype._syncMediaButtons = function () {
+  if (this._micBtn) {
+    this._micBtn.classList.toggle("is-recording", !!this.isRecording);
+    this._micBtn.textContent = this.isRecording ? "⏺" : "🎙";
+    this._micBtn.disabled = !!this.busy && !this.isRecording;
+  }
+  if (this._cameraBtn) this._cameraBtn.disabled = !!this.busy || !!this._isRecordingClip;
+  if (this._videoBtn) {
+    this._videoBtn.classList.toggle("is-recording", !!this._isRecordingClip);
+    this._videoBtn.textContent = this._isRecordingClip ? "⏺" : "🎥";
+    this._videoBtn.disabled = !!this.busy || !!this.isRecording;
+  }
+  var visionInfo = this._latestEvaluableAttachmentInfo("vision_eval");
+  var intentInfo = this._latestEvaluableAttachmentInfo("intent_eval");
+  if (this._observeBtn) this._observeBtn.disabled = !!this.busy || !visionInfo;
+  if (this._intentBtn) this._intentBtn.disabled = !!this.busy || !intentInfo;
+  if (this._ttsBtn) {
+    var hasText = !!(this._ttsLastText && this._ttsLastText.trim());
+    this._ttsBtn.disabled = !hasText || !!this._ttsBusy;
+    this._ttsBtn.classList.toggle("is-busy", !!this._ttsBusy);
+    this._ttsBtn.textContent = this._ttsBusy ? "…" : "🔊";
+  }
+};
+
+Pane.prototype._guessRecordingMimeType = function () {
+  if (typeof MediaRecorder === "undefined") return "";
+  var candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  for (var i = 0; i < candidates.length; i++) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) return candidates[i];
+  }
+  return "";
+};
+
+Pane.prototype.toggleRecording = function () {
+  if (this.isRecording) this.stopRecording(false);
+  else this.startRecording();
+};
+
+Pane.prototype.startRecording = function () {
+  var self = this;
+  if (this.isRecording) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast("Microphone capture is not supported in this browser");
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(function (stream) {
+      var mimeType = self._guessRecordingMimeType();
+      var rec = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
+      self._recordingMimeType = rec.mimeType || mimeType || "audio/webm";
+      self.mediaRecorder = rec;
+      self.recordedAudioChunks = [];
+      self._recordingStream = stream;
+      rec.addEventListener("dataavailable", function (evt) {
+        if (evt.data && evt.data.size > 0) self.recordedAudioChunks.push(evt.data);
+      });
+      rec.addEventListener("stop", function () {
+        var chunks = self.recordedAudioChunks.slice();
+        self.recordedAudioChunks = [];
+        self.isRecording = false;
+        self._syncMediaButtons();
+        if (self._recordingStream && self._recordingStream.getTracks) {
+          self._recordingStream.getTracks().forEach(function (track) { try { track.stop(); } catch (_e) {} });
+        }
+        self._recordingStream = null;
+        self.mediaRecorder = null;
+        if (!chunks.length) return;
+        var blob = new Blob(chunks, { type: self._recordingMimeType || "audio/webm" });
+        self.uploadAudioForSTT(blob);
+      });
+      rec.start();
+      self.isRecording = true;
+      self._syncMediaButtons();
+      showToast("Recording… click again to stop");
+    })
+    .catch(function (err) {
+      showToast("Microphone unavailable: " + ((err && err.message) || "permission denied"));
+    });
+};
+
+Pane.prototype.stopRecording = function (discard) {
+  if (!this.mediaRecorder) {
+    this.isRecording = false;
+    this._syncMediaButtons();
+    return;
+  }
+  var rec = this.mediaRecorder;
+  if (discard) this.recordedAudioChunks = [];
+  if (rec.state !== "inactive") rec.stop();
+};
+
+Pane.prototype.uploadAudioForSTT = function (blob) {
+  if (!this.wsId || !blob || !blob.size) return;
+  var self = this;
+  var ext = ".webm";
+  var mime = blob.type || "audio/webm";
+  if (mime.indexOf("ogg") !== -1) ext = ".ogg";
+  else if (mime.indexOf("mp4") !== -1 || mime.indexOf("mpeg") !== -1) ext = ".m4a";
+  var fd = new FormData();
+  fd.append("audio", blob, "speech" + ext);
+  if (this.busy) {
+    showToast("Wait for the current turn to finish before transcribing audio");
+    return;
+  }
+  this.setBusy(true);
+  authFetch(
+    "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/speech-to-text?auto_send=true",
+    { method: "POST", body: fd },
+  )
+    .then(function (r) { return r.json().then(function (body) { return { ok: r.ok, body: body }; }); })
+    .then(function (res) {
+      if (!res.ok) {
+        self.addErrorMessage((res.body && res.body.error) || "Speech transcription failed");
+        self.setBusy(false);
+        return;
+      }
+      if (res.body && res.body.transcript) self.addUserMessage(res.body.transcript);
+    })
+    .catch(function (err) {
+      self.addErrorMessage("Speech transcription failed: " + err.message);
+      self.setBusy(false);
+    });
+};
+
+Pane.prototype.captureSnapshot = function () {
+  var self = this;
+  if (this.busy) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast("Camera capture is not supported in this browser");
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({ video: true })
+    .then(function (stream) {
+      var video = document.createElement("video");
+      video.playsInline = true;
+      video.muted = true;
+      video.srcObject = stream;
+      var cleanup = function () { stream.getTracks().forEach(function (track) { try { track.stop(); } catch (_e) {} }); };
+      var capture = function () {
+        var width = video.videoWidth || 1280;
+        var height = video.videoHeight || 720;
+        var maxEdge = 1600;
+        if (width > maxEdge || height > maxEdge) {
+          var scale = Math.min(maxEdge / width, maxEdge / height);
+          width = Math.max(1, Math.round(width * scale));
+          height = Math.max(1, Math.round(height * scale));
+        }
+        var canvas = document.createElement("canvas");
+        canvas.width = width; canvas.height = height;
+        var ctx = canvas.getContext("2d");
+        if (!ctx) { cleanup(); showToast("Snapshot capture failed"); return; }
+        ctx.drawImage(video, 0, 0, width, height);
+        canvas.toBlob(function (blob) {
+          cleanup();
+          if (!blob) { showToast("Snapshot capture failed"); return; }
+          var file = new File([blob], "snapshot-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg", { type: "image/jpeg" });
+          self.attachments.upload(file);
+        }, "image/jpeg", 0.82);
+      };
+      video.addEventListener("loadedmetadata", function () { video.play().then(function () { setTimeout(capture, 120); }); }, { once: true });
+    })
+    .catch(function (err) {
+      showToast("Camera unavailable: " + ((err && err.message) || "permission denied"));
+    });
+};
+
+Pane.prototype._guessVideoClipMimeType = function () {
+  if (typeof MediaRecorder === "undefined") return "";
+  var candidates = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm", "video/mp4"];
+  for (var i = 0; i < candidates.length; i++) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) return candidates[i];
+  }
+  return "";
+};
+
+Pane.prototype._stopClipCapture = function () {
+  if (this._clipStream && this._clipStream.getTracks) {
+    this._clipStream.getTracks().forEach(function (track) { try { track.stop(); } catch (_e) {} });
+  }
+  this._clipStream = null;
+  if (this._clipRecorder && this._clipRecorder.state !== "inactive") this._clipRecorder.stop();
+  this._clipRecorder = null;
+  this._isRecordingClip = false;
+  this._syncMediaButtons();
+};
+
+Pane.prototype.captureVideoClip = function () {
+  var self = this;
+  if (this.busy || this._isRecordingClip) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast("Video capture is not supported in this browser");
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+    .then(function (stream) {
+      var mimeType = self._guessVideoClipMimeType();
+      var recorder = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
+      self._clipStream = stream;
+      self._clipRecorder = recorder;
+      self._clipChunks = [];
+      self._isRecordingClip = true;
+      self._syncMediaButtons();
+      recorder.addEventListener("dataavailable", function (evt) {
+        if (evt.data && evt.data.size > 0) self._clipChunks.push(evt.data);
+      });
+      recorder.addEventListener("stop", function () {
+        var chunks = self._clipChunks.slice();
+        self._clipChunks = [];
+        self._isRecordingClip = false;
+        self._syncMediaButtons();
+        self._stopClipCapture();
+        if (!chunks.length) return;
+        var blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "video/webm" });
+        var ext = (blob.type || "").indexOf("mp4") !== -1 ? ".mp4" : ".webm";
+        var outType = ext === ".mp4" ? "video/mp4" : "video/webm";
+        var file = new File([blob], "clip-" + new Date().toISOString().replace(/[:.]/g, "-") + ext, { type: outType });
+        self.attachments.upload(file);
+      });
+      recorder.start(250);
+      showToast("Recording 3-second AV clip…");
+      setTimeout(function () { if (recorder.state !== "inactive") recorder.stop(); }, 3000);
+    })
+    .catch(function (err) {
+      showToast("Video unavailable: " + ((err && err.message) || "permission denied"));
+    });
+};
+
+Pane.prototype._updateLastAssistantText = function () {
+  var assistants = this.messagesEl.querySelectorAll(".msg.assistant .msg-body");
+  this._ttsLastText = assistants.length
+    ? (assistants[assistants.length - 1].innerText || "").trim()
+    : "";
+  this._syncMediaButtons();
+};
+
+Pane.prototype._latestEvaluableAttachmentInfo = function (role) {
+  var snap = this.attachments.snapshot();
+  var atts = snap.attachments || [];
+  var ids = snap.attachment_ids || [];
+  var picked = null;
+  for (var i = 0; i < atts.length; i++) {
+    var info = atts[i];
+    var kind = info.kind || "";
+    var item = { attachment_id: ids[i], kind: kind, info: info };
+    if (role === "vision_eval") {
+      if (kind === "image") picked = item;
+      else if (!picked && (kind === "video" || kind === "audio")) picked = item;
+    } else if (role === "intent_eval") {
+      if (kind === "video") picked = item;
+      else if (!picked && kind === "audio") picked = item;
+      else if (!picked && kind === "image") picked = item;
+    }
+  }
+  return picked;
+};
+
+Pane.prototype.addEvaluatorResult = function (res) {
+  var el = document.createElement("div");
+  el.className = "msg info";
+  var title =
+    res.role === "intent_eval"
+      ? "Intent check"
+      : res.role === "av_eval"
+        ? "AV observation"
+        : "Scene observation";
+  var parsed = res.parsed && Object.keys(res.parsed).length ? JSON.stringify(res.parsed, null, 2) : res.content || "(empty evaluator response)";
+  el.textContent = title + (res.model_alias ? " · " + res.model_alias : "") + "\n" + parsed;
+  this.messagesEl.appendChild(el);
+  this.scrollToBottom();
+};
+
+Pane.prototype.evaluateLatestAttachment = function (role) {
+  if (!this.wsId || this.busy) return;
+  var self = this;
+  var picked = this._latestEvaluableAttachmentInfo(role);
+  if (!picked) {
+    showToast("No compatible attachment available to evaluate");
+    return;
+  }
+  var body = { role: role };
+  if (picked.kind === "video") body.include_audio_in_video = true;
+  authFetch(
+    "/v1/api/workstreams/" +
+      encodeURIComponent(this.wsId) +
+      "/attachments/" +
+      encodeURIComponent(picked.attachment_id) +
+      "/evaluate",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  )
+    .then(function (r) { return r.json().then(function (body) { return { ok: r.ok, body: body }; }); })
+    .then(function (res) {
+      if (!res.ok) {
+        self.addErrorMessage((res.body && res.body.error) || "Attachment evaluation failed");
+        return;
+      }
+      self.addEvaluatorResult(res.body || {});
+    })
+    .catch(function (err) {
+      self.addErrorMessage("Attachment evaluation failed: " + err.message);
+    });
+};
+
+Pane.prototype.playLastAssistantTTS = function () {
+  if (!this._ttsLastText || !this._ttsLastText.trim() || this._ttsBusy) return;
+  var self = this;
+  this.stopTTSPlayback();
+  this._ttsBusy = true;
+  this._syncMediaButtons();
+  authFetch("/v1/api/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: this._ttsLastText, ws_id: this.wsId || "" }),
+  })
+    .then(function (r) {
+      if (!r.ok) return r.json().then(function (body) { throw new Error((body && body.error) || "TTS failed"); });
+      return r.blob();
+    })
+    .then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var audio = new Audio(url);
+      self._ttsAudio = audio;
+      audio.addEventListener("ended", function () { URL.revokeObjectURL(url); if (self._ttsAudio === audio) self._ttsAudio = null; });
+      audio.addEventListener("error", function () { URL.revokeObjectURL(url); if (self._ttsAudio === audio) self._ttsAudio = null; });
+      return audio.play();
+    })
+    .catch(function (err) {
+      showToast("TTS failed: " + err.message);
+    })
+    .finally(function () {
+      self._ttsBusy = false;
+      self._syncMediaButtons();
+    });
+};
+
+Pane.prototype.stopTTSPlayback = function () {
+  if (this._ttsAudio) {
+    try { this._ttsAudio.pause(); this._ttsAudio.src = ""; } catch (_e) {}
+    this._ttsAudio = null;
+  }
 };
 
 Pane.prototype.showEmptyState = function () {
@@ -785,9 +927,8 @@ Pane.prototype.handleEvent = function (evt) {
       this.currentAssistantEl = null;
       this.currentReasoningEl = null;
       this.contentBuffer = "";
-      this.scrollToBottom(true);
       this._updateLastAssistantText();
-      this._syncMediaButtons();
+      this.scrollToBottom(true);
       break;
 
     case "state_change":
@@ -980,797 +1121,6 @@ Pane.prototype.removeThinkingIndicator = function () {
   if (el) el.remove();
 };
 
-Pane.prototype._buildMediaControls = function () {
-  if (!this.composer || !this.composer.actionsRowEl) return;
-  var self = this;
-
-  this._micBtn = document.createElement("button");
-  this._micBtn.type = "button";
-  this._micBtn.className = "ts-composer-media-btn ts-composer-mic-btn";
-  this._micBtn.title = "Record speech to text";
-  this._micBtn.setAttribute("aria-label", "Record speech to text");
-  this._micBtn.textContent = "🎙";
-  this._micBtn.addEventListener("click", function () {
-    self.toggleRecording();
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._micBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-
-  this._cameraBtn = document.createElement("button");
-  this._cameraBtn.type = "button";
-  this._cameraBtn.className = "ts-composer-media-btn ts-composer-camera-btn";
-  this._cameraBtn.title = "Capture webcam snapshot";
-  this._cameraBtn.setAttribute("aria-label", "Capture webcam snapshot");
-  this._cameraBtn.textContent = "📷";
-  this._cameraBtn.addEventListener("click", function () {
-    self.captureSnapshot();
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._cameraBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-
-  this._videoBtn = document.createElement("button");
-  this._videoBtn.type = "button";
-  this._videoBtn.className = "ts-composer-media-btn ts-composer-video-btn";
-  this._videoBtn.title = "Capture short webcam clip";
-  this._videoBtn.setAttribute("aria-label", "Capture short webcam clip");
-  this._videoBtn.textContent = "🎥";
-  this._videoBtn.addEventListener("click", function () {
-    self.captureVideoClip();
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._videoBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-
-  this._observeBtn = document.createElement("button");
-  this._observeBtn.type = "button";
-  this._observeBtn.className = "ts-composer-media-btn ts-composer-observe-btn";
-  this._observeBtn.title = "Evaluate latest media attachment";
-  this._observeBtn.setAttribute("aria-label", "Evaluate latest media attachment");
-  this._observeBtn.textContent = "👁";
-  this._observeBtn.addEventListener("click", function () {
-    self.evaluateLatestAttachment("vision_eval");
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._observeBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-
-  this._intentBtn = document.createElement("button");
-  this._intentBtn.type = "button";
-  this._intentBtn.className = "ts-composer-media-btn ts-composer-intent-btn";
-  this._intentBtn.title = "Check whether latest media suggests user intent";
-  this._intentBtn.setAttribute("aria-label", "Check whether latest media suggests user intent");
-  this._intentBtn.textContent = "🧭";
-  this._intentBtn.addEventListener("click", function () {
-    self.evaluateLatestAttachment("intent_eval");
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._intentBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-
-  this._facilitatorToggleBtn = document.createElement("button");
-  this._facilitatorToggleBtn.type = "button";
-  this._facilitatorToggleBtn.className = "ts-composer-media-btn ts-composer-facilitator-btn";
-  this._facilitatorToggleBtn.title = "Facilitator sidecar mode off";
-  this._facilitatorToggleBtn.setAttribute("aria-label", "Facilitator sidecar mode off");
-  this._facilitatorToggleBtn.textContent = "🤖";
-  this._facilitatorToggleBtn.addEventListener("click", function () {
-    self.cycleFacilitatorMode();
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._facilitatorToggleBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-
-  this._ttsBtn = document.createElement("button");
-  this._ttsBtn.type = "button";
-  this._ttsBtn.className = "ts-composer-media-btn ts-composer-tts-btn";
-  this._ttsBtn.title = "Play last assistant response";
-  this._ttsBtn.setAttribute("aria-label", "Play last assistant response");
-  this._ttsBtn.textContent = "🔊";
-  this._ttsBtn.addEventListener("click", function () {
-    self.playLastAssistantTTS();
-  });
-  this.composer.actionsRowEl.insertBefore(
-    this._ttsBtn,
-    this.sendBtn || this.stopBtn || null,
-  );
-};
-
-Pane.prototype._syncMediaButtons = function () {
-  if (this._micBtn) {
-    this._micBtn.classList.toggle("is-recording", !!this.isRecording);
-    this._micBtn.textContent = this.isRecording ? "⏺" : "🎙";
-    this._micBtn.title = this.isRecording
-      ? "Stop recording and transcribe"
-      : "Record speech to text";
-    this._micBtn.setAttribute(
-      "aria-label",
-      this.isRecording
-        ? "Stop recording and transcribe"
-        : "Record speech to text",
-    );
-  }
-  if (this._cameraBtn) {
-    this._cameraBtn.disabled = !!this.busy || !!this._isRecordingClip;
-  }
-  if (this._videoBtn) {
-    this._videoBtn.disabled = !!this.busy;
-    this._videoBtn.classList.toggle("is-recording", !!this._isRecordingClip);
-    this._videoBtn.textContent = this._isRecordingClip ? "⏺" : "🎥";
-    this._videoBtn.title = this._isRecordingClip
-      ? "Recording short webcam clip…"
-      : "Capture short webcam clip";
-    this._videoBtn.setAttribute(
-      "aria-label",
-      this._isRecordingClip
-        ? "Recording short webcam clip"
-        : "Capture short webcam clip",
-    );
-  }
-  var evaluable = this._latestEvaluableAttachment("vision_eval");
-  var intentEvaluable = this._latestEvaluableAttachment("intent_eval");
-  if (this._observeBtn) {
-    this._observeBtn.disabled = !!this.busy || !evaluable;
-  }
-  if (this._intentBtn) {
-    this._intentBtn.disabled = !!this.busy || !intentEvaluable;
-  }
-  if (this._facilitatorToggleBtn) {
-    var mode = this._facilitatorState.mode || "off";
-    this._facilitatorToggleBtn.disabled = !!this.busy;
-    this._facilitatorToggleBtn.textContent = mode === "off" ? "🤖" : mode === "observe" ? "👁" : "🧭";
-    this._facilitatorToggleBtn.title =
-      mode === "off"
-        ? "Facilitator sidecar mode off"
-        : mode === "observe"
-          ? "Facilitator sidecar observing"
-          : "Facilitator sidecar observing + intent";
-    this._facilitatorToggleBtn.setAttribute("aria-label", this._facilitatorToggleBtn.title);
-  }
-  if (this._ttsBtn) {
-    var hasText = !!(this._ttsLastText && this._ttsLastText.trim());
-    this._ttsBtn.disabled = !hasText || !!this._ttsBusy;
-    this._ttsBtn.classList.toggle("is-busy", !!this._ttsBusy);
-    if (this._ttsBusy) {
-      this._ttsBtn.textContent = "…";
-      this._ttsBtn.title = "Synthesizing speech";
-      this._ttsBtn.setAttribute("aria-label", "Synthesizing speech");
-    } else {
-      this._ttsBtn.textContent = "🔊";
-      this._ttsBtn.title = hasText
-        ? "Play last assistant response"
-        : "No assistant response available";
-      this._ttsBtn.setAttribute(
-        "aria-label",
-        hasText ? "Play last assistant response" : "No assistant response available",
-      );
-    }
-  }
-};
-
-Pane.prototype._guessRecordingMimeType = function () {
-  if (typeof MediaRecorder === "undefined") return "";
-  var candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus",
-    "audio/mp4",
-  ];
-  for (var i = 0; i < candidates.length; i++) {
-    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) {
-      return candidates[i];
-    }
-  }
-  return "";
-};
-
-Pane.prototype.toggleRecording = function () {
-  if (this.isRecording) {
-    this.stopRecording(false);
-    return;
-  }
-  this.startRecording();
-};
-
-Pane.prototype.startRecording = function () {
-  var self = this;
-  if (this.isRecording) return;
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showToast("Microphone capture is not supported in this browser");
-    return;
-  }
-  navigator.mediaDevices
-    .getUserMedia({ audio: true })
-    .then(function (stream) {
-      var mimeType = self._guessRecordingMimeType();
-      var rec = mimeType ? new MediaRecorder(stream, { mimeType: mimeType }) : new MediaRecorder(stream);
-      self._recordingMimeType = rec.mimeType || mimeType || "audio/webm";
-      self.mediaRecorder = rec;
-      self.recordedAudioChunks = [];
-      self._recordingStream = stream;
-      rec.addEventListener("dataavailable", function (evt) {
-        if (evt.data && evt.data.size > 0) {
-          self.recordedAudioChunks.push(evt.data);
-        }
-      });
-      rec.addEventListener("stop", function () {
-        var chunks = self.recordedAudioChunks.slice();
-        var discard = !!self._discardRecording;
-        self._discardRecording = false;
-        self.recordedAudioChunks = [];
-        self.isRecording = false;
-        self._setFacilitatorState({ mic: "processing" });
-        self._syncMediaButtons();
-        self._teardownRecordingStream();
-        self.mediaRecorder = null;
-        if (discard || !chunks.length) return;
-        var blob = new Blob(chunks, { type: self._recordingMimeType || "audio/webm" });
-        self.uploadAudioForSTT(blob);
-      });
-      rec.start();
-      self.isRecording = true;
-      self._setFacilitatorState({ mic: "listening" });
-      self._syncMediaButtons();
-      showToast("Recording… click again to stop");
-    })
-    .catch(function (err) {
-      showToast("Microphone unavailable: " + ((err && err.message) || "permission denied"));
-    });
-};
-
-Pane.prototype._teardownRecordingStream = function () {
-  if (this._recordingStream && this._recordingStream.getTracks) {
-    this._recordingStream.getTracks().forEach(function (track) {
-      try {
-        track.stop();
-      } catch (_e) {}
-    });
-  }
-  this._recordingStream = null;
-};
-
-Pane.prototype.stopRecording = function (discard) {
-  if (!this.mediaRecorder) {
-    this.isRecording = false;
-    this._teardownRecordingStream();
-    this._setFacilitatorState({ mic: "idle" });
-    this._syncMediaButtons();
-    return;
-  }
-  var rec = this.mediaRecorder;
-  this._discardRecording = !!discard;
-  if (rec.state !== "inactive") {
-    rec.stop();
-  } else if (discard) {
-    this.recordedAudioChunks = [];
-    this.isRecording = false;
-    this._discardRecording = false;
-    this._teardownRecordingStream();
-    this.mediaRecorder = null;
-    this._syncMediaButtons();
-  }
-};
-
-Pane.prototype.uploadAudioForSTT = function (blob) {
-  if (!this.wsId || !blob || !blob.size) return;
-  var self = this;
-  var ext = ".webm";
-  var mime = blob.type || "audio/webm";
-  if (mime.indexOf("ogg") !== -1) ext = ".ogg";
-  else if (mime.indexOf("mp4") !== -1 || mime.indexOf("mpeg") !== -1) ext = ".m4a";
-  var fd = new FormData();
-  fd.append("audio", blob, "speech" + ext);
-
-  if (this.busy) {
-    showToast("Wait for the current turn to finish before transcribing audio");
-    return;
-  }
-  this.setBusy(true);
-  authFetch(
-    "/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/speech-to-text?auto_send=true",
-    { method: "POST", body: fd },
-  )
-    .then(function (r) {
-      return r.json().then(function (body) {
-        return { ok: r.ok, body: body };
-      });
-    })
-    .then(function (res) {
-      if (!res.ok) {
-        self.addErrorMessage((res.body && res.body.error) || "Speech transcription failed");
-        self.setBusy(false);
-        return;
-      }
-      if (res.body && res.body.transcript) {
-        self.addUserMessage(res.body.transcript);
-        self.composer.clear();
-        self._setFacilitatorState({ mic: "idle" });
-      }
-    })
-    .catch(function (err) {
-      self.addErrorMessage("Speech transcription failed: " + err.message);
-      self._setFacilitatorState({ mic: "error" });
-      self.setBusy(false);
-    });
-};
-
-Pane.prototype.captureSnapshot = function () {
-  var self = this;
-  if (this.busy) return Promise.resolve(null);
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showToast("Camera capture is not supported in this browser");
-    return Promise.resolve(null);
-  }
-  this._setFacilitatorState({ camera: "capturing snapshot" });
-  return navigator.mediaDevices
-    .getUserMedia({ video: true })
-    .then(function (stream) {
-      return new Promise(function (resolve) {
-        var video = document.createElement("video");
-        video.playsInline = true;
-        video.muted = true;
-        video.srcObject = stream;
-        var cleanup = function () {
-          stream.getTracks().forEach(function (track) {
-            try {
-              track.stop();
-            } catch (_e) {}
-          });
-        };
-        var capture = function () {
-        var width = video.videoWidth || 1280;
-        var height = video.videoHeight || 720;
-        var maxEdge = 1600;
-        if (width > maxEdge || height > maxEdge) {
-          var scale = Math.min(maxEdge / width, maxEdge / height);
-          width = Math.max(1, Math.round(width * scale));
-          height = Math.max(1, Math.round(height * scale));
-        }
-        var canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        var ctx = canvas.getContext("2d");
-        if (!ctx) {
-          cleanup();
-          showToast("Snapshot capture failed");
-          resolve(null);
-          return;
-        }
-        ctx.drawImage(video, 0, 0, width, height);
-        canvas.toBlob(
-          function (blob) {
-            cleanup();
-            if (!blob) {
-              showToast("Snapshot capture failed");
-              resolve(null);
-              return;
-            }
-            var file = new File(
-              [blob],
-              "snapshot-" + new Date().toISOString().replace(/[:.]/g, "-") + ".jpg",
-              { type: "image/jpeg" },
-            );
-            self._setFacilitatorState({ camera: "snapshot attached" });
-            self.uploadAttachment(file).then(resolve);
-          },
-          "image/jpeg",
-          0.82,
-        );
-      };
-        video.addEventListener(
-          "loadedmetadata",
-          function () {
-            video.play().then(function () {
-              setTimeout(capture, 120);
-            });
-          },
-          { once: true },
-        );
-      });
-    })
-    .catch(function (err) {
-      self._setFacilitatorState({ camera: "camera error" });
-      showToast("Camera unavailable: " + ((err && err.message) || "permission denied"));
-      return null;
-    });
-};
-
-Pane.prototype._guessVideoClipMimeType = function () {
-  if (typeof MediaRecorder === "undefined") return "";
-  var candidates = [
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm",
-    "video/mp4",
-  ];
-  for (var i = 0; i < candidates.length; i++) {
-    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidates[i])) {
-      return candidates[i];
-    }
-  }
-  return "";
-};
-
-Pane.prototype._teardownClipStream = function () {
-  if (this._clipStream && this._clipStream.getTracks) {
-    this._clipStream.getTracks().forEach(function (track) {
-      try {
-        track.stop();
-      } catch (_e) {}
-    });
-  }
-  this._clipStream = null;
-};
-
-Pane.prototype.captureVideoClip = function () {
-  var self = this;
-  if (this.busy || this._isRecordingClip) return Promise.resolve(null);
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    showToast("Video capture is not supported in this browser");
-    return Promise.resolve(null);
-  }
-  return navigator.mediaDevices
-    .getUserMedia({ video: true, audio: true })
-    .then(function (stream) {
-      return new Promise(function (resolve) {
-      var mimeType = self._guessVideoClipMimeType();
-      var recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType: mimeType })
-        : new MediaRecorder(stream);
-      self._clipStream = stream;
-      self._clipRecorder = recorder;
-      self._clipChunks = [];
-      self._isRecordingClip = true;
-      self._setFacilitatorState({ camera: "recording short clip" });
-      self._syncMediaButtons();
-      recorder.addEventListener("dataavailable", function (evt) {
-        if (evt.data && evt.data.size > 0) self._clipChunks.push(evt.data);
-      });
-      recorder.addEventListener("stop", function () {
-        var chunks = self._clipChunks.slice();
-        self._clipChunks = [];
-        self._isRecordingClip = false;
-        self._setFacilitatorState({ camera: "clip attached" });
-        self._syncMediaButtons();
-        self._teardownClipStream();
-        self._clipRecorder = null;
-        if (!chunks.length) {
-          resolve(null);
-          return;
-        }
-        var blob = new Blob(chunks, { type: recorder.mimeType || mimeType || "video/webm" });
-        var ext = (blob.type || "").indexOf("mp4") !== -1 ? ".mp4" : ".webm";
-        var outType = ext === ".mp4" ? "video/mp4" : "video/webm";
-        var file = new File(
-          [blob],
-          "clip-" + new Date().toISOString().replace(/[:.]/g, "-") + ext,
-          { type: outType },
-        );
-        file._tsContainsAudio = true;
-        self.uploadAttachment(file).then(resolve);
-      });
-        recorder.start(250);
-        showToast("Recording 3-second webcam clip…");
-        setTimeout(function () {
-          if (recorder.state !== "inactive") recorder.stop();
-        }, 3000);
-      });
-    })
-    .catch(function (err) {
-      self._setFacilitatorState({ camera: "camera error" });
-      showToast("Video unavailable: " + ((err && err.message) || "permission denied"));
-      return null;
-    });
-};
-
-Pane.prototype.stopTTSPlayback = function () {
-  if (this._ttsAudio) {
-    try {
-      this._ttsAudio.pause();
-      this._ttsAudio.src = "";
-    } catch (_e) {}
-    this._ttsAudio = null;
-  }
-};
-
-Pane.prototype._latestEvaluableAttachment = function (role) {
-  var picked = null;
-  this.pendingAttachments.forEach(function (info) {
-    if (!info || info.uploading) return;
-    if (role === "vision_eval") {
-      if (info.kind === "image") picked = info;
-      else if (!picked && (info.kind === "video" || info.kind === "audio")) picked = info;
-      return;
-    }
-    if (role === "intent_eval") {
-      if (info.kind === "video") picked = info;
-      else if (!picked && info.kind === "audio") picked = info;
-      else if (!picked && info.kind === "image") picked = info;
-      return;
-    }
-    if (role === "av_eval") {
-      if (info.kind === "video") picked = info;
-      else if (!picked && info.kind === "audio") picked = info;
-      return;
-    }
-  });
-  return picked;
-};
-
-Pane.prototype.addEvaluatorResult = function (res) {
-  var box = document.createElement("div");
-  box.className = "ts-msg ts-msg--info ts-msg--evaluator";
-  var title = document.createElement("div");
-  title.className = "ts-evaluator-title";
-  title.textContent =
-    (res.role === "intent_eval"
-      ? "Intent check"
-      : res.role === "av_eval"
-        ? "AV observation"
-        : "Scene observation") +
-    (res.model_alias ? " · " + res.model_alias : "");
-  box.appendChild(title);
-  var body = document.createElement("pre");
-  body.className = "ts-evaluator-body";
-  if (res.parsed && Object.keys(res.parsed).length) {
-    body.textContent = JSON.stringify(res.parsed, null, 2);
-  } else {
-    body.textContent = res.content || "(empty evaluator response)";
-  }
-  var summary = (res.parsed && (res.parsed.summary || res.parsed.transcript)) || res.content || "";
-  var now = new Date().toLocaleTimeString();
-  var wakeRelevant =
-    res.parsed && Object.prototype.hasOwnProperty.call(res.parsed, "wake_relevant")
-      ? String(!!res.parsed.wake_relevant)
-      : this._facilitatorState.wakeRelevant;
-  var action = wakeRelevant === "true" ? "would inject / alert" : "observe only";
-  if (res.role === "intent_eval") {
-    this._setFacilitatorState({
-      intent: summary.slice(0, 160) || "checked",
-      lastSeen: now,
-      wakeRelevant: wakeRelevant,
-      action: action,
-    });
-  } else {
-    this._setFacilitatorState({
-      observation: summary.slice(0, 160) || "updated",
-      lastSeen: now,
-      action: action,
-    });
-  }
-  box.appendChild(body);
-  this.messagesEl.appendChild(box);
-  this.scrollToBottom();
-};
-
-Pane.prototype.evaluateAttachmentById = function (role, attachmentId, opts) {
-  if (!this.wsId || this.busy || !attachmentId) return Promise.resolve(null);
-  var self = this;
-  opts = opts || {};
-  return authFetch(
-    "/v1/api/workstreams/" +
-      encodeURIComponent(this.wsId) +
-      "/attachments/" +
-      encodeURIComponent(attachmentId) +
-      "/evaluate",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        role: role,
-        prompt: (this._facilitatorPromptInputEl && this._facilitatorPromptInputEl.value.trim()) || "",
-        include_audio_in_video: !!opts.includeAudioInVideo,
-      }),
-    },
-  )
-    .then(function (r) {
-      return r.json().then(function (body) {
-        return { ok: r.ok, body: body };
-      });
-    })
-    .then(function (res) {
-      if (!res.ok) {
-        self.addErrorMessage((res.body && res.body.error) || "Attachment evaluation failed");
-        return null;
-      }
-      if (opts.showInChat !== false) self.addEvaluatorResult(res.body || {});
-      else {
-        var data = res.body || {};
-        var summary = (data.parsed && (data.parsed.summary || data.parsed.transcript)) || data.content || "";
-        var now = new Date().toLocaleTimeString();
-        var wakeRelevant =
-          data.parsed && Object.prototype.hasOwnProperty.call(data.parsed, "wake_relevant")
-            ? String(!!data.parsed.wake_relevant)
-            : self._facilitatorState.wakeRelevant;
-        var action = wakeRelevant === "true" ? "would inject / alert" : "observe only";
-        if (data.role === "intent_eval") {
-          self._setFacilitatorState({
-            intent: summary.slice(0, 160) || "checked",
-            lastSeen: now,
-            wakeRelevant: wakeRelevant,
-            action: action,
-          });
-          self._maybePromoteFacilitatorObservation(data);
-        } else {
-          self._setFacilitatorState({
-            observation: summary.slice(0, 160) || "updated",
-            lastSeen: now,
-            action: action,
-          });
-        }
-      }
-      if (opts.ephemeral) self.removeAttachment(attachmentId);
-      self._syncMediaButtons();
-      return res.body || {};
-    })
-    .catch(function (err) {
-      self.addErrorMessage("Attachment evaluation failed: " + err.message);
-      return null;
-    });
-};
-
-Pane.prototype.evaluateLatestAttachment = function (role) {
-  if (!this.wsId || this.busy) return;
-  var info = this._latestEvaluableAttachment(role);
-  if (!info) {
-    showToast("No compatible attachment available to evaluate");
-    return;
-  }
-  this.evaluateAttachmentById(role, info.attachment_id, {
-    showInChat: true,
-    includeAudioInVideo: !!info.contains_audio,
-  });
-};
-
-Pane.prototype._stopFacilitatorLoop = function () {
-  if (this._facilitatorTimer) {
-    clearInterval(this._facilitatorTimer);
-    this._facilitatorTimer = null;
-  }
-};
-
-Pane.prototype._startFacilitatorLoop = function () {
-  var self = this;
-  this._stopFacilitatorLoop();
-  var mode = this._facilitatorState.mode || "off";
-  if (mode === "off") return;
-  var everyMs = mode === "observe" ? 20000 : 25000;
-  this._facilitatorTimer = setInterval(function () {
-    if (!self.wsId || self.busy || self.isRecording || self._isRecordingClip) return;
-    if (mode === "observe") {
-      self.captureSnapshot().then(function (info) {
-        if (info && info.attachment_id) {
-          self.evaluateAttachmentById("vision_eval", info.attachment_id, {
-            showInChat: false,
-            ephemeral: true,
-            includeAudioInVideo: !!info.contains_audio,
-          });
-        }
-      });
-      return;
-    }
-    self.captureVideoClip().then(function (info) {
-      if (info && info.attachment_id) {
-        self.evaluateAttachmentById("intent_eval", info.attachment_id, {
-          showInChat: false,
-          ephemeral: true,
-          includeAudioInVideo: !!info.contains_audio,
-        });
-      }
-    });
-  }, everyMs);
-};
-
-Pane.prototype._maybePromoteFacilitatorObservation = function (data) {
-  if (!data || data.role !== "intent_eval") return;
-  if ((this._facilitatorState.mode || "off") !== "observe+intent") return;
-  var parsed = data.parsed || {};
-  if (!parsed.wake_relevant) return;
-  var summary = (parsed.summary || parsed.transcript || data.content || "").trim();
-  if (!summary) return;
-  var hash = summary.slice(0, 240);
-  if (hash === this._lastFacilitatorPromotionHash) return;
-  this._lastFacilitatorPromotionHash = hash;
-  this._setFacilitatorState({ action: "injecting facilitator note" });
-  var note = "[facilitator sidecar] Wake-relevant observation: " + summary;
-  this.addInfoMessage("Facilitator promoted an observation into the workstream.");
-  var self = this;
-  authFetch("/v1/api/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: note, ws_id: this.wsId }),
-  })
-    .then(function (r) {
-      return r.json().then(function (body) {
-        return { ok: r.ok, body: body };
-      });
-    })
-    .then(function (res) {
-      if (!res.ok) {
-        self._setFacilitatorState({ action: "promotion failed" });
-        self.addErrorMessage((res.body && res.body.error) || "Facilitator promotion failed");
-        return;
-      }
-      self._setFacilitatorState({ action: "observation injected" });
-    })
-    .catch(function (err) {
-      self._setFacilitatorState({ action: "promotion failed" });
-      self.addErrorMessage("Facilitator promotion failed: " + err.message);
-    });
-};
-
-Pane.prototype.cycleFacilitatorMode = function () {
-  var mode = this._facilitatorState.mode || "off";
-  var next = mode === "off" ? "observe" : mode === "observe" ? "observe+intent" : "off";
-  this._setFacilitatorState({
-    mode: next,
-    action:
-      next === "observe+intent"
-        ? "auto inject on wake-relevant intent"
-        : next === "observe"
-          ? "observe only"
-          : "observe only",
-  });
-  this._syncMediaButtons();
-  this._startFacilitatorLoop();
-  showToast(
-    next === "off"
-      ? "Facilitator sidecar off"
-      : next === "observe"
-        ? "Facilitator observing snapshots every 20s"
-        : "Facilitator observing short clips every 25s with intent checks",
-  );
-};
-
-Pane.prototype.playLastAssistantTTS = function () {
-  if (!this._ttsLastText || !this._ttsLastText.trim() || this._ttsBusy) return;
-  var self = this;
-  this.stopTTSPlayback();
-  this._ttsBusy = true;
-  this._syncMediaButtons();
-  authFetch("/v1/api/tts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: this._ttsLastText, ws_id: this.wsId || "" }),
-  })
-    .then(function (r) {
-      if (!r.ok) {
-        return r.json().then(function (body) {
-          throw new Error((body && body.error) || "TTS failed");
-        });
-      }
-      return r.blob();
-    })
-    .then(function (blob) {
-      var url = URL.createObjectURL(blob);
-      var audio = new Audio(url);
-      self._ttsAudio = audio;
-      audio.addEventListener("ended", function () {
-        URL.revokeObjectURL(url);
-        if (self._ttsAudio === audio) self._ttsAudio = null;
-      });
-      audio.addEventListener("error", function () {
-        URL.revokeObjectURL(url);
-        if (self._ttsAudio === audio) self._ttsAudio = null;
-      });
-      return audio.play();
-    })
-    .catch(function (err) {
-      showToast("TTS failed: " + err.message);
-    })
-    .finally(function () {
-      self._ttsBusy = false;
-      self._syncMediaButtons();
-    });
-};
-
 Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
@@ -1789,26 +1139,12 @@ Pane.prototype.addUserMessage = function (text, attachments) {
       var icon = document.createElement("span");
       icon.className = "msg-user-attach-icon";
       icon.setAttribute("aria-hidden", "true");
-      icon.textContent =
-        a.kind === "image"
-          ? "\ud83d\uddbc"
-          : a.kind === "audio"
-            ? "\ud83c\udfb5"
-            : a.kind === "video"
-              ? "\ud83c\udf9e"
-              : "\ud83d\udcc4";
+      icon.textContent = a.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
       pill.appendChild(icon);
       var nameEl = document.createElement("span");
       nameEl.className = "msg-user-attach-name";
       nameEl.textContent =
-        a.filename ||
-        (a.kind === "image"
-          ? "image"
-          : a.kind === "audio"
-            ? "audio"
-            : a.kind === "video"
-              ? "video"
-              : "document");
+        a.filename || (a.kind === "image" ? "image" : "document");
       pill.appendChild(nameEl);
       pills.appendChild(pill);
     });
@@ -2014,16 +1350,6 @@ Pane.prototype._editAndResend = function (msgEl, newText) {
       self.addErrorMessage("Rewind failed: " + err.message);
       self.setBusy(false);
     });
-};
-
-Pane.prototype._updateLastAssistantText = function () {
-  var assistants = this.messagesEl.querySelectorAll(".ts-msg--assistant .ts-msg-body");
-  var text = "";
-  if (assistants.length) {
-    text = (assistants[assistants.length - 1].innerText || "").trim();
-  }
-  this._ttsLastText = text;
-  this._syncMediaButtons();
 };
 
 Pane.prototype.replayHistory = function (messages) {
@@ -2686,7 +2012,6 @@ Pane.prototype.sendMessage = function () {
     this.addUserMessage(text, snap.attachments);
   }
   this.composer.clear();
-  this._syncMediaButtons();
 
   authFetch("/v1/api/workstreams/" + encodeURIComponent(this.wsId) + "/send", {
     method: "POST",
@@ -3927,34 +3252,6 @@ var _ATTACH_TEXT_APP_MIMES = [
   "application/yaml",
   "application/toml",
 ];
-var _ATTACH_AUDIO_MIMES = [
-  "audio/wav",
-  "audio/x-wav",
-  "audio/mpeg",
-  "audio/mp3",
-  "audio/ogg",
-  "audio/flac",
-  "audio/mp4",
-  "audio/m4a",
-  "audio/webm",
-];
-var _ATTACH_VIDEO_MIMES = [
-  "video/mp4",
-  "video/quicktime",
-  "video/x-msvideo",
-  "video/webm",
-];
-var _ATTACH_AV_EXTENSIONS = [
-  ".wav",
-  ".mp3",
-  ".ogg",
-  ".flac",
-  ".m4a",
-  ".webm",
-  ".mp4",
-  ".mov",
-  ".avi",
-];
 var _ATTACH_TEXT_EXTENSIONS = [
   ".c",
   ".conf",
@@ -3986,16 +3283,11 @@ var _ATTACH_TEXT_EXTENSIONS = [
 function _isAttachmentAllowed(file) {
   var mime = (file.type || "").toLowerCase();
   if (_ATTACH_IMAGE_MIMES.indexOf(mime) !== -1) return true;
-  if (_ATTACH_AUDIO_MIMES.indexOf(mime) !== -1) return true;
-  if (_ATTACH_VIDEO_MIMES.indexOf(mime) !== -1) return true;
   if (mime.indexOf("text/") === 0) return true;
   if (_ATTACH_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
   var name = (file.name || "").toLowerCase();
   var dot = name.lastIndexOf(".");
   if (dot >= 0 && _ATTACH_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
-    return true;
-  }
-  if (dot >= 0 && _ATTACH_AV_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
     return true;
   }
   return false;
@@ -4015,14 +3307,12 @@ function _newWsAddFiles(files) {
       errEl.textContent =
         "Unsupported file type: " +
         f.name +
-        " (allowed: png/jpeg/gif/webp images, audio/video clips, text)";
+        " (allowed: png/jpeg/gif/webp images, text)";
       errEl.style.display = "block";
       return;
     }
-    var mime = (f.type || "").toLowerCase();
-    var isImage = mime.indexOf("image/") === 0;
-    var isAv = mime.indexOf("audio/") === 0 || mime.indexOf("video/") === 0;
-    var cap = isImage ? _NEW_WS_IMAGE_CAP : isAv ? 25 * 1024 * 1024 : _NEW_WS_TEXT_CAP;
+    var isImage = (f.type || "").indexOf("image/") === 0;
+    var cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
     if (f.size > cap) {
       errEl.textContent =
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap";
@@ -4071,7 +3361,7 @@ function showNewWsModal(forkFromWsId) {
     if (e.target === overlay) hideNewWsModal();
   };
 
-  // Populate model dropdown
+  // Populate model dropdowns
   var modelSelect = document.getElementById("new-ws-model");
   var judgeSelect = document.getElementById("new-ws-judge-model");
   var sttSelect = document.getElementById("new-ws-stt-model");
@@ -4128,7 +3418,6 @@ function showNewWsModal(forkFromWsId) {
         judgeOpt.value = m.alias;
         judgeOpt.textContent = opt.textContent;
         judgeSelect.appendChild(judgeOpt);
-
         [sttSelect, ttsSelect, visionEvalSelect, avEvalSelect, intentEvalSelect].forEach(function (sel) {
           if (!sel) return;
           var extraOpt = document.createElement("option");
@@ -4171,8 +3460,6 @@ function showNewWsModal(forkFromWsId) {
   if (intentEvalSelect) intentEvalSelect.value = "";
   var initEl = document.getElementById("new-ws-initial-message");
   if (initEl) initEl.value = "";
-  var mediaRouting = document.getElementById("new-ws-media-routing");
-  if (mediaRouting) mediaRouting.open = false;
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
   errEl.textContent = "";
@@ -5341,14 +4628,12 @@ function _addDashboardFiles(files) {
       _dashboardError(
         "Unsupported file type: " +
           f.name +
-          " (allowed: png/jpeg/gif/webp images, audio/video clips, text)",
+          " (allowed: png/jpeg/gif/webp images, text)",
       );
       return;
     }
-    var mime = (f.type || "").toLowerCase();
-    var isImage = mime.indexOf("image/") === 0;
-    var isAv = mime.indexOf("audio/") === 0 || mime.indexOf("video/") === 0;
-    var cap = isImage ? _DASH_IMAGE_CAP : isAv ? 25 * 1024 * 1024 : _DASH_TEXT_CAP;
+    var isImage = (f.type || "").indexOf("image/") === 0;
+    var cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
     if (f.size > cap) {
       _dashboardError(
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
@@ -5396,6 +4681,11 @@ function _loadDashboardOptionsLists() {
   // Models
   var modelSel = document.getElementById("dashboard-model");
   var judgeSel = document.getElementById("dashboard-judge-model");
+  var sttSel = document.getElementById("dashboard-stt-model");
+  var ttsSel = document.getElementById("dashboard-tts-model");
+  var visionSel = document.getElementById("dashboard-vision-eval-model");
+  var avSel = document.getElementById("dashboard-av-eval-model");
+  var intentSel = document.getElementById("dashboard-intent-eval-model");
   if (modelSel && modelSel.options.length <= 1) {
     authFetch("/v1/api/models")
       .then(function (r) {
@@ -5414,6 +4704,13 @@ function _loadDashboardOptionsLists() {
             jOpt.textContent = opt.textContent;
             judgeSel.appendChild(jOpt);
           }
+          [sttSel, ttsSel, visionSel, avSel, intentSel].forEach(function (sel) {
+            if (!sel) return;
+            var extraOpt = document.createElement("option");
+            extraOpt.value = m.alias;
+            extraOpt.textContent = opt.textContent;
+            sel.appendChild(extraOpt);
+          });
         });
       })
       .catch(function () {
@@ -5514,9 +4811,19 @@ function _refreshDashboardOptionsSummary() {
   var modelSel = document.getElementById("dashboard-model");
   var judgeSel = document.getElementById("dashboard-judge-model");
   var skillSel = document.getElementById("dashboard-skill");
+  var sttSel = document.getElementById("dashboard-stt-model");
+  var ttsSel = document.getElementById("dashboard-tts-model");
+  var visionSel = document.getElementById("dashboard-vision-eval-model");
+  var avSel = document.getElementById("dashboard-av-eval-model");
+  var intentSel = document.getElementById("dashboard-intent-eval-model");
   if (modelSel && modelSel.value) bits.push(modelSel.value);
   if (judgeSel && judgeSel.value) bits.push("judge: " + judgeSel.value);
   if (skillSel && skillSel.value) bits.push(skillSel.value);
+  if (sttSel && sttSel.value) bits.push("stt: " + sttSel.value);
+  if (ttsSel && ttsSel.value) bits.push("tts: " + ttsSel.value);
+  if (visionSel && visionSel.value) bits.push("vision: " + visionSel.value);
+  if (avSel && avSel.value) bits.push("av: " + avSel.value);
+  if (intentSel && intentSel.value) bits.push("intent: " + intentSel.value);
   if (bits.length === 0) {
     summary.textContent = "";
     summary.setAttribute("hidden", "");
@@ -5538,9 +4845,19 @@ function dashboardSubmit() {
   var body = {};
   var model = document.getElementById("dashboard-model").value.trim();
   var judge = document.getElementById("dashboard-judge-model").value.trim();
+  var sttModel = document.getElementById("dashboard-stt-model").value.trim();
+  var ttsModel = document.getElementById("dashboard-tts-model").value.trim();
+  var visionEvalModel = document.getElementById("dashboard-vision-eval-model").value.trim();
+  var avEvalModel = document.getElementById("dashboard-av-eval-model").value.trim();
+  var intentEvalModel = document.getElementById("dashboard-intent-eval-model").value.trim();
   var skill = document.getElementById("dashboard-skill").value;
   if (model) body.model = model;
   if (judge) body.judge_model = judge;
+  if (sttModel) body.stt_model = sttModel;
+  if (ttsModel) body.tts_model = ttsModel;
+  if (visionEvalModel) body.vision_eval_model = visionEvalModel;
+  if (avEvalModel) body.av_eval_model = avEvalModel;
+  if (intentEvalModel) body.intent_eval_model = intentEvalModel;
   if (skill) body.skill = skill;
   if (text) body.initial_message = text;
 

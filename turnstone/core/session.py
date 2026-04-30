@@ -2090,24 +2090,14 @@ class ChatSession:
                             },
                         }
                     )
-                elif att.is_audio:
-                    parts.append(
-                        {
-                            "type": "audio_url",
-                            "audio_url": {
-                                "url": _encode_media_data_uri(att.content, att.mime_type),
-                            },
-                        }
-                    )
-                elif att.is_video:
-                    parts.append(
-                        {
-                            "type": "video_url",
-                            "video_url": {
-                                "url": _encode_media_data_uri(att.content, att.mime_type),
-                            },
-                        }
-                    )
+                elif att.is_audio or att.is_video:
+                    # Audio/video attachments are facilitator-sidecar media,
+                    # not ordinary conversation history. They are surfaced in
+                    # the UI and evaluator endpoints, but are intentionally NOT
+                    # injected into the main workstream prompt so they don't
+                    # get resent on later turns (providers often cap prompts at
+                    # one audio/video block).
+                    pass
                 elif att.is_text:
                     try:
                         text = att.content.decode("utf-8")

@@ -649,68 +649,7 @@
 .msg.info {
   white-space: pre-wrap;
 }
-.queued-badge {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--fg-dim);
-  margin-right: 4px;
-}
-.msg-queued-important .queued-badge {
-  color: var(--yellow);
-}
-.queued-dismiss {
-  background: none;
-  border: none;
-  color: var(--fg-dim);
-  cursor: pointer;
-  font-size: 14px;
-  padding: 0 4px;
-  margin-left: 8px;
-  float: right;
-  line-height: 1;
-}
-.queued-dismiss:hover {
-  color: var(--red);
-}
-/* .ts-msg--assistant / .ts-msg--info / .ts-msg--error alignment +
-   baseline visuals come from shared_static/chat.css.  Interactive UI
-   adds a pre-wrap override for info messages and a tightened
-   tool-message shape with the yellow accent bar the instrument-panel
-   look established. */
-.ts-msg--info { white-space: pre-wrap; }
-
-.ws-facilitator-panel {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px 12px;
-  padding: 8px 12px;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-surface);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--fg-dim);
-  flex-shrink: 0;
-}
-.ws-facilitator-row {
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.ws-facilitator-prompt {
-  grid-column: 1 / -1;
-  min-width: 0;
-  padding: 6px 8px;
-  background: var(--bg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  color: var(--fg);
-  font: inherit;
-  font-size: 11px;
-}
-.ts-msg--tool {
+.msg.tool {
   background: var(--bg-surface);
   border: 1px solid var(--border);
   /* Tool cards use --cyan to read distinctly from user (amber) and
@@ -1427,25 +1366,7 @@ body {
    ========================================================================== */
 
 /* Attachment chips — pill cluster above the textarea */
-.ts-msg--evaluator {
-  border-left-color: var(--cyan);
-}
-.ts-evaluator-title {
-  font-family: var(--font-display);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--fg-bright);
-  margin-bottom: 6px;
-}
-.ts-evaluator-body {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.45;
-}
-.ts-composer-media-btn {
+.composer-media-btn {
   background: transparent;
   border: 1px solid var(--border);
   color: var(--fg-dim);
@@ -1460,33 +1381,33 @@ body {
   font-size: 15px;
   transition: background 0.1s, border-color 0.1s, color 0.1s, transform 0.1s;
 }
-.ts-composer-media-btn:hover:not(:disabled) {
+.composer-media-btn:hover:not(:disabled) {
   background: var(--bg-highlight);
   color: var(--fg-bright);
   border-color: var(--accent-dim);
 }
-.ts-composer-media-btn:focus-visible {
+.composer-media-btn:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
-.ts-composer-media-btn:disabled {
+.composer-media-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
-.ts-composer-media-btn.is-recording {
+.composer-media-btn.is-recording {
   color: var(--red);
   border-color: var(--red);
   background: rgba(248, 113, 113, 0.08);
   animation: ts-media-record-pulse 1s ease-in-out infinite;
 }
-.ts-composer-media-btn.is-busy {
+.composer-media-btn.is-busy {
   color: var(--accent);
 }
 @keyframes ts-media-record-pulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.06); }
 }
-.ts-composer-chips {
+.composer-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -1542,39 +1463,6 @@ body {
 }
 
 /* New-workstream modal: attachment row + chips */
-#new-ws-media-routing {
-  margin: 6px 0 8px;
-  border: 1px solid var(--border-strong);
-  border-radius: 6px;
-  padding: 0 10px;
-  background: var(--bg-surface);
-}
-#new-ws-media-routing[open] {
-  padding-bottom: 10px;
-}
-#new-ws-media-routing summary {
-  cursor: pointer;
-  list-style: none;
-  font-family: var(--font-display);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--fg-bright);
-  padding: 10px 0;
-}
-#new-ws-media-routing summary::-webkit-details-marker {
-  display: none;
-}
-#new-ws-media-routing summary::after {
-  content: "▾";
-  float: right;
-  color: var(--fg-dim);
-}
-#new-ws-media-routing[open] summary::after {
-  transform: rotate(180deg);
-}
-#new-ws-media-routing label:first-of-type {
-  margin-top: 4px;
-}
 #new-ws-attach-row {
   display: flex;
   flex-direction: column;
